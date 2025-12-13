@@ -9,9 +9,13 @@ import csv
 import os
 import requests
 
+# ---- Discord Webhook ---- #
+WEBHOOK_URL = "https://discord.com/api/webhooks/1445480294500270081/pBeMhblXLTybjfht9YPOuC8YshLxXD52BKb-IL7TR9YMt1i4fcqteMcbG9sqrzRYnlr_"
+
 # ---- Configuration ---- #
 POSITIONS_FILE = "open_positions.csv"
 TRADES_LOG_FILE = "closed_trades.csv"
+CSP_LEDGER_FILE = "csp_ledger.csv"
 
 STOCKS: List[str] = [
     "AAPL", "NVDA", "MSFT", "AMZN", "META", "GOOGL", "TSLA", "AMD",
@@ -24,45 +28,93 @@ STOCKS: List[str] = [
     "FSLR", "RUN", "CARR", "MOD", "F", "LULU", "CMG", "TGT", "COST", "ABNB", "UBER"
 ]
 
-# ---- CSP (Cash-Secured Put) CONFIG ---- #
-ENABLE_CSP = False
-
-CSP_MAX_CASH_PER_TRADE = 10_000      # max cash risked per trade
-CSP_MIN_PREMIUM_PER_TRADE = 500      # minimum target premium
-CSP_TARGET_DTE_MIN = 25             # target ~30-45 DTE
-CSP_TARGET_DTE_MAX = 45
-
-# liquidity filters
-CSP_MIN_OI = 100                 
-CSP_MIN_VOLUME = 10
-CSP_MIN_BID = 0.10
-
-# Strike selection
-# "ema21_atr" = strike near EMA21 - (k * ATR)
-CSP_STRIKE_MODE = "ema21_atr"
-CSP_ATR_MULT = 1.0                  # 1.0 ATR below EMA21
-
-# Additional CSP sanity filter
-CSP_MIN_IV = 0.30                   # 30% IV, optional
-
-
-# ---- Discord Webhook ---- #
-WEBHOOK_URL = "https://discord.com/api/webhooks/1445480294500270081/pBeMhblXLTybjfht9YPOuC8YshLxXD52BKb-IL7TR9YMt1i4fcqteMcbG9sqrzRYnlr_"
-
 # Pull data 1 year out in daily intervals
 DATA_PERIOD = "1y"
 DATA_INTERVAL = "1d"
 
+# ---- CSP (Cash-Secured Put) Configuration ---- #
+ENABLE_CSP = True
+
+CSP_STOCKS: List[str] = list(dict.fromkeys(
+    STOCKS + [
+        # ETFs for consistency & liquidity
+        "IWM", "XLF", "XLK", "SMH", "XLE",
+
+        # Extra large-cap / income-friendly names
+        "XOM", "CVX", "KO", "PEP", "ABBV", "UNH",
+        "HD", "LOW", "DIS", "CMCSA",
+
+        # Optional higher-IV liquid names
+        "COIN"
+    ]
+))
+
+ACCOUNT_SIZE = 110_000
+CSP_MAX_TOTAL_ALLOCATION_PCT = 0.75 
+CSP_MAX_TOTAL_ALLOCATION = int(ACCOUNT_SIZE * CSP_MAX_TOTAL_ALLOCATION_PCT)
+
+# Ladder: 1/4 per week, ~30-45 DTE
+CSP_WEEKLY_TARGET_ALLOCATION = CSP_MAX_TOTAL_ALLOCATION / 4.0
+# Per-trade cap
+CSP_MAX_CASH_PER_TRADE = 7_000
+# Premium expectations
+CSP_MIN_PREMIUM_CONSERVATIVE = 200
+CSP_MIN_PREMIUM_BALANCED = 300
+CSP_MIN_PREMIUM_AGGRESSIVE = 400
+# Yield expectations (premium / cash_reserved)
+CSP_MIN_YIELD_CONSERVATIVE = 0.03   # 3% for ~month
+CSP_MIN_YIELD_BALANCED = 0.04       # 4%
+CSP_MIN_YIELD_AGGRESSIVE = 0.05     # 5%
+# DTE window
+CSP_TARGET_DTE_MIN = 25
+CSP_TARGET_DTE_MAX = 45
+# liquidity filters
+CSP_MIN_OI = 100                 
+CSP_MIN_VOLUME = 10
+CSP_MIN_BID = 0.10
+# Tier caps (prevents going too wild)
+CSP_MAX_AGGRESSIVE_TOTAL = 2
+CSP_MAX_AGGRESSIVE_PER_WEEK = 1
+# Strike selection
+# "ema21_atr" = strike near EMA21 - (k * ATR)
+CSP_STRIKE_MODE = "ema21_atr"
+CSP_ATR_MULT = 1.0                  # 1.0 ATR below EMA21
+# “Notch below balanced” = slightly further OTM than balanced
+CSP_ATR_MULT_CONSERVATIVE = 0.75
+CSP_ATR_MULT_BALANCED = 0.50
+CSP_ATR_MULT_AGGRESSIVE = 0.25
+# Additional CSP sanity filter
+CSP_MIN_IV = 0.30                   # 30% IV, optional
+
+# ---- Methods ---- #
+
 def send_discord(message: str):
-    """Send a simple text message to a Discord channel via webhook."""
+    """Send message(s) to Discord via webhook, splitting to avoid 2000-char limit."""
     if not WEBHOOK_URL:
         print("No WEBHOOK_URL set, skipping Discord notification.")
         return
+
+    MAX_LEN = 1900  # safety buffer
+    parts = []
+
+    msg = message.strip()
+    while len(msg) > MAX_LEN:
+        # split on last newline before MAX_LEN
+        cut = msg.rfind("\n", 0, MAX_LEN)
+        if cut == -1:
+            cut = MAX_LEN
+        parts.append(msg[:cut].rstrip())
+        msg = msg[cut:].lstrip()
+
+    if msg:
+        parts.append(msg)
+
     try:
-        payload = {"content": message}
-        resp = requests.post(WEBHOOK_URL, json=payload, timeout=10)
-        if resp.status_code >= 300:
-            print(f"Discord webhook error: {resp.status_code} {resp.text}")
+        for i, part in enumerate(parts, start=1):
+            payload = {"content": part if len(parts) == 1 else f"{part}\n\n(Part {i}/{len(parts)})"}
+            resp = requests.post(WEBHOOK_URL, json=payload, timeout=10)
+            if resp.status_code >= 300:
+                print(f"Discord webhook error: {resp.status_code} {resp.text}")
     except Exception as e:
         print(f"Error sending Discord message: {e}")
 
@@ -240,6 +292,68 @@ def log_closed_trade(trade: dict):
 
 # ------- CSP STRATEGY LOGIC -------- #
 
+def _iso_week_id(d: dt.date) -> str:
+    y, w, _ = d.isocalendar()
+    return f"{y}-W{w:02d}"
+
+def load_csp_ledger():
+    rows = []
+    if not os.path.isfile(CSP_LEDGER_FILE):
+        return rows
+    with open(CSP_LEDGER_FILE, mode="r", newline="") as f:
+        reader = csv.DictReader(f)
+        for r in reader:
+            rows.append(r)
+    return rows
+
+def append_csp_ledger_row(row: dict):
+    """
+    Row fields:
+      date, week_id, ticker, expiry, strike, contracts, credit_mid,
+      cash_reserved, est_premium, tier
+    """
+    fieldnames = [
+        "date","week_id","ticker","expiry","strike","contracts",
+        "credit_mid","cash_reserved","est_premium","tier"
+    ]
+    file_exists = os.path.isfile(CSP_LEDGER_FILE)
+    with open(CSP_LEDGER_FILE, mode="a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        if not file_exists:
+            w.writeheader()
+        w.writerow(row)
+
+def current_csp_exposure(ledger_rows: list, week_id: str):
+    """
+    We assume everything in the ledger is 'open collateral' until expiry passes.
+    (Simple + conservative; later we can add status/close handling.)
+    """
+    today = dt.date.today()
+    total_reserved = 0.0
+    week_reserved = 0.0
+    aggressive_total = 0
+    aggressive_week = 0
+
+    for r in ledger_rows:
+        try:
+            exp = dt.date.fromisoformat(r["expiry"])
+            if exp < today:
+                continue  # expired -> collateral released
+            cash = float(r["cash_reserved"])
+            total_reserved += cash
+            if r["week_id"] == week_id:
+                week_reserved += cash
+
+            tier = (r.get("tier") or "").upper()
+            if tier == "AGGRESSIVE":
+                aggressive_total += 1
+                if r["week_id"] == week_id:
+                    aggressive_week += 1
+        except Exception:
+            continue
+
+    return total_reserved, week_reserved, aggressive_total, aggressive_week
+
 def _pick_expiry_in_dte_range(ticker_obj: yf.Ticker, dte_min: int, dte_max: int):
     """Pick the first expiry whose DTE falls inside [dte_min, dte_max]."""
     today = dt.date.today()
@@ -259,20 +373,14 @@ def _pick_expiry_in_dte_range(ticker_obj: yf.Ticker, dte_min: int, dte_max: int)
 
     return None, None
 
-def _suggest_strike(stock_last: pd.Series) -> float:
-    """
-    Suggest a CSP strike based rules.
-    Returns a 'raw' strike (not rounded to option increment).
-    """
+def _suggest_strike(stock_last: pd.Series, atr_mult: float) -> float:
     close = float(stock_last["Close"])
     ema21 = float(stock_last["EMA_21"])
     atr14 = float(stock_last["ATR_14"])
 
     if CSP_STRIKE_MODE == "ema21_atr":
-        # Sell put below perceived support area
-        return ema21 - (CSP_ATR_MULT * atr14)
+        return ema21 - (atr_mult * atr14)
 
-    # Fallback: modest OTM (example 8% below)
     return close * 0.92
 
 def _round_strike_to_chain(puts_df: pd.DataFrame, target_strike: float) -> float:
@@ -284,15 +392,9 @@ def _round_strike_to_chain(puts_df: pd.DataFrame, target_strike: float) -> float
         return strikes[0]
     return below[-1]
 
-def evaluate_csp_candidate(ticker: str, stock_last: pd.Series):
-    """
-    Returns a dict describing a CSP trade idea if it meets requirements,
-    otherwise returns None.
-    This function MUST NOT throw — it should fail gracefully.
-    """
+def evaluate_csp_candidate(ticker: str, stock_last: pd.Series, atr_mult: float):
     try:
         t = yf.Ticker(ticker)
-
         exp_str, dte = _pick_expiry_in_dte_range(t, CSP_TARGET_DTE_MIN, CSP_TARGET_DTE_MAX)
         if not exp_str:
             return None
@@ -302,14 +404,9 @@ def evaluate_csp_candidate(ticker: str, stock_last: pd.Series):
         if puts.empty:
             return None
 
-        # Optional IV gate (Yahoo IV is per-contract)
-        # We'll apply IV after picking a contract.
-
-        # Suggest strike and snap to chain
-        raw_strike = _suggest_strike(stock_last)
+        raw_strike = _suggest_strike(stock_last, atr_mult=atr_mult)
         strike = _round_strike_to_chain(puts, raw_strike)
 
-        # Pull the exact contract row for that strike
         row = puts.loc[puts["strike"] == strike]
         if row.empty:
             return None
@@ -321,7 +418,6 @@ def evaluate_csp_candidate(ticker: str, stock_last: pd.Series):
         vol = int(row.get("volume", 0) or 0)
         iv = float(row.get("impliedVolatility", 0) or 0)
 
-        # Liquidity + sanity checks
         if bid < CSP_MIN_BID or ask <= 0 or ask < bid:
             return None
         if oi < CSP_MIN_OI or vol < CSP_MIN_VOLUME:
@@ -337,18 +433,14 @@ def evaluate_csp_candidate(ticker: str, stock_last: pd.Series):
             return None
 
         est_premium = mid * 100.0 * contracts
-        if est_premium < CSP_MIN_PREMIUM_PER_TRADE:
-            return None
-
-        # Rough yield (premium / cash reserved)
         cash_reserved = cash_required_per_contract * contracts
-        yield_pct = (est_premium / cash_reserved) * 100.0
+        yield_pct = est_premium / cash_reserved  # decimal (e.g., 0.035)
 
         return {
             "ticker": ticker,
             "expiry": exp_str,
             "dte": dte,
-            "strike": strike,
+            "strike": float(strike),
             "bid": bid,
             "ask": ask,
             "mid": mid,
@@ -357,14 +449,161 @@ def evaluate_csp_candidate(ticker: str, stock_last: pd.Series):
             "cash_reserved": cash_reserved,
             "est_premium": est_premium,
             "yield_pct": yield_pct,
-            "reason": f"Strike≈{CSP_STRIKE_MODE} (target {raw_strike:.2f})",
+            "reason": f"Strike≈EMA21-{atr_mult:.2f}*ATR (raw {raw_strike:.2f})",
         }
 
     except Exception as e:
-        # just print errors so the stock screener can still continue
         print(f"[CSP] Error evaluating {ticker}: {e}")
         return None
+    
+def csp_regime(vix_close: float) -> str:
+    if vix_close < 18:
+        return "LOW_IV"
+    if vix_close <= 25:
+        return "NORMAL"
+    return "HIGH_IV"
 
+def classify_csp_tier(idea: dict) -> str:
+    prem = float(idea["est_premium"])
+    y = float(idea["yield_pct"])
+
+    # Conservative is only a notch below balanced
+    if prem >= CSP_MIN_PREMIUM_AGGRESSIVE and y >= CSP_MIN_YIELD_AGGRESSIVE:
+        return "AGGRESSIVE"
+    if prem >= CSP_MIN_PREMIUM_BALANCED and y >= CSP_MIN_YIELD_BALANCED:
+        return "BALANCED"
+    if prem >= CSP_MIN_PREMIUM_CONSERVATIVE and y >= CSP_MIN_YIELD_CONSERVATIVE:
+        return "CONSERVATIVE"
+    return "REJECT"
+
+def score_csp_idea(idea: dict) -> float:
+    # simple scoring: prefer higher premium, higher yield, higher IV (but not insane)
+    prem = float(idea["est_premium"])
+    y = float(idea["yield_pct"])
+    iv = float(idea["iv"])
+    dte = float(idea["dte"])
+
+    # normalize-ish
+    s = 0.0
+    s += min(prem / 250.0, 2.0)
+    s += min(y / 0.04, 2.0)          # 4% monthly-ish
+    s += min(iv / 0.45, 1.5)
+    s += 0.5 if 30 <= dte <= 40 else 0.0
+    return s
+
+def allowed_tiers_for_regime(reg: str):
+    # Keep “conservative” not too conservative: still allow BALANCED basically always.
+    if reg == "LOW_IV":
+        return {"CONSERVATIVE", "BALANCED"}          # avoid forcing aggressive in low IV
+    if reg == "NORMAL":
+        return {"CONSERVATIVE", "BALANCED", "AGGRESSIVE"}
+    return {"CONSERVATIVE", "BALANCED", "AGGRESSIVE"}  # high IV ok, but caps still apply
+
+def plan_weekly_csp_orders(csp_candidates: list, vix_close: float):
+    """
+    Select CSP ideas to meet weekly tranche target while respecting total allocation and aggressive caps.
+    Also uses the ledger to avoid over-allocating.
+    """
+    today = dt.date.today()
+    week_id = _iso_week_id(today)
+    ledger = load_csp_ledger()
+
+    total_reserved, week_reserved, aggressive_total, aggressive_week = current_csp_exposure(ledger, week_id)
+
+    total_remaining = CSP_MAX_TOTAL_ALLOCATION - total_reserved
+    week_remaining = CSP_WEEKLY_TARGET_ALLOCATION - week_reserved
+
+    reg = csp_regime(vix_close)
+    allowed = allowed_tiers_for_regime(reg)
+
+    # Attach tier + score, filter rejects
+    enriched = []
+    for idea in csp_candidates:
+        tier = classify_csp_tier(idea)
+        if tier == "REJECT":
+            continue
+        if tier not in allowed:
+            continue
+        idea2 = dict(idea)
+        idea2["tier"] = tier
+        idea2["score"] = score_csp_idea(idea2)
+        enriched.append(idea2)
+
+    # Sort best first
+    enriched.sort(key=lambda x: x["score"], reverse=True)
+
+    selected = []
+    used_tickers = set()
+
+    for idea in enriched:
+        if idea["ticker"] in used_tickers:
+            continue
+
+        cash = float(idea["cash_reserved"])
+        if cash <= 0:
+            continue
+
+        # Respect remaining budgets
+        if cash > week_remaining:
+            continue
+        if cash > total_remaining:
+            continue
+
+        # Aggressive caps
+        if idea["tier"] == "AGGRESSIVE":
+            if aggressive_total >= CSP_MAX_AGGRESSIVE_TOTAL:
+                continue
+            if aggressive_week >= CSP_MAX_AGGRESSIVE_PER_WEEK:
+                continue
+
+        selected.append(idea)
+        used_tickers.add(idea["ticker"])
+
+        week_remaining -= cash
+        total_remaining -= cash
+
+        if idea["tier"] == "AGGRESSIVE":
+            aggressive_total += 1
+            aggressive_week += 1
+
+        # stop once weekly budget is basically filled
+        if week_remaining < (CSP_MAX_CASH_PER_TRADE * 0.8):
+            break
+
+    return {
+        "week_id": week_id,
+        "regime": reg,
+        "vix_close": vix_close,
+        "total_reserved": total_reserved,
+        "week_reserved": week_reserved,
+        "total_remaining": max(total_remaining, 0),
+        "week_remaining": max(week_remaining, 0),
+        "selected": selected
+    }
+
+def csp_already_logged(ledger_rows: list, week_id: str, ticker: str, expiry: str, strike: float) -> bool:
+    """
+    Returns True if this CSP (same week, ticker, expiry, strike) already exists.
+    """
+    for r in ledger_rows:
+        try:
+            if (
+                r["week_id"] == week_id
+                and r["ticker"] == ticker
+                and r["expiry"] == expiry
+                and float(r["strike"]) == float(strike)
+            ):
+                return True
+        except Exception:
+            continue
+    return False
+
+def is_csp_eligible(stock_row: pd.Series) -> bool:
+    # Keep it “not crazy” but not overly restrictive
+    return bool(
+        stock_row["Close"] > stock_row["SMA_200"] and
+        stock_row["Volume"] > 1_000_000
+    )
 
 # ------- STOCK SCREENER -------- #
 
@@ -406,6 +645,27 @@ def run_screener():
     debug_rows = []
     last_rows = {}
     csp_ideas = []
+
+    if ENABLE_CSP:
+        for ticker in CSP_STOCKS:
+            try:
+                df = download_ohlcv(ticker)
+                df = add_indicators(df)
+                last = df.iloc[-1]
+
+                if not is_csp_eligible(last):
+                    continue
+
+                # Evaluate multiple ATR distances so we actually find enough CSPs.
+                # Planner will pick best one per ticker via score + tier.
+                for atr_mult in (CSP_ATR_MULT_CONSERVATIVE, CSP_ATR_MULT_BALANCED, CSP_ATR_MULT_AGGRESSIVE):
+                    csp = evaluate_csp_candidate(ticker, last, atr_mult=atr_mult)
+                    if csp:
+                        csp["atr_mult"] = atr_mult  # optional, helpful for debugging
+                        csp_ideas.append(csp)
+
+            except Exception as e:
+                print(f"[CSP] Error processing {ticker}: {e}")
 
     for ticker in STOCKS:
         try:
@@ -473,11 +733,6 @@ def run_screener():
             else:
                 category = "NOT_ELIGIBLE"
 
-            if ENABLE_CSP and eligible:
-                csp = evaluate_csp_candidate(ticker, last)
-                if csp:
-                    csp_ideas.append(csp)
-
             # --- CSV Log ---
             debug_rows.append({
                 "date": today,
@@ -506,6 +761,37 @@ def run_screener():
 
         except Exception as e:
             print(f"Error processing {ticker}: {e}")
+
+    csp_plan = None
+    if ENABLE_CSP:
+        vix_close = float(vix_df["Close"].iloc[-1])
+        csp_plan = plan_weekly_csp_orders(csp_ideas, vix_close=vix_close)
+
+        ledger_rows = load_csp_ledger()
+
+        # Auto-log selected trades so next run doesn't keep recommending the same tranche
+        for idea in csp_plan["selected"]:
+            if csp_already_logged(
+                ledger_rows=ledger_rows,
+                week_id=csp_plan["week_id"],
+                ticker=idea["ticker"],
+                expiry=idea["expiry"],
+                strike=idea["strike"],
+            ):
+                continue  # already logged this CSP for the week
+
+            append_csp_ledger_row({
+                "date": today,
+                "week_id": csp_plan["week_id"],
+                "ticker": idea["ticker"],
+                "expiry": idea["expiry"],
+                "strike": f"{idea['strike']:.2f}",
+                "contracts": int(idea["contracts"]),
+                "credit_mid": f"{idea['mid']:.2f}",
+                "cash_reserved": f"{idea['cash_reserved']:.2f}",
+                "est_premium": f"{idea['est_premium']:.2f}",
+                "tier": idea["tier"],
+            })
 
     # ----- Exit logic for open positions ----- #
     exits = []
@@ -738,21 +1024,26 @@ def run_screener():
     else:
         lines.append("📈 Breakout entries: none")
 
-    # CSP ideas
-    if ENABLE_CSP:
+    # CSP tranche + selected orders
+    if ENABLE_CSP and csp_plan:
         lines.append("")
-        if csp_ideas:
-            lines.append("💰 CSP Ideas (cash-secured puts):")
-            for idea in csp_ideas[:10]:  # prevent huge messages
+        lines.append("💰 CSP Ladder (1/4 weekly, ~30–45 DTE)")
+        lines.append(f"• Regime: {csp_plan['regime']} | VIX: {csp_plan['vix_close']:.2f}")
+        lines.append(f"• Total CSP cap: ${CSP_MAX_TOTAL_ALLOCATION:,.0f}  | Reserved now: ${csp_plan['total_reserved']:,.0f}  | Remaining: ${csp_plan['total_remaining']:,.0f}")
+        lines.append(f"• Weekly target: ${CSP_WEEKLY_TARGET_ALLOCATION:,.0f} | Reserved this week: ${csp_plan['week_reserved']:,.0f} | Remaining: ${csp_plan['week_remaining']:,.0f}")
+        lines.append("")
+
+        if csp_plan["selected"]:
+            lines.append("✅ CSP Orders (this week):")
+            for idea in csp_plan["selected"]:
                 lines.append(
                     f"• {idea['ticker']} {idea['expiry']} (DTE {idea['dte']}): "
-                    f"Sell {idea['contracts']}x {idea['strike']:.0f}P "
-                    f"mid {idea['mid']:.2f} (est ${idea['est_premium']:.0f}, "
-                    f"cash ${idea['cash_reserved']:.0f}, yield {idea['yield_pct']:.1f}%, "
-                    f"IV {idea['iv']*100:.0f}%)"
+                    f"{idea['tier']} | Sell {idea['contracts']}x {idea['strike']:.0f}P "
+                    f"mid {idea['mid']:.2f} | est ${idea['est_premium']:.0f} "
+                    f"on ${idea['cash_reserved']:.0f} ({idea['yield_pct']*100:.1f}%) | IV {idea['iv']*100:.0f}%"
                 )
         else:
-            lines.append("💰 CSP Ideas: none")
+            lines.append("✅ CSP Orders (this week): none (budgets full or no qualifying contracts)")
 
     lines.append("")
 
