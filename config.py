@@ -2,7 +2,6 @@
 from typing import List
 
 # ---- Discord Webhook ---- #
-# Set this to your Discord webhook. Keep it OUT of git.
 WEBHOOK_URL = "https://discord.com/api/webhooks/1445480294500270081/pBeMhblXLTybjfht9YPOuC8YshLxXD52BKb-IL7TR9YMt1i4fcqteMcbG9sqrzRYnlr_"
 
 # ---- Files ---- #
@@ -52,3 +51,85 @@ DATA_INTERVAL = "1d"
 
 # ---- CSP enable ---- #
 ENABLE_CSP = True
+
+# ============================================================
+# CSP / CC configuration (institutional-ish defaults)
+# ============================================================
+
+# ---- CSV schemas ----
+# Keep these stable; changing columns will break existing CSVs.
+
+CSP_POSITIONS_COLUMNS = [
+    "id",
+    "open_date",
+    "week_id",
+    "ticker",
+    "expiry",
+    "dte_open",
+    "strike",
+    "contracts",
+    "credit_mid",
+    "cash_reserved",
+    "est_premium",
+    "status",
+    "underlying_last",
+    "strike_diff",
+    "strike_diff_pct",
+    "dte_remaining",
+    "itm_otm",
+    "close_date",
+    "close_type",
+    "underlying_close_at_expiry",
+    "shares_if_assigned",
+    "assignment_cost_basis",
+    "notes",
+]
+
+CC_POSITIONS_COLUMNS = [
+    "id",
+    "open_date",
+    "ticker",
+    "expiry",
+    "strike",
+    "contracts",
+    "credit_mid",
+    "status",  # OPEN / EXPIRED / CALLED_AWAY
+    "close_date",
+    "close_type",
+    "notes",
+]
+
+# ---- DTE window ----
+CSP_TARGET_DTE_MIN = 25
+CSP_TARGET_DTE_MAX = 45
+
+# ---- Risk / sizing ----
+# Per-trade cash collateral cap (strike * 100 * contracts)
+CSP_MAX_CASH_PER_TRADE = 7_000
+
+# ---- Liquidity filters ----
+CSP_MIN_OI = 100
+CSP_MIN_VOLUME = 10
+CSP_MIN_BID = 0.10
+
+# Optional IV sanity check (set to 0.0/None to disable)
+CSP_MIN_IV = 0.30
+
+# ---- Strike selection ----
+# Supported by strategies.py: "ema21_atr" or fallback percentage.
+CSP_STRIKE_MODE = "ema21_atr"
+
+# ---- Premium / yield tiers ----
+# Premium numbers are per position (already contracts-adjusted).
+CSP_MIN_PREMIUM_CONSERVATIVE = 200
+CSP_MIN_PREMIUM_BALANCED = 300
+CSP_MIN_PREMIUM_AGGRESSIVE = 400
+
+# Yield is premium / cash_reserved (decimal).
+CSP_MIN_YIELD_CONSERVATIVE = 0.03
+CSP_MIN_YIELD_BALANCED = 0.04
+CSP_MIN_YIELD_AGGRESSIVE = 0.05
+
+# ---- Tier caps ----
+CSP_MAX_AGGRESSIVE_TOTAL = 2
+CSP_MAX_AGGRESSIVE_PER_WEEK = 1
