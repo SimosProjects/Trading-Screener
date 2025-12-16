@@ -16,6 +16,9 @@ WEBHOOK_URL = "https://discord.com/api/webhooks/1445480294500270081/pBeMhblXLTyb
 POSITIONS_FILE = "open_positions.csv"
 TRADES_LOG_FILE = "closed_trades.csv"
 CSP_LEDGER_FILE = "csp_ledger.csv"
+CSP_POSITIONS_FILE = "csp_positions.csv"
+CSP_MONTHLY_SUMMARY_FILE = "csp_monthly_summary.csv"
+CSP_MONTHLY_DIR = "csp_monthly"
 
 STOCKS: List[str] = [
     "AAPL", "NVDA", "MSFT", "AMZN", "META", "GOOGL", "TSLA", "AMD",
@@ -48,6 +51,18 @@ CSP_STOCKS: List[str] = list(dict.fromkeys(
         "COIN"
     ]
 ))
+
+CSP_POSITIONS_COLUMNS = [
+    "id","open_date","week_id","ticker","expiry","dte_open",
+    "strike","contracts","credit_mid",
+    "cash_reserved","est_premium",
+    "status",
+    "underlying_last","strike_diff","strike_diff_pct","dte_remaining","itm_otm",
+    "close_date","close_type",
+    "underlying_close_at_expiry",
+    "shares_if_assigned","assignment_cost_basis",
+    "notes"
+]
 
 ACCOUNT_SIZE = 110_000
 CSP_MAX_TOTAL_ALLOCATION_PCT = 0.75 
@@ -197,9 +212,31 @@ def allow_trading(spy_df: pd.DataFrame, qqq_df: pd.DataFrame, vix_df: pd.DataFra
     qqq_last = add_indicators(qqq_df).iloc[-1]
     vix_close = vix_df["Close"].iloc[-1]
 
-    cond_spy = spy_last["Close"] > spy_last["SMA_200"]
-    cond_qqq = qqq_last["Close"] > qqq_last["SMA_50"]
-    cond_vix = vix_close < 25
+    spy_close = spy_last["Close"]
+    qqq_close = qqq_last["Close"]
+
+    spy_above_sma200 = spy_close > spy_last["SMA_200"]
+    spy_above_sma50  = spy_close > spy_last["SMA_50"]
+    spy_above_ema21  = spy_close > spy_last["EMA_21"]
+
+    qqq_above_sma50  = qqq_close > qqq_last["SMA_50"]
+    vix_ok = vix_close < 25
+
+    cond_spy = spy_above_sma200
+    cond_qqq = qqq_above_sma50
+    cond_vix = vix_ok
+
+    print("\nSPY trend:")
+    print(f"  Above 200 SMA: {spy_above_sma200}")
+    print(f"  Above 50 SMA:  {spy_above_sma50}")
+    print(f"  Above 21 EMA:  {spy_above_ema21}")
+
+    print("\nQQQ trend:")
+    print(f"  Above 50 SMA:  {qqq_above_sma50}")
+
+    print("\nVIX trend:")
+    print(f"  VIX < 25:      {vix_ok}")
+    print()
 
     return bool(cond_spy and cond_qqq and cond_vix)
 
@@ -605,6 +642,331 @@ def is_csp_eligible(stock_row: pd.Series) -> bool:
         stock_row["Volume"] > 1_000_000
     )
 
+def load_csv_rows(path: str) -> list:
+    if not os.path.isfile(path):
+        return []
+    with open(path, "r", newline="") as f:
+        return list(csv.DictReader(f))
+
+def write_csv_rows(path: str, rows: list, fieldnames: list):
+    with open(path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
+
+def ensure_csp_positions_file():
+    if os.path.isfile(CSP_POSITIONS_FILE):
+        return
+    write_csv_rows(CSP_POSITIONS_FILE, [], CSP_POSITIONS_COLUMNS)
+
+def make_csp_position_id(ticker: str, expiry: str, strike: float, open_date: str) -> str:
+    # stable-ish ID
+    return f"{ticker}-{expiry}-{float(strike):.2f}-{open_date}"
+
+def add_csp_position_from_selected(today: str, week_id: str, idea: dict):
+    ensure_csp_positions_file()
+    rows = load_csv_rows(CSP_POSITIONS_FILE)
+
+    pos_id = make_csp_position_id(idea["ticker"], idea["expiry"], idea["strike"], today)
+    # prevent duplicates if you run multiple times/day
+    for r in rows:
+        if r.get("id") == pos_id:
+            return
+
+    rows.append({
+        "id": pos_id,
+        "open_date": today,
+        "week_id": week_id,
+        "ticker": idea["ticker"],
+        "expiry": idea["expiry"],
+        "dte_open": int(idea["dte"]),
+        "strike": f"{float(idea['strike']):.2f}",
+        "contracts": int(idea["contracts"]),
+        "credit_mid": f"{float(idea['mid']):.2f}",
+        "cash_reserved": f"{float(idea['cash_reserved']):.2f}",
+        "est_premium": f"{float(idea['est_premium']):.2f}",
+        "status": "OPEN",
+        "close_date": "",
+        "close_type": "",
+        "underlying_close_at_expiry": "",
+        "shares_if_assigned": "",
+        "assignment_cost_basis": "",
+        "notes": "",
+    })
+
+    write_csv_rows(CSP_POSITIONS_FILE, rows, CSP_POSITIONS_COLUMNS)
+
+def update_open_csp_status(today: dt.date):
+    """
+    For each OPEN CSP in csp_positions.csv, update:
+      - underlying_last
+      - strike_diff (underlying - strike)
+      - strike_diff_pct ((underlying - strike) / strike)
+      - dte_remaining
+      - itm_otm (ITM if underlying < strike else OTM)
+
+    Runs fast enough for daily EOD.
+    """
+    ensure_csp_positions_file()
+    rows = load_csv_rows(CSP_POSITIONS_FILE)
+    if not rows:
+        return
+
+    # Ensure new columns exist even if file was created earlier
+    needed_cols = [
+        "underlying_last", "strike_diff", "strike_diff_pct", "dte_remaining", "itm_otm"
+    ]
+    for r in rows:
+        for c in needed_cols:
+            if c not in r:
+                r[c] = ""
+
+    # Fetch latest closes once per ticker (avoid repeated downloads)
+    open_tickers = sorted({
+        (r.get("ticker") or "").strip().upper()
+        for r in rows
+        if (r.get("status") or "").upper() == "OPEN"
+    })
+
+    last_close_map = {}
+    for tkr in open_tickers:
+        try:
+            df = yf.download(tkr, period="7d", interval="1d", auto_adjust=False, progress=False)
+            df.dropna(inplace=True)
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            if df.empty:
+                continue
+            last_close_map[tkr] = float(df["Close"].iloc[-1])
+        except Exception:
+            continue
+
+    # Update each open row
+    for r in rows:
+        if (r.get("status") or "").upper() != "OPEN":
+            continue
+
+        tkr = (r.get("ticker") or "").strip().upper()
+        if not tkr:
+            continue
+
+        # DTE remaining
+        try:
+            exp = dt.date.fromisoformat((r.get("expiry") or "").strip())
+            dte_rem = (exp - today).days
+            r["dte_remaining"] = str(dte_rem)
+        except Exception:
+            r["dte_remaining"] = ""
+
+        # Underlying last + distance to strike
+        strike = None
+        try:
+            strike = float(r.get("strike") or 0)
+        except Exception:
+            strike = None
+
+        last_px = last_close_map.get(tkr)
+        if last_px is None or strike is None or strike <= 0:
+            # can’t compute today
+            continue
+
+        diff = last_px - strike
+        diff_pct = diff / strike
+
+        r["underlying_last"] = f"{last_px:.2f}"
+        r["strike_diff"] = f"{diff:.2f}"
+        r["strike_diff_pct"] = f"{diff_pct*100:.2f}"  # percent
+        r["itm_otm"] = "ITM" if last_px < strike else "OTM"
+
+    # Write back
+    write_csv_rows(CSP_POSITIONS_FILE, rows, CSP_POSITIONS_COLUMNS)
+
+def process_csp_expirations(today: dt.date):
+    ensure_csp_positions_file()
+    rows = load_csv_rows(CSP_POSITIONS_FILE)
+    if not rows:
+        return {"expired": [], "assigned": []}
+
+    changed_expired = []
+    changed_assigned = []
+
+    for r in rows:
+        if (r.get("status") or "").upper() != "OPEN":
+            continue
+
+        try:
+            exp = dt.date.fromisoformat(r["expiry"])
+        except Exception:
+            continue
+
+        # only process when expiry has passed (or is today)
+        if exp > today:
+            continue
+
+        ticker = r["ticker"]
+        strike = float(r["strike"])
+        contracts = int(float(r["contracts"]))
+        shares = contracts * 100
+
+        # get underlying close for expiry date (best-effort)
+        try:
+            start = (exp - dt.timedelta(days=7)).isoformat()
+            end = (exp + dt.timedelta(days=1)).isoformat()
+            df = yf.download(ticker, start=start, end=end, interval="1d", auto_adjust=False)
+            df.dropna(inplace=True)
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+
+            if df.empty:
+                continue
+
+            # last close on or before expiry
+            underlying_close = float(df["Close"].iloc[-1])
+        except Exception:
+            underlying_close = None
+
+        if underlying_close is None:
+            continue
+
+        r["underlying_close_at_expiry"] = f"{underlying_close:.2f}"
+        r["close_date"] = exp.isoformat()
+
+        # Infer outcome
+        if underlying_close >= strike:
+            r["status"] = "EXPIRED"
+            r["close_type"] = "EXPIRED_OTM"
+            changed_expired.append(f"{ticker} {r['expiry']} {strike:.0f}P")
+        else:
+            r["status"] = "ASSIGNED"
+            r["close_type"] = "ASSIGNED_ITM"
+            r["shares_if_assigned"] = str(shares)
+            # cost basis if assigned (strike * shares) minus premium collected (approx)
+            est_prem = float(r.get("est_premium") or 0)
+            basis = (strike * shares) - est_prem
+            r["assignment_cost_basis"] = f"{basis:.2f}"
+            changed_assigned.append(f"{ticker} {r['expiry']} {strike:.0f}P -> {shares} sh")
+
+    # write back
+    write_csv_rows(CSP_POSITIONS_FILE, rows, CSP_POSITIONS_COLUMNS)
+
+    return {"expired": changed_expired, "assigned": changed_assigned}
+
+def get_open_csp_tickers(today: dt.date) -> set:
+    """
+    Returns set of tickers that currently have an OPEN CSP position.
+    Uses csp_positions.csv and ignores positions whose expiry < today.
+    """
+    if not os.path.isfile(CSP_POSITIONS_FILE):
+        return set()
+
+    rows = load_csv_rows(CSP_POSITIONS_FILE)
+    open_tickers = set()
+
+    for r in rows:
+        if (r.get("status") or "").upper() != "OPEN":
+            continue
+
+        t = (r.get("ticker") or "").strip().upper()
+        if not t:
+            continue
+
+        # If expiry is invalid, be conservative and treat as open
+        exp_str = (r.get("expiry") or "").strip()
+        try:
+            exp = dt.date.fromisoformat(exp_str)
+            if exp < today:
+                continue
+        except Exception:
+            pass
+
+        open_tickers.add(t)
+
+    return open_tickers
+
+def update_csp_monthly_csvs_from_ledger():
+    """
+    Creates/updates ONE CSV PER MONTH based on OPEN DATE (sale date) from csp_ledger.csv.
+
+    Output files:
+      csp_monthly/YYYY-MM.csv
+
+    Each monthly file contains:
+      date, ticker, strategy, action, contracts, strike, expiration, premium_total
+    plus a final TOTAL row that sums premium_total for the month.
+
+    Rebuilds files from the ledger each run (so totals are always correct).
+    """
+    rows = load_csv_rows(CSP_LEDGER_FILE)
+
+    # Ensure output directory exists
+    os.makedirs(CSP_MONTHLY_DIR, exist_ok=True)
+
+    fieldnames = [
+        "date",
+        "ticker",
+        "strategy",
+        "action",
+        "contracts",
+        "strike",
+        "expiration",
+        "premium_total",
+    ]
+
+    if not rows:
+        # Nothing to write; optionally keep the folder empty.
+        return
+
+    # Group ledger rows by YYYY-MM
+    by_month = {}  # month -> list[dict]
+    for r in rows:
+        date_str = (r.get("date") or "").strip()
+        if len(date_str) < 7:
+            continue
+        month = date_str[:7]
+        by_month.setdefault(month, []).append(r)
+
+    for month, month_rows in by_month.items():
+        # Sort by date then ticker for readability
+        def _sort_key(x):
+            return ((x.get("date") or ""), (x.get("ticker") or ""))
+        month_rows_sorted = sorted(month_rows, key=_sort_key)
+
+        out_rows = []
+        total_premium = 0.0
+
+        for r in month_rows_sorted:
+            prem = float(r.get("est_premium") or 0.0)
+            total_premium += prem
+
+            out_rows.append({
+                "date": (r.get("date") or "").strip(),
+                "ticker": (r.get("ticker") or "").strip(),
+                "strategy": "CSP",
+                "action": "SELL_TO_OPEN",
+                "contracts": int(float(r.get("contracts") or 0)),
+                "strike": f"{float(r.get('strike') or 0):.2f}",
+                "expiration": (r.get("expiry") or "").strip(),
+                "premium_total": f"{prem:.2f}",
+            })
+
+        # Add a final TOTAL row
+        out_rows.append({
+            "date": "",
+            "ticker": "TOTAL",
+            "strategy": "",
+            "action": "",
+            "contracts": "",
+            "strike": "",
+            "expiration": "",
+            "premium_total": f"{total_premium:.2f}",
+        })
+
+        # Write/replace the monthly file
+        monthly_path = os.path.join(CSP_MONTHLY_DIR, f"{month}.csv")
+        write_csv_rows(monthly_path, out_rows, fieldnames)
+
+
 # ------- STOCK SCREENER -------- #
 
 def run_screener():
@@ -627,10 +989,6 @@ def run_screener():
     print(f"  Volume: {int(last['Volume']):,}")
 
     spy_ind = add_indicators(spy_df).iloc[-1]
-    print("\nSPY trend:")
-    print(f"  Above 200 SMA: {spy_ind['Close'] > spy_ind['SMA_200']}")
-    print(f"  Above 50 SMA:  {spy_ind['Close'] > spy_ind['SMA_50']}")
-    print(f"  Above 21 EMA:  {spy_ind['Close'] > spy_ind['EMA_21']}")
 
     trading_on = allow_trading(spy_df, qqq_df, vix_df)
 
@@ -646,9 +1004,15 @@ def run_screener():
     last_rows = {}
     csp_ideas = []
 
+    open_csp_tickers = get_open_csp_tickers(dt.date.today()) if ENABLE_CSP else set()
+
     if ENABLE_CSP:
         for ticker in CSP_STOCKS:
             try:
+                # Prevent opening another CSP on the same ticker
+                if ticker.upper() in open_csp_tickers:
+                    continue
+        
                 df = download_ohlcv(ticker)
                 df = add_indicators(df)
                 last = df.iloc[-1]
@@ -763,13 +1127,18 @@ def run_screener():
             print(f"Error processing {ticker}: {e}")
 
     csp_plan = None
+    logged_this_run = []
+
     if ENABLE_CSP:
         vix_close = float(vix_df["Close"].iloc[-1])
         csp_plan = plan_weekly_csp_orders(csp_ideas, vix_close=vix_close)
 
         ledger_rows = load_csp_ledger()
 
-        # Auto-log selected trades so next run doesn't keep recommending the same tranche
+        selected_cash = sum(float(i["cash_reserved"]) for i in csp_plan["selected"])
+        reserved_after_total = float(csp_plan["total_reserved"]) + selected_cash
+        reserved_after_week  = float(csp_plan["week_reserved"]) + selected_cash
+
         for idea in csp_plan["selected"]:
             if csp_already_logged(
                 ledger_rows=ledger_rows,
@@ -778,7 +1147,7 @@ def run_screener():
                 expiry=idea["expiry"],
                 strike=idea["strike"],
             ):
-                continue  # already logged this CSP for the week
+                continue
 
             append_csp_ledger_row({
                 "date": today,
@@ -792,6 +1161,21 @@ def run_screener():
                 "est_premium": f"{idea['est_premium']:.2f}",
                 "tier": idea["tier"],
             })
+
+            logged_this_run.append(idea)
+
+    #Create/track CSP positions only for newly-logged trades
+    if ENABLE_CSP and csp_plan:
+        for idea in logged_this_run:
+            add_csp_position_from_selected(today=today, week_id=csp_plan["week_id"], idea=idea)
+    
+    # Process any CSPs that expired (updates csp_positions.csv) + monthly summary
+    csp_expiry_updates = {"expired": [], "assigned": []}
+    if ENABLE_CSP:
+        csp_expiry_updates = process_csp_expirations(dt.date.today())
+        update_open_csp_status(dt.date.today())
+        update_csp_monthly_csvs_from_ledger()
+
 
     # ----- Exit logic for open positions ----- #
     exits = []
@@ -1029,8 +1413,17 @@ def run_screener():
         lines.append("")
         lines.append("💰 CSP Ladder (1/4 weekly, ~30–45 DTE)")
         lines.append(f"• Regime: {csp_plan['regime']} | VIX: {csp_plan['vix_close']:.2f}")
-        lines.append(f"• Total CSP cap: ${CSP_MAX_TOTAL_ALLOCATION:,.0f}  | Reserved now: ${csp_plan['total_reserved']:,.0f}  | Remaining: ${csp_plan['total_remaining']:,.0f}")
-        lines.append(f"• Weekly target: ${CSP_WEEKLY_TARGET_ALLOCATION:,.0f} | Reserved this week: ${csp_plan['week_reserved']:,.0f} | Remaining: ${csp_plan['week_remaining']:,.0f}")
+        lines.append(f"• Total CSP cap: ${CSP_MAX_TOTAL_ALLOCATION:,.0f}")
+        lines.append(f"  - Reserved (before): ${float(csp_plan['total_reserved']):,.0f}")
+        lines.append(f"  - New planned today: ${selected_cash:,.0f}")
+        lines.append(f"  - Reserved (after):  ${reserved_after_total:,.0f}")
+        lines.append(f"  - Remaining (after): ${CSP_MAX_TOTAL_ALLOCATION - reserved_after_total:,.0f}")
+
+        lines.append(f"• Weekly target: ${CSP_WEEKLY_TARGET_ALLOCATION:,.0f}")
+        lines.append(f"  - Reserved (before): ${float(csp_plan['week_reserved']):,.0f}")
+        lines.append(f"  - Reserved (after):  ${reserved_after_week:,.0f}")
+        lines.append(f"  - Remaining (after): ${CSP_WEEKLY_TARGET_ALLOCATION - reserved_after_week:,.0f}")
+
         lines.append("")
 
         if csp_plan["selected"]:
@@ -1044,6 +1437,15 @@ def run_screener():
                 )
         else:
             lines.append("✅ CSP Orders (this week): none (budgets full or no qualifying contracts)")
+
+    if ENABLE_CSP:
+        if csp_expiry_updates["expired"] or csp_expiry_updates["assigned"]:
+            lines.append("")
+            lines.append("📌 CSP Outcomes (processed today):")
+            for x in csp_expiry_updates["expired"]:
+                lines.append(f"• EXPIRED: {x}")
+            for x in csp_expiry_updates["assigned"]:
+                lines.append(f"• ASSIGNED: {x} (wheel -> consider CC)")
 
     lines.append("")
 
