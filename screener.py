@@ -17,7 +17,7 @@ POSITIONS_FILE = "open_positions.csv"
 TRADES_LOG_FILE = "closed_trades.csv"
 CSP_LEDGER_FILE = "csp_ledger.csv"
 CSP_POSITIONS_FILE = "csp_positions.csv"
-CSP_MONTHLY_SUMMARY_FILE = "csp_monthly_summary.csv"
+CC_POSITIONS_FILE = "cc_positions.csv"
 CSP_MONTHLY_DIR = "csp_monthly"
 
 STOCKS: List[str] = [
@@ -48,7 +48,7 @@ CSP_STOCKS: List[str] = list(dict.fromkeys(
         "HD", "LOW", "DIS", "CMCSA",
 
         # Optional higher-IV liquid names
-        "COIN"
+        "COIN", "BBAI", "SOUN", "QUBT", "CLSK"
     ]
 ))
 
@@ -100,6 +100,22 @@ CSP_ATR_MULT_BALANCED = 0.50
 CSP_ATR_MULT_AGGRESSIVE = 0.25
 # Additional CSP sanity filter
 CSP_MIN_IV = 0.30                   # 30% IV, optional
+
+# ---- CC (Covered Call) Configuration ---- #
+CC_POSITIONS_COLUMNS = [
+    "id",
+    "open_date",
+    "ticker",
+    "expiry",
+    "strike",
+    "contracts",
+    "credit_mid",
+    "status",          # OPEN / EXPIRED / CALLED_AWAY
+    "close_date",
+    "close_type",
+    "notes"
+]
+
 
 # ---- Methods ---- #
 
@@ -428,6 +444,15 @@ def _round_strike_to_chain(puts_df: pd.DataFrame, target_strike: float) -> float
     if not below:
         return strikes[0]
     return below[-1]
+
+def _round_call_strike_to_chain(calls_df: pd.DataFrame, target_strike: float) -> float:
+    """Round UP to nearest available call strike."""
+    strikes = sorted([float(s) for s in calls_df["strike"].tolist()])
+    above = [s for s in strikes if s >= target_strike]
+    # if target above highest, use highest
+    if not above:
+        return strikes[-1]
+    return above[0]
 
 def evaluate_csp_candidate(ticker: str, stock_last: pd.Series, atr_mult: float):
     try:
@@ -884,6 +909,21 @@ def get_open_csp_tickers(today: dt.date) -> set:
 
     return open_tickers
 
+def update_csp_position_notes(pos_id: str, notes: str):
+    """Persist notes into csp_positions.csv for a specific position id."""
+    ensure_csp_positions_file()
+    rows = load_csv_rows(CSP_POSITIONS_FILE)
+    changed = False
+
+    for r in rows:
+        if (r.get("id") or "") == pos_id:
+            r["notes"] = notes
+            changed = True
+            break
+
+    if changed:
+        write_csv_rows(CSP_POSITIONS_FILE, rows, CSP_POSITIONS_COLUMNS)
+
 def update_csp_monthly_csvs_from_ledger():
     """
     Creates/updates ONE CSV PER MONTH based on OPEN DATE (sale date) from csp_ledger.csv.
@@ -966,6 +1006,151 @@ def update_csp_monthly_csvs_from_ledger():
         monthly_path = os.path.join(CSP_MONTHLY_DIR, f"{month}.csv")
         write_csv_rows(monthly_path, out_rows, fieldnames)
 
+def get_assigned_csp_positions():
+    rows = load_csv_rows(CSP_POSITIONS_FILE)
+    assigned = []
+
+    for r in rows:
+        if (r.get("status") or "").upper() != "ASSIGNED":
+            continue
+        shares = int(float(r.get("shares_if_assigned") or 0))
+        if shares <= 0:
+            continue
+        assigned.append(r)
+
+    return assigned
+
+def decide_cc_strike(current_price: float, csp_strike: float) -> tuple:
+    """
+    Returns:
+      (decision, target_strike)
+    decision:
+      SELL_CC / WAIT
+    """
+    pct_from_strike = (current_price - csp_strike) / csp_strike
+
+    if abs(pct_from_strike) <= 0.02:
+        return "SELL_CC", max(current_price, csp_strike) * 1.02
+
+    if -0.08 <= pct_from_strike < -0.02:
+        return "SELL_CC", csp_strike
+
+    return "WAIT", None
+
+def plan_covered_calls(today: dt.date):
+    open_cc_tickers = load_open_cc_tickers()
+    assigned = get_assigned_csp_positions()
+    ideas = []
+
+    for pos in assigned:
+        ticker = pos["ticker"]
+        csp_strike = float(pos["strike"])
+        shares = int(float(pos["shares_if_assigned"]))
+        contracts = shares // 100
+
+        if ticker.upper() in open_cc_tickers:
+            continue
+
+        if contracts < 1:
+            continue
+
+        try:
+            df = download_ohlcv(ticker)
+            last = add_indicators(df).iloc[-1]
+            current_price = float(last["Close"])
+        except Exception:
+            continue
+
+        decision, target_strike = decide_cc_strike(current_price, csp_strike)
+
+        if decision == "WAIT":
+            update_csp_position_notes(pos.get("id", ""), "Waiting for recovery before CC")
+            continue
+
+        try:
+            t = yf.Ticker(ticker)
+            exp_str, dte = _pick_expiry_in_dte_range(t, 14, 30)
+            if not exp_str:
+                continue
+
+            chain = t.option_chain(exp_str)
+            calls = chain.calls.copy()
+            if calls.empty:
+                continue
+
+            strike = _round_call_strike_to_chain(calls, target_strike)
+            row = calls.loc[calls["strike"] == strike].iloc[0]
+
+            bid = float(row.get("bid", 0) or 0)
+            ask = float(row.get("ask", 0) or 0)
+            if bid <= 0 or ask < bid:
+                continue
+
+            mid = (bid + ask) / 2.0
+
+            ideas.append({
+                "ticker": ticker,
+                "expiry": exp_str,
+                "strike": strike,
+                "contracts": contracts,
+                "mid": mid,
+                "reason": f"Wheel CC vs CSP {csp_strike}",
+            })
+
+        except Exception:
+            continue
+
+    return ideas
+
+def ensure_cc_positions_file():
+    if os.path.isfile(CC_POSITIONS_FILE):
+        return
+    write_csv_rows(CC_POSITIONS_FILE, [], CC_POSITIONS_COLUMNS)
+
+def make_cc_position_id(ticker: str, expiry: str, strike: float, open_date: str) -> str:
+    return f"{ticker}-{expiry}-{float(strike):.2f}-{open_date}"
+
+def load_open_cc_tickers() -> set:
+    """Tickers that currently have an OPEN covered call in cc_positions.csv."""
+    ensure_cc_positions_file()
+    rows = load_csv_rows(CC_POSITIONS_FILE)
+    out = set()
+    for r in rows:
+        if (r.get("status") or "").upper() == "OPEN":
+            t = (r.get("ticker") or "").strip().upper()
+            if t:
+                out.add(t)
+    return out
+
+def add_cc_position_from_candidate(today: str, idea: dict):
+    """
+    Records the suggested CC as an OPEN position entry.
+    (This is your 'paper trade tracking'—you can later add broker execution.)
+    """
+    ensure_cc_positions_file()
+    rows = load_csv_rows(CC_POSITIONS_FILE)
+
+    pos_id = make_cc_position_id(idea["ticker"], idea["expiry"], idea["strike"], today)
+    for r in rows:
+        if r.get("id") == pos_id:
+            return  # already logged
+
+    rows.append({
+        "id": pos_id,
+        "open_date": today,
+        "ticker": idea["ticker"],
+        "expiry": idea["expiry"],
+        "strike": f"{float(idea['strike']):.2f}",
+        "contracts": int(idea["contracts"]),
+        "credit_mid": f"{float(idea['mid']):.2f}",
+        "status": "OPEN",
+        "close_date": "",
+        "close_type": "",
+        "notes": idea.get("reason", ""),
+    })
+
+    write_csv_rows(CC_POSITIONS_FILE, rows, CC_POSITIONS_COLUMNS)
+
 
 # ------- STOCK SCREENER -------- #
 
@@ -1003,6 +1188,7 @@ def run_screener():
     debug_rows = []
     last_rows = {}
     csp_ideas = []
+    cc_candidates = []
 
     open_csp_tickers = get_open_csp_tickers(dt.date.today()) if ENABLE_CSP else set()
 
@@ -1175,6 +1361,14 @@ def run_screener():
         csp_expiry_updates = process_csp_expirations(dt.date.today())
         update_open_csp_status(dt.date.today())
         update_csp_monthly_csvs_from_ledger()
+        cc_candidates = plan_covered_calls(dt.date.today())
+
+    cc_logged_this_run = []
+
+    if ENABLE_CSP:
+        for idea in cc_candidates:
+            add_cc_position_from_candidate(today=today, idea=idea)
+            cc_logged_this_run.append(idea)
 
 
     # ----- Exit logic for open positions ----- #
@@ -1446,6 +1640,18 @@ def run_screener():
                 lines.append(f"• EXPIRED: {x}")
             for x in csp_expiry_updates["assigned"]:
                 lines.append(f"• ASSIGNED: {x} (wheel -> consider CC)")
+
+    if ENABLE_CSP:
+        lines.append("")
+        lines.append("📞 Covered Calls (wheel):")
+        if cc_candidates:
+            for cc in cc_candidates:
+                lines.append(
+                    f"• {cc['ticker']} {cc['expiry']}: Sell {cc['contracts']}x {cc['strike']:.0f}C "
+                    f"mid {cc['mid']:.2f} | {cc.get('reason','')}"
+                )
+        else:
+            lines.append("• none")
 
     lines.append("")
 
