@@ -11,11 +11,17 @@ import yfinance as yf
 import ta
 
 from config import (
+    # data
     DATA_PERIOD, DATA_INTERVAL,
+    # files
     POSITIONS_FILE, TRADES_LOG_FILE,
-    CSP_LEDGER_FILE,
-    CSP_POSITIONS_FILE, CC_POSITIONS_FILE,
+    CSP_LEDGER_FILE, CSP_POSITIONS_FILE, CC_POSITIONS_FILE,
+    RETIREMENT_POSITIONS_FILE,
+    # schemas
     CSP_POSITIONS_COLUMNS, CC_POSITIONS_COLUMNS,
+    # accounts / rules
+    RETIREMENT_BREAKEVEN_ONLY_DD_PCT,
+    # CSP config
     CSP_TARGET_DTE_MIN, CSP_TARGET_DTE_MAX,
     CSP_MAX_CASH_PER_TRADE,
     CSP_MIN_OI, CSP_MIN_VOLUME, CSP_MIN_BID, CSP_MIN_IV,
@@ -24,6 +30,11 @@ from config import (
     CSP_MIN_YIELD_CONSERVATIVE, CSP_MIN_YIELD_BALANCED, CSP_MIN_YIELD_AGGRESSIVE,
     CSP_MAX_AGGRESSIVE_TOTAL, CSP_MAX_AGGRESSIVE_PER_WEEK,
 )
+
+# Derived: max underlying price allowed for CSPs given per-trade cash cap.
+# Example: $6,500 cap => max price $65/share (since CSP is 100 shares).
+CSP_MAX_SHARE_PRICE = float(CSP_MAX_CASH_PER_TRADE) / 100.0
+
 
 # ----------------------------
 # Data / indicators
@@ -69,12 +80,12 @@ def compute_relative_strength(stock_df: pd.DataFrame, spy_df: pd.DataFrame, look
     spy_return = (spy_last - spy_recent) / spy_recent
     return float(stock_return - spy_return)
 
+
 # ----------------------------
 # Market regime (SPY/QQQ/VIX)
 # ----------------------------
 
 def market_context_from_dfs(spy_df: pd.DataFrame, qqq_df: pd.DataFrame, vix_df: pd.DataFrame) -> Dict[str, float | bool]:
-    """Compute market regime flags from pre-fetched SPY/QQQ/VIX OHLCV."""
     spy_last = add_indicators(spy_df).iloc[-1]
     qqq_last = add_indicators(qqq_df).iloc[-1]
     vix_close = float(vix_df["Close"].iloc[-1])
@@ -94,13 +105,12 @@ def market_context_from_dfs(spy_df: pd.DataFrame, qqq_df: pd.DataFrame, vix_df: 
         "vix_below_25": bool(vix_close < 25),
     }
 
-
 def market_context(today: dt.date) -> Dict[str, float | bool]:
-    """Screener-friendly wrapper: downloads SPY/QQQ/VIX and returns normalized keys."""
     spy_df = download_ohlcv("SPY")
     qqq_df = download_ohlcv("QQQ")
     vix_df = download_ohlcv("^VIX")
     return market_context_from_dfs(spy_df, qqq_df, vix_df)
+
 
 # ----------------------------
 # Stock entry logic
@@ -121,12 +131,7 @@ def is_eligible_detailed(stock_row: pd.Series, rs_20: float) -> Tuple[bool, Dict
     }
     return eligible, details
 
-
 def is_eligible(stock_row: pd.Series, rs_20: Optional[float] = None) -> bool:
-    """Screener-friendly eligibility boolean.
-
-    If rs_20 is provided, uses the old 'relative strength' filter too.
-    """
     try:
         close = float(stock_row["Close"])
         sma50 = float(stock_row["SMA_50"])
@@ -152,8 +157,9 @@ def breakout_signal(stock_row: pd.Series) -> bool:
     cond_vol = bool(stock_row["Volume"] > 1.5 * stock_row["VOL_SMA_10"])
     return bool(cond_price and cond_vol)
 
+
 # ----------------------------
-# Open positions (stock trades)
+# Open positions (stock swing trades - INDIVIDUAL account)
 # ----------------------------
 
 def load_open_positions() -> Dict[str, dict]:
@@ -182,6 +188,119 @@ def log_closed_trade(trade: dict) -> None:
         if not file_exists:
             w.writeheader()
         w.writerow(trade)
+
+
+# ----------------------------
+# Retirement positions (stock-only tracking)
+# ----------------------------
+
+RETIREMENT_FIELDS = [
+    "account",         # IRA / ROTH
+    "ticker",
+    "shares",
+    "entry_price",
+    "entry_date",
+    "current_price",
+    "pct_change",
+    "breakeven_target",
+    "flag_breakeven_only",
+    "notes",
+]
+
+def ensure_retirement_file() -> None:
+    if not os.path.isfile(RETIREMENT_POSITIONS_FILE):
+        with open(RETIREMENT_POSITIONS_FILE, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=RETIREMENT_FIELDS)
+            w.writeheader()
+
+def load_retirement_positions() -> List[dict]:
+    ensure_retirement_file()
+    with open(RETIREMENT_POSITIONS_FILE, "r", newline="") as f:
+        return list(csv.DictReader(f))
+
+def save_retirement_positions(rows: List[dict]) -> None:
+    ensure_retirement_file()
+    with open(RETIREMENT_POSITIONS_FILE, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=RETIREMENT_FIELDS)
+        w.writeheader()
+        for r in rows:
+            w.writerow({k: r.get(k, "") for k in RETIREMENT_FIELDS})
+
+def retirement_should_be_breakeven_only(entry_price: float, current_price: float) -> bool:
+    if entry_price <= 0:
+        return False
+    dd = (current_price - entry_price) / entry_price
+    return bool(dd <= -float(RETIREMENT_BREAKEVEN_ONLY_DD_PCT))
+
+def update_retirement_marks() -> Dict[str, float]:
+    """Update current_price / pct_change / breakeven flags in retirement_positions.csv.
+
+    Returns a summary: {account: market_value}
+    """
+    rows = load_retirement_positions()
+    if not rows:
+        return {}
+
+    # group tickers for a small batch download
+    tickers = sorted({(r.get("ticker") or "").strip().upper() for r in rows if (r.get("ticker") or "").strip()})
+    px: Dict[str, float] = {}
+
+    if tickers:
+        try:
+            df = yf.download(" ".join(tickers), period="7d", interval="1d", auto_adjust=False, progress=False)
+            df.dropna(inplace=True)
+            if isinstance(df.columns, pd.MultiIndex):
+                # df["Close"] becomes a DataFrame with tickers as columns
+                close = df["Close"]
+                for t in tickers:
+                    try:
+                        px[t] = float(close[t].iloc[-1])
+                    except Exception:
+                        pass
+            else:
+                # single ticker
+                try:
+                    px[tickers[0]] = float(df["Close"].iloc[-1])
+                except Exception:
+                    pass
+        except Exception:
+            px = {}
+
+    mv_by_acct: Dict[str, float] = {}
+
+    for r in rows:
+        t = (r.get("ticker") or "").strip().upper()
+        acct = (r.get("account") or "").strip().upper()
+        try:
+            shares = float(r.get("shares") or 0.0)
+        except Exception:
+            shares = 0.0
+        try:
+            entry = float(r.get("entry_price") or 0.0)
+        except Exception:
+            entry = 0.0
+
+        cur = px.get(t)
+        if cur is None:
+            # keep previous if present
+            try:
+                cur = float(r.get("current_price") or 0.0)
+            except Exception:
+                cur = 0.0
+
+        r["current_price"] = f"{float(cur):.2f}" if cur else ""
+        pct = ((cur - entry) / entry) if (entry and cur) else 0.0
+        r["pct_change"] = f"{pct*100.0:.2f}" if (entry and cur) else ""
+
+        flag = retirement_should_be_breakeven_only(entry, cur) if (entry and cur) else False
+        r["flag_breakeven_only"] = "1" if flag else "0"
+        r["breakeven_target"] = f"{entry:.2f}" if flag else ""
+
+        mv_by_acct[acct] = mv_by_acct.get(acct, 0.0) + float(cur or 0.0) * float(shares or 0.0)
+
+    save_retirement_positions(rows)
+    return mv_by_acct
+
 
 # ----------------------------
 # CSP planning / bookkeeping (paper)
@@ -214,7 +333,7 @@ def write_csv_rows(path: str, rows: List[dict], fieldnames: List[str]) -> None:
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
         for r in rows:
-            w.writerow(r)
+            w.writerow({k: r.get(k, "") for k in fieldnames})
 
 def append_csp_ledger_row(row: dict) -> None:
     fieldnames = ["date","week_id","ticker","expiry","strike","contracts","credit_mid","cash_reserved","est_premium","tier"]
@@ -270,28 +389,19 @@ def _round_strike_to_chain(puts_df: pd.DataFrame, target_strike: float) -> float
 
 def evaluate_csp_candidate(
     ticker: str,
-    df_or_last: pd.DataFrame | pd.Series,
+    df: pd.DataFrame,
     atr_mult: float = 0.50,
 ) -> Optional[dict]:
     """Evaluate a single CSP candidate.
 
-    screener.py passes the full indicator dataframe, while older code passed the
-    last row + an explicit ATR multiplier. This wrapper supports both.
+    HARD RULE: underlying must be <= CSP_MAX_SHARE_PRICE (e.g. <= $65).
     """
-
-    # Accept either full df (preferred) or a single last-row Series.
-    if isinstance(df_or_last, pd.DataFrame):
-        df = df_or_last
-        stock_last = df.iloc[-1]
-        # If the caller passed raw OHLCV, ensure indicators exist.
-        if "EMA_21" not in df.columns or "ATR_14" not in df.columns:
-            try:
-                stock_last = add_indicators(df).iloc[-1]
-            except Exception:
-                return None
-    else:
-        stock_last = df_or_last
     try:
+        last = df.iloc[-1]
+        close_px = float(last.get("Close", 0) or 0)
+        if close_px <= 0 or close_px > CSP_MAX_SHARE_PRICE:
+            return None
+
         t = yf.Ticker(ticker)
         exp_str, dte = _pick_expiry_in_dte_range(t, CSP_TARGET_DTE_MIN, CSP_TARGET_DTE_MAX)
         if not exp_str:
@@ -302,7 +412,7 @@ def evaluate_csp_candidate(
         if puts.empty:
             return None
 
-        raw_strike = _suggest_put_strike(stock_last, atr_mult=atr_mult)
+        raw_strike = _suggest_put_strike(last, atr_mult=atr_mult)
         strike = _round_strike_to_chain(puts, raw_strike)
 
         row = puts.loc[puts["strike"] == strike]
@@ -320,7 +430,7 @@ def evaluate_csp_candidate(
             return None
         if oi < CSP_MIN_OI or vol < CSP_MIN_VOLUME:
             return None
-        if CSP_MIN_IV and iv < CSP_MIN_IV:
+        if float(CSP_MIN_IV or 0.0) > 0 and iv < float(CSP_MIN_IV):
             return None
 
         mid = (bid + ask) / 2.0
@@ -483,6 +593,7 @@ def add_csp_position_from_selected(today: str, week_id: str, idea: dict) -> str:
         "credit_mid": f"{float(idea['mid']):.2f}",
         "cash_reserved": f"{float(idea['cash_reserved']):.2f}",
         "est_premium": f"{float(idea['est_premium']):.2f}",
+        "tier": idea.get("tier", ""),
         "status": "OPEN",
         "underlying_last": "",
         "strike_diff": "",
@@ -633,8 +744,9 @@ def get_open_csp_tickers(today: dt.date) -> set:
         out.add(tkr)
     return out
 
+
 # ----------------------------
-# CC planning from assigned CSPs (classic wheel)
+# CC planning from assigned lots (classic wheel)
 # ----------------------------
 
 def decide_cc_strike(current_price: float, assigned_strike: float) -> Tuple[str, Optional[float]]:
@@ -653,12 +765,10 @@ def _round_call_strike_to_chain(calls_df: pd.DataFrame, target_strike: float) ->
     return above[0]
 
 def plan_covered_calls(today: dt.date, assigned_rows: List[dict], open_cc_tickers: set) -> List[dict]:
-    ideas = []
+    ideas: List[dict] = []
     for pos in assigned_rows:
         ticker = (pos.get("ticker") or "").strip().upper()
-        if not ticker:
-            continue
-        if ticker in open_cc_tickers:
+        if not ticker or ticker in open_cc_tickers:
             continue
 
         try:
@@ -689,9 +799,10 @@ def plan_covered_calls(today: dt.date, assigned_rows: List[dict], open_cc_ticker
 
         try:
             t = yf.Ticker(ticker)
-            exp_str, dte = _pick_expiry_in_dte_range(t, 14, 30)
+            exp_str, _ = _pick_expiry_in_dte_range(t, 14, 30)
             if not exp_str:
                 continue
+
             chain = t.option_chain(exp_str)
             calls = chain.calls.copy()
             if calls.empty:

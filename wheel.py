@@ -17,7 +17,7 @@ from __future__ import annotations
 import csv
 import datetime as dt
 import os
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 from config import (
     WHEEL_EVENTS_FILE,
@@ -62,39 +62,55 @@ def _iso_week_id(d: dt.date) -> str:
     y, w, _ = d.isocalendar()
     return f"{y}-W{w:02d}"
 
-def ensure_wheel_files():
-    os.makedirs(os.path.dirname(os.path.abspath(WHEEL_EVENTS_FILE)), exist_ok=True)
-    if os.path.isfile(WHEEL_EVENTS_FILE):
-        return
-    with open(WHEEL_EVENTS_FILE, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=EVENT_FIELDS)
-        w.writeheader()
+def _read_rows(path: str) -> List[dict]:
+    if not os.path.isfile(path):
+        return []
+    with open(path, "r", newline="") as f:
+        return list(csv.DictReader(f))
 
-def record_event(**kwargs):
+def _write_rows(path: str, rows: List[dict], fieldnames: List[str]) -> None:
+    with open(path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for r in rows:
+            w.writerow({k: r.get(k, "") for k in fieldnames})
+
+def ensure_wheel_files() -> None:
+    # ensure directory exists
+    base_dir = os.path.dirname(os.path.abspath(WHEEL_EVENTS_FILE))
+    os.makedirs(base_dir, exist_ok=True)
+
+    if not os.path.isfile(WHEEL_EVENTS_FILE):
+        with open(WHEEL_EVENTS_FILE, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=EVENT_FIELDS)
+            w.writeheader()
+
+    if not os.path.isfile(WHEEL_LOTS_FILE):
+        with open(WHEEL_LOTS_FILE, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=LOT_FIELDS)
+            w.writeheader()
+
+def record_event(**kwargs) -> None:
     ensure_wheel_files()
 
-    # Normalize required fields
-    date_str = (kwargs.get("date") or "").strip()
-    if not date_str:
-        date_str = dt.date.today().isoformat()
-
+    date_str = (kwargs.get("date") or "").strip() or dt.date.today().isoformat()
     try:
         d = dt.date.fromisoformat(date_str)
     except Exception:
         d = dt.date.today()
 
-    row = {k: "" for k in EVENT_FIELDS}
     ticker_norm = (kwargs.get("ticker") or "").strip().upper()
     event_type_norm = (kwargs.get("event_type") or "").strip().upper()
     ref_norm = (kwargs.get("ref_id") or "").strip()
 
+    row = {k: "" for k in EVENT_FIELDS}
     # Deterministic event_id so rerunning the screener is idempotent
     row["event_id"] = kwargs.get("event_id") or f"{date_str}-{ticker_norm}-{event_type_norm}-{ref_norm}"
     row["date"] = date_str
     row["week_id"] = kwargs.get("week_id") or _iso_week_id(d)
-    row["ticker"] = (kwargs.get("ticker") or "").strip().upper()
-    row["event_type"] = (kwargs.get("event_type") or "").strip().upper()
-    row["ref_id"] = (kwargs.get("ref_id") or "").strip()
+    row["ticker"] = ticker_norm
+    row["event_type"] = event_type_norm
+    row["ref_id"] = ref_norm
     row["expiry"] = (kwargs.get("expiry") or "").strip()
     row["strike"] = f"{float(kwargs.get('strike') or 0):.2f}"
     row["contracts"] = str(int(float(kwargs.get("contracts") or 0)))
@@ -102,10 +118,11 @@ def record_event(**kwargs):
     row["premium"] = f"{float(kwargs.get('premium') or 0):.2f}"
     row["wheel_value"] = f"{float(kwargs.get('wheel_value') or 0):.2f}"
     row["notes"] = (kwargs.get("notes") or "").strip()
+
     # Idempotency: don't append the same event twice
     try:
         existing = _read_rows(WHEEL_EVENTS_FILE)
-        if any((r.get('event_id') or '') == row['event_id'] for r in existing):
+        if any((r.get("event_id") or "") == row["event_id"] for r in existing):
             return
     except Exception:
         pass
@@ -114,19 +131,6 @@ def record_event(**kwargs):
         w = csv.DictWriter(f, fieldnames=EVENT_FIELDS, extrasaction="ignore")
         w.writerow(row)
 
-def _read_rows(path: str) -> List[dict]:
-    if not os.path.isfile(path):
-        return []
-    with open(path, "r", newline="") as f:
-        return list(csv.DictReader(f))
-
-
-def _write_rows(path: str, rows: List[dict], fieldnames: List[str]) -> None:
-    with open(path, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
-        w.writeheader()
-        for r in rows:
-            w.writerow(r)
 
 # ----------------------------
 # Lots (assigned stock)
@@ -135,24 +139,17 @@ def _write_rows(path: str, rows: List[dict], fieldnames: List[str]) -> None:
 def _make_lot_id(ticker: str, open_date: str, strike: float) -> str:
     return f"{ticker}-{open_date}-{float(strike):.2f}"
 
-
 def get_open_lots() -> List[dict]:
     ensure_wheel_files()
     lots = _read_rows(WHEEL_LOTS_FILE)
-    out = []
-    for r in lots:
-        if (r.get("status") or "").upper() == "OPEN":
-            out.append(r)
-    return out
-
+    return [r for r in lots if (r.get("status") or "").upper() == "OPEN"]
 
 def create_lots_from_new_assignments(today: dt.date) -> None:
     """Create lots for any CSP positions marked ASSIGNED that don't yet have a lot."""
     ensure_wheel_files()
     lots = _read_rows(WHEEL_LOTS_FILE)
-    existing_by_csp = { (r.get("source_csp_id") or "") for r in lots }
+    existing_by_csp = {(r.get("source_csp_id") or "") for r in lots}
 
-    # Read assigned CSPs from csp_positions.csv (produced by strategies.process_csp_expirations)
     csp_rows = _read_rows(CSP_POSITIONS_FILE)
     for r in csp_rows:
         if (r.get("status") or "").upper() != "ASSIGNED":
@@ -189,7 +186,6 @@ def create_lots_from_new_assignments(today: dt.date) -> None:
             "status": "OPEN",
         })
 
-        # Log assignment event
         record_event(
             date=open_date,
             ticker=ticker,
@@ -206,7 +202,6 @@ def create_lots_from_new_assignments(today: dt.date) -> None:
 
     _write_rows(WHEEL_LOTS_FILE, lots, LOT_FIELDS)
 
-
 def link_new_ccs_to_lots(today: dt.date) -> None:
     """Attach OPEN CCs in cc_positions.csv to OPEN lots of the same ticker if not already linked."""
     ensure_wheel_files()
@@ -217,7 +212,6 @@ def link_new_ccs_to_lots(today: dt.date) -> None:
     cc_rows = _read_rows(CC_POSITIONS_FILE)
     open_ccs = [r for r in cc_rows if (r.get("status") or "").upper() == "OPEN"]
 
-    # quick map: ticker -> latest open CC id (one per ticker is the intended invariant)
     cc_by_ticker: Dict[str, dict] = {}
     for r in open_ccs:
         t = (r.get("ticker") or "").strip().upper()
@@ -271,14 +265,8 @@ def link_new_ccs_to_lots(today: dt.date) -> None:
     if changed:
         _write_rows(WHEEL_LOTS_FILE, lots, LOT_FIELDS)
 
-
 def process_cc_expirations(today: dt.date) -> Dict[str, List[str]]:
-    """Mark OPEN CCs as EXPIRED if expiry <= today.
-
-    Called-away detection requires underlying close vs strike; for now we treat:
-      - if underlying_close >= strike => CALLED_AWAY (lot closed)
-      - else => EXPIRED
-    """
+    """Mark OPEN CCs as EXPIRED / CALLED_AWAY if expiry <= today."""
     ensure_wheel_files()
     cc_rows = _read_rows(CC_POSITIONS_FILE)
     if not cc_rows:
@@ -287,7 +275,6 @@ def process_cc_expirations(today: dt.date) -> Dict[str, List[str]]:
     expired: List[str] = []
     called: List[str] = []
 
-    # lazy import to avoid circular deps
     import yfinance as yf
     import pandas as pd
 
@@ -311,7 +298,6 @@ def process_cc_expirations(today: dt.date) -> Dict[str, List[str]]:
         except Exception:
             strike = 0.0
 
-        # fetch last close around expiry
         underlying_close = None
         try:
             start = (exp - dt.timedelta(days=7)).isoformat()
@@ -363,13 +349,15 @@ def process_cc_expirations(today: dt.date) -> Dict[str, List[str]]:
         changed = True
 
     if changed:
-        _write_rows(CC_POSITIONS_FILE, cc_rows, cc_rows[0].keys() if cc_rows else [])
+        # keep original headers if present, else fall back
+        fieldnames = list(cc_rows[0].keys()) if cc_rows else []
+        _write_rows(CC_POSITIONS_FILE, cc_rows, fieldnames)
 
     # If called away, close the associated lot
     if called:
         lots = _read_rows(WHEEL_LOTS_FILE)
         lot_changed = False
-        called_cc_ids = { (r.get("id") or "") for r in cc_rows if (r.get("status") or "").upper() == "CALLED_AWAY" }
+        called_cc_ids = {(r.get("id") or "") for r in cc_rows if (r.get("status") or "").upper() == "CALLED_AWAY"}
         for lot in lots:
             if (lot.get("status") or "").upper() != "OPEN":
                 continue
@@ -388,12 +376,7 @@ def process_cc_expirations(today: dt.date) -> Dict[str, List[str]]:
 # ----------------------------
 
 def compute_wheel_exposure(today: dt.date) -> Dict[str, float | int | str]:
-    """Compute total exposure for budgeting.
-
-    Exposure includes:
-      - OPEN CSP collateral from csp_positions.csv
-      - OPEN lot notional (assigned_strike * shares) from wheel_lots.csv
-    """
+    """Compute wheel exposure (INDIVIDUAL wheel account only)."""
     ensure_wheel_files()
 
     total = 0.0
@@ -424,7 +407,7 @@ def compute_wheel_exposure(today: dt.date) -> Dict[str, float | int | str]:
             if (r.get("week_id") or "") == week_id:
                 aggressive_week += 1
 
-    # Assigned lots
+    # Assigned lots (notional)
     lots = _read_rows(WHEEL_LOTS_FILE)
     for lot in lots:
         if (lot.get("status") or "").upper() != "OPEN":
@@ -444,7 +427,6 @@ def compute_wheel_exposure(today: dt.date) -> Dict[str, float | int | str]:
         "aggressive_total": int(aggressive_total),
         "aggressive_week": int(aggressive_week),
     }
-
 
 def compute_week_remaining(today: dt.date) -> float:
     """Weekly remaining based on OPEN CSP collateral entered this ISO week."""
@@ -482,7 +464,6 @@ def rebuild_monthly_from_events() -> None:
 
     os.makedirs(WHEEL_MONTHLY_DIR, exist_ok=True)
 
-    # group by YYYY-MM
     by_month: Dict[str, List[dict]] = {}
     for r in rows:
         d = (r.get("date") or "").strip()
@@ -491,7 +472,7 @@ def rebuild_monthly_from_events() -> None:
         month = d[:7]
         by_month.setdefault(month, []).append(r)
 
-    out_fields = ["date","ticker","event_type","ref_id","premium"]
+    out_fields = ["date", "ticker", "event_type", "ref_id", "premium"]
 
     for month, evs in by_month.items():
         evs_sorted = sorted(evs, key=lambda x: ((x.get("date") or ""), (x.get("ticker") or "")))
@@ -515,7 +496,6 @@ def rebuild_monthly_from_events() -> None:
                 "premium": f"{prem:.2f}",
             })
 
-        # total row
         out_rows.append({
             "date": "",
             "ticker": "TOTAL",
@@ -531,10 +511,7 @@ def should_backfill_events() -> bool:
     return (not os.path.isfile(WHEEL_EVENTS_FILE)) or (os.path.getsize(WHEEL_EVENTS_FILE) < 50)
 
 def backfill_open_events_from_positions(today: dt.date) -> None:
-    """
-    If you already have OPEN CSP/CC positions but wheel_events.csv was empty,
-    backfill CSP_OPEN / CC_OPEN events so monthly files populate.
-    """
+    """If wheel_events.csv is empty but you already have OPEN CSP/CC positions, backfill open events."""
     ensure_wheel_files()
 
     events = _read_rows(WHEEL_EVENTS_FILE)
@@ -553,7 +530,6 @@ def backfill_open_events_from_positions(today: dt.date) -> None:
         if not ref or ("CSP_OPEN", ref) in existing:
             continue
 
-        # prefer est_premium; fallback to credit_mid * 100 * contracts
         prem = 0.0
         try:
             prem = float(r.get("est_premium") or 0.0)

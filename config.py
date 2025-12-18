@@ -1,10 +1,18 @@
 # config.py
-from typing import List
+from __future__ import annotations
 
-# ---- Discord Webhook ---- #
+from typing import Dict, List
+
+# ============================================================
+# Discord
+# ============================================================
+# Tip: keep this OUT of git in real life (env var / local override).
 WEBHOOK_URL = "https://discord.com/api/webhooks/1445480294500270081/pBeMhblXLTybjfht9YPOuC8YshLxXD52BKb-IL7TR9YMt1i4fcqteMcbG9sqrzRYnlr_"
 
-# ---- Files ---- #
+
+# ============================================================
+# Files
+# ============================================================
 POSITIONS_FILE = "open_positions.csv"
 TRADES_LOG_FILE = "closed_trades.csv"
 
@@ -12,18 +20,39 @@ CSP_LEDGER_FILE = "csp_ledger.csv"
 CSP_POSITIONS_FILE = "csp_positions.csv"
 CC_POSITIONS_FILE = "cc_positions.csv"
 
-# Institutional wheel tracking
+# Wheel bookkeeping
 WHEEL_EVENTS_FILE = "wheel_events.csv"
 WHEEL_LOTS_FILE = "wheel_lots.csv"
 WHEEL_MONTHLY_DIR = "wheel_monthly"
 
-# ---- Account / Allocation ---- #
-ACCOUNT_SIZE = 125_000
-WHEEL_CAP_PCT = 0.8
-WHEEL_CAP = int(ACCOUNT_SIZE * WHEEL_CAP_PCT)
+# Retirement tracking (stock-only)
+RETIREMENT_POSITIONS_FILE = "retirement_positions.csv"
+
+# ============================================================
+# Accounts / allocation
+# ============================================================
+ACCOUNT_SIZES: Dict[str, float] = {
+    "INDIVIDUAL": 125_000,
+    "IRA": 100_000,
+    "ROTH": 100_000,
+}
+
+# Which account runs the wheel (CSP/CC) logic
+WHEEL_ACCOUNT = "INDIVIDUAL"
+
+# Wheel cap is applied ONLY to the wheel account
+WHEEL_CAP_PCT = 0.80
+WHEEL_CAP = float(ACCOUNT_SIZES[WHEEL_ACCOUNT]) * float(WHEEL_CAP_PCT)
+
+# “Weekly target” is a pacing number for new CSP collateral, not a hard rule.
 WHEEL_WEEKLY_TARGET = WHEEL_CAP / 5.0
 
-# ---- Universe ---- #
+# Retirement rule: if a position is down >= this %, flag as "breakeven-only" target (sell at entry).
+RETIREMENT_BREAKEVEN_ONLY_DD_PCT = 0.10
+
+# ============================================================
+# Universe
+# ============================================================
 STOCKS: List[str] = [
     # Mega-cap quality
     "AAPL","MSFT","AMZN","GOOGL","META","NVDA","AVGO","TSM","ASML",
@@ -43,79 +72,42 @@ STOCKS: List[str] = [
     # Profitable tech infrastructure
     "ANET","CRWD","PANW",
 
-    # Tactical Growth
+    # Tactical Growth (still quality filters in code)
     "AMD","MU","INTC","ON","LSCC","MCHP","SMCI",
     "NFLX","LULU","CMG","TGT","ABNB","UBER",
-    "PLTR","SHOP","SNOW","MDB","NET","ZS","BILL"
+    "PLTR","SHOP","SNOW","MDB","NET","ZS","BILL",
+
+    # Your higher-beta names you trade
+    "CELH","BROS","ACHR","RKLB","GTLB","JOBY","SOFI","DKNG",
+    "IONQ","TREE","HIMS","AFRM","QUBT","SOUN","BBAI","CLSK","ASTS","APLD","EHTH",
 ]
 
-# CSP universe (STOCKS + liquid ETFs + a few high-IV names)
+# CSP universe:
+# - MUST respect CSP_MAX_CASH_PER_TRADE cap, so underlyings above ~$65 are auto-excluded in strategies.py
 CSP_STOCKS: List[str] = list(dict.fromkeys(
     STOCKS + [
-    # Financials / payments
-    "BAC","C","SOFI","AXP",
-
-    # Consumer / retail
-    "TGT","WMT","UBER","CMCSA",
-
-    # Semiconductors (selectively)
-    "INTC","MU","ON","LSCC","MCHP",
-
-    # Industrials / autos
-    "F","CARR",
-
-    # Healthcare
-    "ABBV","UNH","VRTX","EXAS",
-
-    # Energy
-    "XOM","CVX",
-
-    # Media / entertainment
-    "DIS",
-
-    # Tactical CSPs
-    "PLTR","SHOP","NET","SNOW",
-    "DKNG","AFRM","HIMS",
-    "CELH","BROS"
+        "SOFI","RKLB","JOBY","BBAI","ASTS","ACHR","CLSK",
+        "DKNG","AFRM","HIMS","CELH","BROS",
+        "IONQ","TREE","QUBT","SOUN","EHTH",
     ]
 ))
 
-"""
-STOCKS: List[str] = [
-    "AAPL","NVDA","MSFT","AMZN","META","GOOGL","TSLA","AMD",
-    "AVGO","WMT","V","NFLX","MU","CELH","BROS","ACHR","TSM",
-    "RKLB","GTLB","JOBY","SOFI","QQQ","INTC","DKNG",
-    "ASTS","APLD","LLY","JPM","PLTR","BAC","ASML","ARM","MCHP",
-    "MS","AXP","GS","IONQ","TREE","HIMS","SHOP","LSCC","ON","SMCI",
-    "CRWD","NET","SNOW","ZS","PANW","MDB","PAYC","BILL","AFRM",
-    "ADYEY","GLBE","VRTX","REGN","TMDX","EXAS","CAT","DE","ANET","ENPH",
-    "FSLR","RUN","CARR","MOD","F","LULU","CMG","TGT","COST","ABNB","UBER"
-]
-
-# CSP universe (STOCKS + liquid ETFs + a few high-IV names)
-CSP_STOCKS: List[str] = list(dict.fromkeys(
-    STOCKS + [
-        "IWM", "XLF", "XLK", "SMH", "XLE",
-        "XOM", "CVX", "KO", "PEP", "ABBV", "UNH",
-        "HD", "LOW", "DIS", "CMCSA", "BETA",
-        "COIN", "BBAI", "SOUN", "QUBT", "CLSK"
-    ]
-))"""
-
-# ---- Market data ---- #
+# ============================================================
+# Market data
+# ============================================================
 DATA_PERIOD = "1y"
 DATA_INTERVAL = "1d"
 
-# ---- CSP enable ---- #
+# ============================================================
+# CSP enable
+# ============================================================
 ENABLE_CSP = True
 
 # ============================================================
-# CSP / CC configuration (institutional-ish defaults)
+# CSP / CC configuration
 # ============================================================
 
-# ---- CSV schemas ----
-# Keep these stable; changing columns will break existing CSVs.
-
+# ---- CSV schemas (stable) ----
 CSP_POSITIONS_COLUMNS = [
     "id",
     "open_date",
@@ -128,6 +120,7 @@ CSP_POSITIONS_COLUMNS = [
     "credit_mid",
     "cash_reserved",
     "est_premium",
+    "tier",
     "status",
     "underlying_last",
     "strike_diff",
@@ -169,7 +162,7 @@ CSP_MIN_OI = 100
 CSP_MIN_VOLUME = 10
 CSP_MIN_BID = 0.10
 
-# Optional IV sanity check (set to 0.0/None to disable)
+# Optional IV sanity check (set to 0.0 to disable)
 CSP_MIN_IV = 0.30
 
 # ---- Strike selection ----
