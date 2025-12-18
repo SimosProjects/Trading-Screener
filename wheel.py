@@ -84,7 +84,12 @@ def record_event(**kwargs):
         d = dt.date.today()
 
     row = {k: "" for k in EVENT_FIELDS}
-    row["event_id"] = kwargs.get("event_id") or f"{date_str}-{kwargs.get('ticker','')}-{kwargs.get('event_type','')}-{kwargs.get('ref_id','')}"
+    ticker_norm = (kwargs.get("ticker") or "").strip().upper()
+    event_type_norm = (kwargs.get("event_type") or "").strip().upper()
+    ref_norm = (kwargs.get("ref_id") or "").strip()
+
+    # Deterministic event_id so rerunning the screener is idempotent
+    row["event_id"] = kwargs.get("event_id") or f"{date_str}-{ticker_norm}-{event_type_norm}-{ref_norm}"
     row["date"] = date_str
     row["week_id"] = kwargs.get("week_id") or _iso_week_id(d)
     row["ticker"] = (kwargs.get("ticker") or "").strip().upper()
@@ -97,6 +102,13 @@ def record_event(**kwargs):
     row["premium"] = f"{float(kwargs.get('premium') or 0):.2f}"
     row["wheel_value"] = f"{float(kwargs.get('wheel_value') or 0):.2f}"
     row["notes"] = (kwargs.get("notes") or "").strip()
+    # Idempotency: don't append the same event twice
+    try:
+        existing = _read_rows(WHEEL_EVENTS_FILE)
+        if any((r.get('event_id') or '') == row['event_id'] for r in existing):
+            return
+    except Exception:
+        pass
 
     with open(WHEEL_EVENTS_FILE, "a", newline="") as f:
         w = csv.DictWriter(f, fieldnames=EVENT_FIELDS, extrasaction="ignore")

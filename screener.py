@@ -355,6 +355,25 @@ def run_screener() -> None:
             # Persist CSP positions + log wheel events
             for o in orders:
                 csp_id = strat.add_csp_position_from_selected(today.isoformat(), exposure['week_id'], o)
+                # Also log to CSP ledger (idempotent)
+                try:
+                    ledger_rows = strat.load_csv_rows(strat.CSP_LEDGER_FILE)
+                    if not strat.csp_already_logged(ledger_rows, exposure['week_id'], o['ticker'], o['expiry'], float(o['strike'])):
+                        strat.append_csp_ledger_row({
+                            'date': today.isoformat(),
+                            'week_id': exposure['week_id'],
+                            'ticker': o['ticker'],
+                            'expiry': o['expiry'],
+                            'strike': f"{float(o['strike']):.2f}",
+                            'contracts': int(o.get('contracts', 1)),
+                            'credit_mid': float(o.get('credit_mid', 0.0)),
+                            'cash_reserved': float(o.get('cash_reserved', 0.0)),
+                            'est_premium': float(o.get('est_premium', 0.0)),
+                            'tier': o.get('tier', ''),
+                        })
+                except Exception:
+                    pass
+
                 record_event(
                     date=today.isoformat(),
                     ticker=o["ticker"],
