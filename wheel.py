@@ -515,6 +515,9 @@ def rebuild_monthly_from_events() -> None:
         path = os.path.join(WHEEL_MONTHLY_DIR, f"{month}.csv")
         _write_rows(path, out_rows, out_fields)
 
+def should_backfill_events() -> bool:
+    return (not os.path.isfile(WHEEL_EVENTS_FILE)) or (os.path.getsize(WHEEL_EVENTS_FILE) < 50)
+
 def backfill_open_events_from_positions(today: dt.date) -> None:
     """
     If you already have OPEN CSP/CC positions but wheel_events.csv was empty,

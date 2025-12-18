@@ -18,12 +18,69 @@ WHEEL_LOTS_FILE = "wheel_lots.csv"
 WHEEL_MONTHLY_DIR = "wheel_monthly"
 
 # ---- Account / Allocation ---- #
-ACCOUNT_SIZE = 110_000
-WHEEL_CAP_PCT = 0.75
+ACCOUNT_SIZE = 125_000
+WHEEL_CAP_PCT = 0.8
 WHEEL_CAP = int(ACCOUNT_SIZE * WHEEL_CAP_PCT)
-WHEEL_WEEKLY_TARGET = WHEEL_CAP / 4.0
+WHEEL_WEEKLY_TARGET = WHEEL_CAP / 5.0
 
 # ---- Universe ---- #
+STOCKS: List[str] = [
+    # Mega-cap quality
+    "AAPL","MSFT","AMZN","GOOGL","META","NVDA","AVGO","TSM","ASML",
+
+    # Payments / financial quality
+    "V","MA","JPM","BAC","MS","GS","AXP",
+
+    # Healthcare (defensive growth)
+    "LLY","ABBV","UNH","VRTX","REGN",
+
+    # Consumer staples / resilient demand
+    "WMT","COST","KO","PEP",
+
+    # Industrials / infrastructure
+    "CAT","DE","CARR",
+
+    # Profitable tech infrastructure
+    "ANET","CRWD","PANW",
+
+    # Tactical Growth
+    "AMD","MU","INTC","ON","LSCC","MCHP","SMCI",
+    "NFLX","LULU","CMG","TGT","ABNB","UBER",
+    "PLTR","SHOP","SNOW","MDB","NET","ZS","BILL"
+]
+
+# CSP universe (STOCKS + liquid ETFs + a few high-IV names)
+CSP_STOCKS: List[str] = list(dict.fromkeys(
+    STOCKS + [
+    # Financials / payments
+    "BAC","C","SOFI","AXP",
+
+    # Consumer / retail
+    "TGT","WMT","UBER","CMCSA",
+
+    # Semiconductors (selectively)
+    "INTC","MU","ON","LSCC","MCHP",
+
+    # Industrials / autos
+    "F","CARR",
+
+    # Healthcare
+    "ABBV","UNH","VRTX","EXAS",
+
+    # Energy
+    "XOM","CVX",
+
+    # Media / entertainment
+    "DIS",
+
+    # Tactical CSPs
+    "PLTR","SHOP","NET","SNOW",
+    "DKNG","AFRM","HIMS",
+    "CELH","BROS"
+    ]
+))
+
+"""
 STOCKS: List[str] = [
     "AAPL","NVDA","MSFT","AMZN","META","GOOGL","TSLA","AMD",
     "AVGO","WMT","V","NFLX","MU","CELH","BROS","ACHR","TSM",
@@ -40,10 +97,10 @@ CSP_STOCKS: List[str] = list(dict.fromkeys(
     STOCKS + [
         "IWM", "XLF", "XLK", "SMH", "XLE",
         "XOM", "CVX", "KO", "PEP", "ABBV", "UNH",
-        "HD", "LOW", "DIS", "CMCSA",
+        "HD", "LOW", "DIS", "CMCSA", "BETA",
         "COIN", "BBAI", "SOUN", "QUBT", "CLSK"
     ]
-))
+))"""
 
 # ---- Market data ---- #
 DATA_PERIOD = "1y"
@@ -105,7 +162,7 @@ CSP_TARGET_DTE_MAX = 45
 
 # ---- Risk / sizing ----
 # Per-trade cash collateral cap (strike * 100 * contracts)
-CSP_MAX_CASH_PER_TRADE = 7_000
+CSP_MAX_CASH_PER_TRADE = 6_500
 
 # ---- Liquidity filters ----
 CSP_MIN_OI = 100

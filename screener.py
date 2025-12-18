@@ -22,6 +22,7 @@ from wheel import (
     process_cc_expirations,
     rebuild_monthly_from_events,
     get_open_lots,
+    should_backfill_events,
     backfill_open_events_from_positions
 )
 
@@ -49,13 +50,10 @@ def send_discord(msg: str) -> None:
 # ============================================================
 # Market filter + watchlist / entries
 # ============================================================
-
-def trading_allowed(mkt: Dict) -> bool:
+def allow_swing_trades(mkt: Dict) -> bool:
     """
-    Keep the exact vibe you liked:
-    - SPY above 200 & 50 & 21
-    - QQQ above 50
-    - VIX < 25 (and <18 is "low")
+    Swing trades = aggressive, directional risk.
+    Keep strict gating.
     """
     return bool(
         mkt.get("spy_above_200")
@@ -65,6 +63,30 @@ def trading_allowed(mkt: Dict) -> bool:
         and mkt.get("vix_below_25")
     )
 
+def allow_aggressive_risk(mkt: Dict) -> bool:
+    """
+    Conditions for adding NEW aggressive risk:
+    - Swing trades
+    - Aggressive CSPs
+    """
+    return bool(
+        mkt.get("spy_above_200")
+        and mkt.get("spy_above_50")
+        and mkt.get("spy_above_21")
+        and mkt.get("qqq_above_50")
+        and mkt.get("vix_below_25")
+    )
+
+def allow_conservative_premium(mkt: Dict) -> bool:
+    """
+    Conditions for conservative income strategies (CSPs):
+    - Market not broken
+    - Volatility acceptable
+    """
+    return bool(
+        mkt.get("spy_above_200")
+        and mkt.get("vix_below_25")
+    )
 
 def scan_stock_entries_and_watchlist() -> Tuple[List[dict], List[dict]]:
     """
@@ -265,7 +287,7 @@ def run_screener() -> None:
 
     # --- Market context (always) ---
     mkt = strat.market_context(today)
-    trading_on = trading_allowed(mkt)
+    trading_on = allow_swing_trades(mkt)
     print_market_context(mkt, trading_on)
 
     # --- Ensure files + maintenance ALWAYS (even when trading OFF) ---
@@ -278,7 +300,7 @@ def run_screener() -> None:
     create_lots_from_new_assignments(today)         # turns ASSIGNED CSPs into wheel lots
     link_new_ccs_to_lots(today)                     # attaches OPEN CCs to lots + logs wheel events
 
-    # --- Exposure (screen-only) ---
+    # Exposure
     exposure = compute_wheel_exposure(today)
     week_remaining = compute_week_remaining(today)
     print("\n💼 WHEEL EXPOSURE")
@@ -286,7 +308,7 @@ def run_screener() -> None:
     print(f"  Weekly target:  ${exposure['weekly_target']:,.0f}")
     print(f"  Weekly remaining: ${week_remaining:,.0f}")
 
-    # Allocation (screen-only)
+    # Allocation
     stock_alloc = max(int(exposure["cap"]) - int(exposure["total_exposure"]), 0)
     print("\n🧮 ALLOCATION")
     print(f"  Wheel cap: ${WHEEL_CAP:,.0f} | Weekly target: ${WHEEL_WEEKLY_TARGET:,.0f}")
@@ -304,9 +326,10 @@ def run_screener() -> None:
         for w in watch[:20]:
             print(f"  {w['ticker']:<6} {w['note']:<13} Close {w['close']:.2f} | RSI2 {w['rsi2']:.1f}")
 
-    # --- CSP planning (only if market ON and cap allows) ---
+    # --- CSP planning ---
     new_csp_orders: List[dict] = []
-    if ENABLE_CSP and trading_on and week_remaining > 0:
+
+    if ENABLE_CSP and allow_conservative_premium(mkt) and week_remaining > 0:
         candidates = build_csp_candidates()
 
         # Total remaining under cap is computed from current exposure
@@ -350,26 +373,31 @@ def run_screener() -> None:
     else:
         print("\n🧾 CSP scanning skipped (market filter or allocation).")
 
-    # --- CC planning (only if market ON; from lots only) ---
+    # --- CC planning (ALWAYS runs; inventory management) ---
     new_cc_orders: List[dict] = []
-    if trading_on:
-        new_cc_orders = plan_ccs_from_open_lots()
-        if new_cc_orders:
-            print("\n📞 NEW CC IDEAS (from lots)")
-            for o in new_cc_orders[:15]:
-                credit_est = float(o.get("credit_mid", 0.0)) * 100.0
-                print(f"  {o['ticker']:<6} {float(o['strike']):.0f}C {o['expiry']} | est credit ${credit_est:.0f}")
+    new_cc_orders = plan_ccs_from_open_lots()
 
-            # persist CC positions (wheel will link + record CC_OPEN event)
-            for o in new_cc_orders:
-                strat.add_cc_position_from_candidate(today.isoformat(), o)
-            link_new_ccs_to_lots(today)
-        else:
-            print("\n📞 CC: No new calls today.")
+    if new_cc_orders:
+        print("\n📞 NEW CC IDEAS (from lots)")
+        for o in new_cc_orders[:15]:
+            credit_est = float(o.get("credit_mid", 0.0)) * 100.0
+            print(
+                f"  {o['ticker']:<6} {float(o['strike']):.0f}C "
+                f"{o['expiry']} | est credit ${credit_est:.0f}"
+            )
+
+        # persist CC positions
+        for o in new_cc_orders:
+            strat.add_cc_position_from_candidate(today.isoformat(), o)
+
+        link_new_ccs_to_lots(today)
     else:
-        print("\n📞 CC scanning skipped (market filter).")
+        print("\n📞 CC: No calls triggered today.")
 
-    backfill_open_events_from_positions(today)
+    # backfill ONLY if you are missing events
+    if should_backfill_events():
+        backfill_open_events_from_positions(today)
+
     rebuild_monthly_from_events()
 
     # --- Discord (alerts only) ---
