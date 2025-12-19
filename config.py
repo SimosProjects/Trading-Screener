@@ -1,58 +1,109 @@
 # config.py
 from __future__ import annotations
-
 from typing import Dict, List
 
-# ============================================================
-# Discord
-# ============================================================
-# Tip: keep this OUT of git in real life (env var / local override).
-WEBHOOK_URL = "https://discord.com/api/webhooks/1445480294500270081/pBeMhblXLTybjfht9YPOuC8YshLxXD52BKb-IL7TR9YMt1i4fcqteMcbG9sqrzRYnlr_"
+# ---- Discord Webhook ---- #
+# Keep OUT of git (use env var in the future if you want)
+WEBHOOK_URL = ""
 
+# ---- Files ---- #
+# Stock swing / tactical tracking (paper)
+STOCK_POSITIONS_FILE = "stock_positions.csv"
+STOCK_TRADES_FILE = "stock_trades.csv"
 
-# ============================================================
-# Files
-# ============================================================
+# Legacy single-account swing tracking is replaced by the files above
+# (kept only if you still want them elsewhere)
 POSITIONS_FILE = "open_positions.csv"
 TRADES_LOG_FILE = "closed_trades.csv"
 
+# Wheel / options tracking (paper)
 CSP_LEDGER_FILE = "csp_ledger.csv"
 CSP_POSITIONS_FILE = "csp_positions.csv"
 CC_POSITIONS_FILE = "cc_positions.csv"
 
-# Wheel bookkeeping
+# Institutional-ish wheel tracking
 WHEEL_EVENTS_FILE = "wheel_events.csv"
 WHEEL_LOTS_FILE = "wheel_lots.csv"
 WHEEL_MONTHLY_DIR = "wheel_monthly"
 
-# Retirement tracking (stock-only)
+# Retirement holdings tracking (stock-only “inventory”, separate from swing trades)
 RETIREMENT_POSITIONS_FILE = "retirement_positions.csv"
 
 # ============================================================
-# Accounts / allocation
+# Accounts / Allocation
 # ============================================================
-ACCOUNT_SIZES: Dict[str, float] = {
-    "INDIVIDUAL": 125_000,
-    "IRA": 100_000,
-    "ROTH": 100_000,
+
+# Named accounts used everywhere
+INDIVIDUAL = "INDIVIDUAL"
+IRA = "IRA"
+ROTH = "ROTH"
+
+ACCOUNT_SIZES: Dict[str, int] = {
+    INDIVIDUAL: 125_000,
+    IRA: 100_000,
+    ROTH: 100_000,
 }
 
-# Which account runs the wheel (CSP/CC) logic
-WHEEL_ACCOUNT = "INDIVIDUAL"
-
-# Wheel cap is applied ONLY to the wheel account
+# Wheel allocation is ONLY for INDIVIDUAL account
+WHEEL_ACCOUNT = INDIVIDUAL
 WHEEL_CAP_PCT = 0.80
-WHEEL_CAP = float(ACCOUNT_SIZES[WHEEL_ACCOUNT]) * float(WHEEL_CAP_PCT)
-
-# “Weekly target” is a pacing number for new CSP collateral, not a hard rule.
+WHEEL_CAP = int(ACCOUNT_SIZES[WHEEL_ACCOUNT] * WHEEL_CAP_PCT)
 WHEEL_WEEKLY_TARGET = WHEEL_CAP / 5.0
 
-# Retirement rule: if a position is down >= this %, flag as "breakeven-only" target (sell at entry).
+# INDIVIDUAL stock (non-wheel) cap is the remaining % (e.g., 20%)
+INDIVIDUAL_STOCK_CAP_PCT = 1.0 - WHEEL_CAP_PCT
+INDIVIDUAL_STOCK_CAP = int(ACCOUNT_SIZES[INDIVIDUAL] * INDIVIDUAL_STOCK_CAP_PCT)
+
+# Retirement accounts can be more aggressive but still capped by account size
+RETIREMENT_MAX_EQUITY_UTIL_PCT = 0.98  # keep a little cash buffer
+
+# If a retirement holding is down >= 10%, only allow selling at breakeven (entry)
 RETIREMENT_BREAKEVEN_ONLY_DD_PCT = 0.10
+
+# ============================================================
+# Stock swing trade rules (paper execution)
+# ============================================================
+
+# “Run after close” means entries are detected using EOD data.
+# We build entry plans meant to be still valid the next day.
+STOCK_REQUIRE_NEXTDAY_VALIDATION = True
+
+# If False, a ticker can only be OPEN in ONE account at a time (INDIVIDUAL/IRA/ROTH)
+ALLOW_MULTI_ACCOUNT_SAME_TICKER = False
+
+# Minimum position market value (helps avoid tiny positions when risk_per_share is large)
+STOCK_MIN_POSITION_VALUE_INDIVIDUAL = 1_500
+STOCK_MIN_POSITION_VALUE_RETIREMENT = 3_000
+
+# Gating by market regime
+# - INDIVIDUAL swing trades are strict
+# - IRA/ROTH tactical trades are slightly less strict (still avoid broken markets)
+STOCK_GATE_INDIVIDUAL = "STRICT"   # STRICT = SPY>200 & SPY>50 & SPY>21 & QQQ>50 & VIX<25
+STOCK_GATE_RETIREMENT = "SOFT"     # SOFT   = SPY>200 & VIX<25
+
+# Risk / sizing
+# Risk is defined as (entry - stop) * shares.
+# We size shares to keep risk per trade within these caps.
+STOCK_RISK_PCT_INDIVIDUAL = 0.050   # 5.0% of INDIVIDUAL_STOCK_CAP per trade
+STOCK_RISK_PCT_RETIREMENT = 0.050   # 5.0% of account per trade
+
+# Max position size as a % of account MV (avoid concentration)
+STOCK_MAX_POSITION_PCT_INDIVIDUAL = 0.10
+STOCK_MAX_POSITION_PCT_RETIREMENT = 0.5
+
+# Targets / exits
+STOCK_TARGET_R_MULTIPLE = 2.0           # take-profit at ~2R
+STOCK_BREAKEVEN_AFTER_R = 1.0           # optional: move stop to breakeven after +1R
+STOCK_USE_BREAKEVEN_TRAIL = True
+
+# Stop building blocks
+STOCK_STOP_ATR_PULLBACK = 1.0  # stop = EMA21 - ATR*X for pullbacks
+STOCK_STOP_ATR_BREAKOUT = 1.2  # stop = breakout_level - ATR*X
 
 # ============================================================
 # Universe
 # ============================================================
+
 STOCKS: List[str] = [
     # Mega-cap quality
     "AAPL","MSFT","AMZN","GOOGL","META","NVDA","AVGO","TSM","ASML",
@@ -72,42 +123,57 @@ STOCKS: List[str] = [
     # Profitable tech infrastructure
     "ANET","CRWD","PANW",
 
-    # Tactical Growth (still quality filters in code)
+    # Tactical Growth
     "AMD","MU","INTC","ON","LSCC","MCHP","SMCI",
     "NFLX","LULU","CMG","TGT","ABNB","UBER",
     "PLTR","SHOP","SNOW","MDB","NET","ZS","BILL",
-
-    # Your higher-beta names you trade
-    "CELH","BROS","ACHR","RKLB","GTLB","JOBY","SOFI","DKNG",
-    "IONQ","TREE","HIMS","AFRM","QUBT","SOUN","BBAI","CLSK","ASTS","APLD","EHTH",
 ]
 
-# CSP universe:
-# - MUST respect CSP_MAX_CASH_PER_TRADE cap, so underlyings above ~$65 are auto-excluded in strategies.py
+# CSP universe (kept focused; price cap is enforced in strategies.evaluate_csp_candidate)
 CSP_STOCKS: List[str] = list(dict.fromkeys(
     STOCKS + [
-        "SOFI","RKLB","JOBY","BBAI","ASTS","ACHR","CLSK",
-        "DKNG","AFRM","HIMS","CELH","BROS",
-        "IONQ","TREE","QUBT","SOUN","EHTH",
+        # Financials / payments
+        "BAC","C","SOFI","AXP",
+
+        # Consumer / retail
+        "TGT","WMT","UBER","CMCSA",
+
+        # Semiconductors (selectively)
+        "INTC","MU","ON","LSCC","MCHP",
+
+        # Industrials / autos
+        "F","CARR",
+
+        # Healthcare
+        "ABBV","UNH","VRTX","EXAS",
+
+        # Energy
+        "XOM","CVX",
+
+        # Media / entertainment
+        "DIS",
+
+        # Tactical CSPs
+        "PLTR","SHOP","NET","SNOW",
+        "DKNG","AFRM","HIMS",
+        "CELH","BROS",
+
+        # High-IV under $65 candidates (price cap is enforced anyway)
+        "BBAI","SOUN","QUBT","CLSK","RKLB","JOBY","ASTS","ACHR",
     ]
 ))
 
-# ============================================================
-# Market data
-# ============================================================
+# ---- Market data ---- #
 DATA_PERIOD = "1y"
 DATA_INTERVAL = "1d"
 
-# ============================================================
-# CSP enable
-# ============================================================
+# ---- CSP enable ---- #
 ENABLE_CSP = True
 
 # ============================================================
 # CSP / CC configuration
 # ============================================================
 
-# ---- CSV schemas (stable) ----
 CSP_POSITIONS_COLUMNS = [
     "id",
     "open_date",
@@ -154,28 +220,24 @@ CSP_TARGET_DTE_MIN = 25
 CSP_TARGET_DTE_MAX = 45
 
 # ---- Risk / sizing ----
-# Per-trade cash collateral cap (strike * 100 * contracts)
-CSP_MAX_CASH_PER_TRADE = 6_500
+CSP_MAX_CASH_PER_TRADE = 6_500  # => $65/share max if 1 contract
 
 # ---- Liquidity filters ----
 CSP_MIN_OI = 100
 CSP_MIN_VOLUME = 10
 CSP_MIN_BID = 0.10
 
-# Optional IV sanity check (set to 0.0 to disable)
+# Optional IV sanity check (set to 0.0/None to disable)
 CSP_MIN_IV = 0.30
 
 # ---- Strike selection ----
-# Supported by strategies.py: "ema21_atr" or fallback percentage.
 CSP_STRIKE_MODE = "ema21_atr"
 
 # ---- Premium / yield tiers ----
-# Premium numbers are per position (already contracts-adjusted).
 CSP_MIN_PREMIUM_CONSERVATIVE = 200
 CSP_MIN_PREMIUM_BALANCED = 300
 CSP_MIN_PREMIUM_AGGRESSIVE = 400
 
-# Yield is premium / cash_reserved (decimal).
 CSP_MIN_YIELD_CONSERVATIVE = 0.03
 CSP_MIN_YIELD_BALANCED = 0.04
 CSP_MIN_YIELD_AGGRESSIVE = 0.05

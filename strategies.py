@@ -11,17 +11,33 @@ import yfinance as yf
 import ta
 
 from config import (
-    # data
+    # market data
     DATA_PERIOD, DATA_INTERVAL,
+
     # files
-    POSITIONS_FILE, TRADES_LOG_FILE,
-    CSP_LEDGER_FILE, CSP_POSITIONS_FILE, CC_POSITIONS_FILE,
+    STOCK_POSITIONS_FILE, STOCK_TRADES_FILE,
     RETIREMENT_POSITIONS_FILE,
-    # schemas
-    CSP_POSITIONS_COLUMNS, CC_POSITIONS_COLUMNS,
-    # accounts / rules
+    CSP_LEDGER_FILE, CSP_POSITIONS_FILE, CC_POSITIONS_FILE,
+
+    # accounts / sizing
+    INDIVIDUAL, IRA, ROTH,
+    ACCOUNT_SIZES,
+    INDIVIDUAL_STOCK_CAP,
+    RETIREMENT_MAX_EQUITY_UTIL_PCT,
     RETIREMENT_BREAKEVEN_ONLY_DD_PCT,
-    # CSP config
+
+    # stock rules
+    STOCK_REQUIRE_NEXTDAY_VALIDATION,
+    STOCK_RISK_PCT_INDIVIDUAL, STOCK_RISK_PCT_RETIREMENT,
+    STOCK_MAX_POSITION_PCT_INDIVIDUAL, STOCK_MAX_POSITION_PCT_RETIREMENT,
+    STOCK_TARGET_R_MULTIPLE,
+    STOCK_BREAKEVEN_AFTER_R,
+    STOCK_USE_BREAKEVEN_TRAIL,
+    STOCK_STOP_ATR_PULLBACK,
+    STOCK_STOP_ATR_BREAKOUT,
+
+    # CSP rules
+    CSP_POSITIONS_COLUMNS, CC_POSITIONS_COLUMNS,
     CSP_TARGET_DTE_MIN, CSP_TARGET_DTE_MAX,
     CSP_MAX_CASH_PER_TRADE,
     CSP_MIN_OI, CSP_MIN_VOLUME, CSP_MIN_BID, CSP_MIN_IV,
@@ -31,29 +47,33 @@ from config import (
     CSP_MAX_AGGRESSIVE_TOTAL, CSP_MAX_AGGRESSIVE_PER_WEEK,
 )
 
-# Derived: max underlying price allowed for CSPs given per-trade cash cap.
-# Example: $6,500 cap => max price $65/share (since CSP is 100 shares).
+# Derived: max underlying price allowed for CSPs (e.g., $6,500 cap => $65/share for 1 contract)
 CSP_MAX_SHARE_PRICE = float(CSP_MAX_CASH_PER_TRADE) / 100.0
 
 
-# ----------------------------
+# ============================================================
 # Data / indicators
-# ----------------------------
+# ============================================================
 
 def download_ohlcv(ticker: str, period: str = DATA_PERIOD, interval: str = DATA_INTERVAL) -> pd.DataFrame:
     df = yf.download(ticker, period=period, interval=interval, auto_adjust=False, progress=False)
+    if df is None or df.empty:
+        return pd.DataFrame()
     df.dropna(inplace=True)
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
     return df
 
+
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    df = df.copy()
     close = df["Close"]
     high = df["High"]
     low = df["Low"]
     volume = df["Volume"]
-
-    df = df.copy()
 
     df["SMA_50"] = ta.trend.sma_indicator(close, window=50)
     df["SMA_200"] = ta.trend.sma_indicator(close, window=200)
@@ -66,28 +86,34 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     df["VOL_SMA_10"] = volume.rolling(window=10).mean()
     df["HIGH_20"] = close.rolling(window=20).max()
+    df["LOW_20"] = close.rolling(window=20).min()
 
     return df
 
-def compute_relative_strength(stock_df: pd.DataFrame, spy_df: pd.DataFrame, lookback: int = 20) -> float:
-    if len(stock_df) < lookback or len(spy_df) < lookback:
-        return 0.0
-    stock_recent = stock_df["Close"].iloc[-lookback]
-    stock_last = stock_df["Close"].iloc[-1]
-    spy_recent = spy_df["Close"].iloc[-lookback]
-    spy_last = spy_df["Close"].iloc[-1]
-    stock_return = (stock_last - stock_recent) / stock_recent
-    spy_return = (spy_last - spy_recent) / spy_recent
-    return float(stock_return - spy_return)
 
-
-# ----------------------------
+# ============================================================
 # Market regime (SPY/QQQ/VIX)
-# ----------------------------
+# ============================================================
 
 def market_context_from_dfs(spy_df: pd.DataFrame, qqq_df: pd.DataFrame, vix_df: pd.DataFrame) -> Dict[str, float | bool]:
-    spy_last = add_indicators(spy_df).iloc[-1]
-    qqq_last = add_indicators(qqq_df).iloc[-1]
+    spy_df = add_indicators(spy_df)
+    qqq_df = add_indicators(qqq_df)
+    if spy_df.empty or qqq_df.empty or vix_df is None or vix_df.empty:
+        # fail-safe: return conservative "OFF" regime
+        return {
+            "spy_close": 0.0,
+            "qqq_close": 0.0,
+            "vix_close": 99.0,
+            "spy_above_200": False,
+            "spy_above_50": False,
+            "spy_above_21": False,
+            "qqq_above_50": False,
+            "vix_below_18": False,
+            "vix_below_25": False,
+        }
+
+    spy_last = spy_df.iloc[-1]
+    qqq_last = qqq_df.iloc[-1]
     vix_close = float(vix_df["Close"].iloc[-1])
 
     spy_close = float(spy_last["Close"])
@@ -105,6 +131,7 @@ def market_context_from_dfs(spy_df: pd.DataFrame, qqq_df: pd.DataFrame, vix_df: 
         "vix_below_25": bool(vix_close < 25),
     }
 
+
 def market_context(today: dt.date) -> Dict[str, float | bool]:
     spy_df = download_ohlcv("SPY")
     qqq_df = download_ohlcv("QQQ")
@@ -112,26 +139,12 @@ def market_context(today: dt.date) -> Dict[str, float | bool]:
     return market_context_from_dfs(spy_df, qqq_df, vix_df)
 
 
-# ----------------------------
+# ============================================================
 # Stock entry logic
-# ----------------------------
+# ============================================================
 
-def is_eligible_detailed(stock_row: pd.Series, rs_20: float) -> Tuple[bool, Dict[str, bool]]:
-    cond_close_above_sma50 = bool(stock_row["Close"] > stock_row["SMA_50"])
-    cond_ema21_above_sma50 = bool(stock_row["EMA_21"] > stock_row["SMA_50"])
-    cond_rs_positive = bool(rs_20 > 0)
-    cond_adx_ok = bool(stock_row["ADX_14"] > 20)
-
-    eligible = bool(cond_close_above_sma50 and cond_ema21_above_sma50 and cond_rs_positive and cond_adx_ok)
-    details = {
-        "close_above_sma50": cond_close_above_sma50,
-        "ema21_above_sma50": cond_ema21_above_sma50,
-        "rs20_positive": cond_rs_positive,
-        "adx14_gt_20": cond_adx_ok,
-    }
-    return eligible, details
-
-def is_eligible(stock_row: pd.Series, rs_20: Optional[float] = None) -> bool:
+def is_eligible(stock_row: pd.Series) -> bool:
+    """Healthy-trend filter used for stock entries and CSP scan."""
     try:
         close = float(stock_row["Close"])
         sma50 = float(stock_row["SMA_50"])
@@ -139,86 +152,86 @@ def is_eligible(stock_row: pd.Series, rs_20: Optional[float] = None) -> bool:
         adx = float(stock_row["ADX_14"])
     except Exception:
         return False
+    return bool(close > sma50 and ema21 > sma50 and adx > 20)
 
-    base = bool(close > sma50 and ema21 > sma50 and adx > 20)
-    if rs_20 is None:
-        return base
-    return bool(base and float(rs_20) > 0)
 
 def pullback_signal(stock_row: pd.Series) -> bool:
-    rsi_ok = bool(stock_row["RSI_2"] < 5)
-    ema_21 = float(stock_row["EMA_21"])
-    close = float(stock_row["Close"])
-    near_ema = abs(close - ema_21) / ema_21 < 0.005
+    # Very short-term oversold + close near EMA21
+    try:
+        rsi2 = float(stock_row["RSI_2"])
+        ema21 = float(stock_row["EMA_21"])
+        close = float(stock_row["Close"])
+    except Exception:
+        return False
+    rsi_ok = rsi2 < 5
+    near_ema = abs(close - ema21) / max(ema21, 1e-9) < 0.005
     return bool(rsi_ok and near_ema)
 
+
 def breakout_signal(stock_row: pd.Series) -> bool:
-    cond_price = bool(stock_row["Close"] > stock_row["HIGH_20"])
-    cond_vol = bool(stock_row["Volume"] > 1.5 * stock_row["VOL_SMA_10"])
-    return bool(cond_price and cond_vol)
+    # 20D breakout + volume expansion
+    try:
+        close = float(stock_row["Close"])
+        high20 = float(stock_row["HIGH_20"])
+        vol = float(stock_row["Volume"])
+        vol_sma = float(stock_row["VOL_SMA_10"])
+    except Exception:
+        return False
+    return bool(close > high20 and vol > 1.5 * vol_sma)
 
 
-# ----------------------------
-# Open positions (stock swing trades - INDIVIDUAL account)
-# ----------------------------
+def nextday_valid_for_entry(signal: str, last: pd.Series) -> bool:
+    """Heuristic to prefer signals that are still tradable the next day (EOD run)."""
+    if not STOCK_REQUIRE_NEXTDAY_VALIDATION:
+        return True
 
-def load_open_positions() -> Dict[str, dict]:
-    positions: Dict[str, dict] = {}
-    if not os.path.isfile(POSITIONS_FILE):
-        return positions
-    with open(POSITIONS_FILE, mode="r", newline="") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            positions[row["ticker"]] = row
-    return positions
+    try:
+        close = float(last["Close"])
+        ema21 = float(last["EMA_21"])
+        atr = float(last.get("ATR_14", 0) or 0)
+        high20 = float(last["HIGH_20"])
+        vol = float(last["Volume"])
+        vol_sma = float(last.get("VOL_SMA_10", 0) or 0)
+    except Exception:
+        return False
 
-def save_open_positions(positions: Dict[str, dict]) -> None:
-    fieldnames = ["ticker", "entry_date", "entry_price", "entry_type", "initial_stop"]
-    with open(POSITIONS_FILE, mode="w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
-        w.writeheader()
-        for _, pos in positions.items():
-            w.writerow(pos)
+    if signal == "PULLBACK":
+        # Don't chase if it already bounced far above EMA21 into the close
+        return bool(abs(close - ema21) / max(ema21, 1e-9) <= 0.010)
 
-def log_closed_trade(trade: dict) -> None:
-    fieldnames = ["ticker","entry_date","entry_price","exit_date","exit_price","reason","pnl_abs","pnl_pct"]
-    file_exists = os.path.isfile(TRADES_LOG_FILE)
-    with open(TRADES_LOG_FILE, mode="a", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
-        if not file_exists:
-            w.writeheader()
-        w.writerow(trade)
+    # BREAKOUT: avoid blow-off; require real vol
+    if atr > 0 and close > high20 + atr:
+        return False
+    if vol_sma > 0 and vol < 1.3 * vol_sma:
+        return False
+    return True
 
 
-# ----------------------------
-# Retirement positions (stock-only tracking)
-# ----------------------------
+# ============================================================
+# Retirement holdings inventory (long holds)
+# ============================================================
 
 RETIREMENT_FIELDS = [
-    "account",         # IRA / ROTH
-    "ticker",
-    "shares",
-    "entry_price",
-    "entry_date",
-    "current_price",
-    "pct_change",
-    "breakeven_target",
-    "flag_breakeven_only",
-    "notes",
+    "account", "ticker", "shares", "entry_price", "entry_date",
+    "current_price", "pct_change", "breakeven_target", "flag_breakeven_only", "notes",
 ]
 
+
 def ensure_retirement_file() -> None:
-    if not os.path.isfile(RETIREMENT_POSITIONS_FILE):
-        with open(RETIREMENT_POSITIONS_FILE, "w", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=RETIREMENT_FIELDS)
-            w.writeheader()
+    if os.path.isfile(RETIREMENT_POSITIONS_FILE):
+        return
+    with open(RETIREMENT_POSITIONS_FILE, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=RETIREMENT_FIELDS)
+        w.writeheader()
+
 
 def load_retirement_positions() -> List[dict]:
     ensure_retirement_file()
     with open(RETIREMENT_POSITIONS_FILE, "r", newline="") as f:
         return list(csv.DictReader(f))
 
-def save_retirement_positions(rows: List[dict]) -> None:
+
+def write_retirement_positions(rows: List[dict]) -> None:
     ensure_retirement_file()
     with open(RETIREMENT_POSITIONS_FILE, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=RETIREMENT_FIELDS)
@@ -226,101 +239,514 @@ def save_retirement_positions(rows: List[dict]) -> None:
         for r in rows:
             w.writerow({k: r.get(k, "") for k in RETIREMENT_FIELDS})
 
-def retirement_should_be_breakeven_only(entry_price: float, current_price: float) -> bool:
+
+def retirement_flag_breakeven_only(entry_price: float, current_price: float) -> bool:
     if entry_price <= 0:
         return False
     dd = (current_price - entry_price) / entry_price
     return bool(dd <= -float(RETIREMENT_BREAKEVEN_ONLY_DD_PCT))
 
-def update_retirement_marks() -> Dict[str, float]:
-    """Update current_price / pct_change / breakeven flags in retirement_positions.csv.
 
-    Returns a summary: {account: market_value}
-    """
+def update_retirement_marks() -> Tuple[Dict[str, dict], List[str]]:
+    """Update current_price/pct_change + breakeven-only flags. Returns (by_key, flagged_tickers)."""
     rows = load_retirement_positions()
     if not rows:
-        return {}
+        return {}, []
 
-    # group tickers for a small batch download
     tickers = sorted({(r.get("ticker") or "").strip().upper() for r in rows if (r.get("ticker") or "").strip()})
-    px: Dict[str, float] = {}
+    last_close: Dict[str, float] = {}
 
-    if tickers:
+    for tkr in tickers:
         try:
-            df = yf.download(" ".join(tickers), period="7d", interval="1d", auto_adjust=False, progress=False)
+            df = yf.download(tkr, period="7d", interval="1d", auto_adjust=False, progress=False)
             df.dropna(inplace=True)
             if isinstance(df.columns, pd.MultiIndex):
-                # df["Close"] becomes a DataFrame with tickers as columns
-                close = df["Close"]
-                for t in tickers:
-                    try:
-                        px[t] = float(close[t].iloc[-1])
-                    except Exception:
-                        pass
-            else:
-                # single ticker
-                try:
-                    px[tickers[0]] = float(df["Close"].iloc[-1])
-                except Exception:
-                    pass
+                df.columns = df.columns.get_level_values(0)
+            if not df.empty:
+                last_close[tkr] = float(df["Close"].iloc[-1])
         except Exception:
-            px = {}
+            continue
 
-    mv_by_acct: Dict[str, float] = {}
+    flagged = set()
+    by_key: Dict[str, dict] = {}
 
     for r in rows:
-        t = (r.get("ticker") or "").strip().upper()
         acct = (r.get("account") or "").strip().upper()
-        try:
-            shares = float(r.get("shares") or 0.0)
-        except Exception:
-            shares = 0.0
+        tkr = (r.get("ticker") or "").strip().upper()
+        if not acct or not tkr:
+            continue
+
         try:
             entry = float(r.get("entry_price") or 0.0)
         except Exception:
             entry = 0.0
 
-        cur = px.get(t)
-        if cur is None:
-            # keep previous if present
+        px = last_close.get(tkr)
+        if px is None:
+            continue
+
+        r["current_price"] = f"{px:.2f}"
+        if entry > 0:
+            pct = (px - entry) / entry
+            r["pct_change"] = f"{pct*100:.2f}"
+            be_only = retirement_flag_breakeven_only(entry, px)
+            r["flag_breakeven_only"] = "1" if be_only else "0"
+            r["breakeven_target"] = f"{entry:.2f}" if be_only else ""
+            if be_only:
+                flagged.add(tkr)
+
+        by_key[f"{acct}:{tkr}"] = r
+
+    write_retirement_positions(rows)
+    return by_key, sorted(flagged)
+
+
+def retirement_market_value_by_account(ret_by_key: Dict[str, dict]) -> Dict[str, float]:
+    mv = {INDIVIDUAL: 0.0, IRA: 0.0, ROTH: 0.0}
+    for _, r in ret_by_key.items():
+        acct = (r.get("account") or "").strip().upper()
+        if acct not in mv:
+            continue
+        try:
+            sh = float(r.get("shares") or 0.0)
+            px = float(r.get("current_price") or 0.0)
+            mv[acct] += sh * px
+        except Exception:
+            continue
+    return mv
+
+
+# ============================================================
+# Stock swing / tactical positions (paper execution)
+# ============================================================
+
+STOCK_POS_FIELDS = [
+    "id",
+    "account",
+    "ticker",
+    "signal",
+    "plan_date",
+    "entry_date",
+    "entry_price",
+    "shares",
+    "stop_price",
+    "target_price",
+    "risk_per_share",
+    "r_multiple_target",
+    "status",          # OPEN / CLOSED
+    "exit_date",
+    "exit_price",
+    "exit_reason",
+    "pnl_abs",
+    "pnl_pct",
+    "notes",
+]
+
+STOCK_TRADE_FIELDS = [
+    "id",
+    "account",
+    "ticker",
+    "entry_date",
+    "entry_price",
+    "shares",
+    "exit_date",
+    "exit_price",
+    "reason",
+    "pnl_abs",
+    "pnl_pct",
+]
+
+
+def ensure_stock_files() -> None:
+    if not os.path.isfile(STOCK_POSITIONS_FILE):
+        with open(STOCK_POSITIONS_FILE, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=STOCK_POS_FIELDS)
+            w.writeheader()
+    if not os.path.isfile(STOCK_TRADES_FILE):
+        with open(STOCK_TRADES_FILE, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=STOCK_TRADE_FIELDS)
+            w.writeheader()
+
+
+def load_stock_positions() -> List[dict]:
+    ensure_stock_files()
+    with open(STOCK_POSITIONS_FILE, "r", newline="") as f:
+        return list(csv.DictReader(f))
+
+
+def write_stock_positions(rows: List[dict]) -> None:
+    ensure_stock_files()
+    with open(STOCK_POSITIONS_FILE, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=STOCK_POS_FIELDS)
+        w.writeheader()
+        for r in rows:
+            w.writerow({k: r.get(k, "") for k in STOCK_POS_FIELDS})
+
+
+def append_stock_trade(row: dict) -> None:
+    ensure_stock_files()
+    with open(STOCK_TRADES_FILE, "a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=STOCK_TRADE_FIELDS)
+        w.writerow({k: row.get(k, "") for k in STOCK_TRADE_FIELDS})
+
+
+def _stock_position_id(account: str, ticker: str, entry_date: str) -> str:
+    return f"{account}-{ticker}-{entry_date}"
+
+
+def stock_market_value_by_account(stock_positions: List[dict], prices: Dict[str, float]) -> Dict[str, float]:
+    mv = {INDIVIDUAL: 0.0, IRA: 0.0, ROTH: 0.0}
+    for r in stock_positions:
+        if (r.get("status") or "").upper() != "OPEN":
+            continue
+        acct = (r.get("account") or "").strip().upper()
+        tkr = (r.get("ticker") or "").strip().upper()
+        if acct not in mv or not tkr:
+            continue
+        px = prices.get(tkr)
+        if px is None:
+            continue
+        try:
+            sh = float(r.get("shares") or 0.0)
+            mv[acct] += sh * px
+        except Exception:
+            continue
+    return mv
+
+
+def _risk_pct_for_account(account: str) -> float:
+    return float(STOCK_RISK_PCT_INDIVIDUAL if account == INDIVIDUAL else STOCK_RISK_PCT_RETIREMENT)
+
+
+def _max_pos_pct_for_account(account: str) -> float:
+    return float(STOCK_MAX_POSITION_PCT_INDIVIDUAL if account == INDIVIDUAL else STOCK_MAX_POSITION_PCT_RETIREMENT)
+
+
+def _account_cap(account: str) -> float:
+    if account == INDIVIDUAL:
+        # INDIVIDUAL stock trading uses the non-wheel slice only
+        return float(INDIVIDUAL_STOCK_CAP)
+    return float(ACCOUNT_SIZES.get(account, 0))
+
+
+def plan_stock_trade(
+    *,
+    account: str,
+    ticker: str,
+    signal: str,
+    last: pd.Series,
+    mkt: Dict[str, float | bool],
+    existing_open_tickers: set,
+    acct_current_mv: float,
+    retirement_breakeven_only: bool,
+) -> Optional[dict]:
+    """Build a paper trade plan (entry/stop/target/shares)."""
+
+    account = account.upper().strip()
+    ticker = ticker.upper().strip()
+    signal = signal.upper().strip()
+
+    if not ticker or ticker in existing_open_tickers:
+        return None
+
+    try:
+        close = float(last["Close"])
+        ema21 = float(last["EMA_21"])
+        atr = float(last.get("ATR_14", 0) or 0)
+        high20 = float(last["HIGH_20"])
+    except Exception:
+        return None
+
+    if close <= 0:
+        return None
+    if signal not in ("PULLBACK", "BREAKOUT"):
+        return None
+    if not nextday_valid_for_entry(signal, last):
+        return None
+
+    # If retirement holding is breakeven-only, don't add new risk in that ticker.
+    if account in (IRA, ROTH) and retirement_breakeven_only:
+        return None
+
+    # Stop logic
+    if signal == "PULLBACK":
+        stop = ema21 - (STOCK_STOP_ATR_PULLBACK * atr) if atr > 0 else ema21 * 0.97
+        risk_ps = max(close - stop, 0.01)
+        target_r = close + STOCK_TARGET_R_MULTIPLE * risk_ps
+        target = max(high20, target_r)
+    else:
+        breakout_level = high20
+        stop = breakout_level - (STOCK_STOP_ATR_BREAKOUT * atr) if atr > 0 else breakout_level * 0.96
+        risk_ps = max(close - stop, 0.01)
+        target = close + STOCK_TARGET_R_MULTIPLE * risk_ps
+
+    cap = _account_cap(account)
+    if cap <= 0:
+        return None
+
+    # utilization cap (retirement keeps buffer)
+    util_cap = cap * (RETIREMENT_MAX_EQUITY_UTIL_PCT if account in (IRA, ROTH) else 1.0)
+
+    # Max position value constraint (this is what capped your MS size to 141 shares)
+    max_pos_value = util_cap * _max_pos_pct_for_account(account)
+
+    # Risk budget per trade
+    risk_cap = util_cap * _risk_pct_for_account(account)
+
+    # 1) shares by risk budget
+    shares = int(risk_cap // risk_ps)
+    if shares < 1:
+        return None
+
+    # 2) shares by max position value
+    shares = min(shares, int(max_pos_value // close))
+    if shares < 1:
+        return None
+
+    # 3) shares by remaining available allocation (current MV already deployed)
+    remaining = max(util_cap - float(acct_current_mv or 0.0), 0.0)
+    shares = min(shares, int(remaining // close))
+    if shares < 1:
+        return None
+
+    return {
+        "account": account,
+        "ticker": ticker,
+        "signal": signal,
+        "entry_price": float(close),
+        "stop_price": float(stop),
+        "target_price": float(target),
+        "shares": int(shares),
+        "risk_per_share": float(risk_ps),
+        "r_multiple_target": float(STOCK_TARGET_R_MULTIPLE),
+        "notes": f"{signal} plan (EOD close={close:.2f})",
+    }
+
+
+def execute_stock_plan(today: dt.date, plan: dict) -> str:
+    """Paper 'execution': record OPEN stock position immediately (filled at close)."""
+    ensure_stock_files()
+    rows = load_stock_positions()
+
+    entry_date = today.isoformat()
+
+    # If we already opened this ticker TODAY in IRA or ROTH, don't open it again
+    if plan.get("account") in (IRA, ROTH):
+        tkr = (plan.get("ticker") or "").strip().upper()
+        for r in rows:
+            if (r.get("status") or "").upper() != "OPEN":
+                continue
+            if (r.get("entry_date") or "") != entry_date:
+                continue
+            if (r.get("account") or "") not in (IRA, ROTH):
+                continue
+            if (r.get("ticker") or "").strip().upper() == tkr:
+                return (r.get("id") or "")
+
+
+    pos_id = _stock_position_id(plan["account"], plan["ticker"], entry_date)
+
+    # idempotent
+    if any((r.get("id") or "") == pos_id for r in rows):
+        return pos_id
+
+    rows.append({
+        "id": pos_id,
+        "account": plan["account"],
+        "ticker": plan["ticker"],
+        "signal": plan["signal"],
+        "plan_date": entry_date,
+        "entry_date": entry_date,
+        "entry_price": f"{float(plan['entry_price']):.2f}",
+        "shares": str(int(plan["shares"])),
+        "stop_price": f"{float(plan['stop_price']):.2f}",
+        "target_price": f"{float(plan['target_price']):.2f}",
+        "risk_per_share": f"{float(plan['risk_per_share']):.4f}",
+        "r_multiple_target": f"{float(plan['r_multiple_target']):.2f}",
+        "status": "OPEN",
+        "exit_date": "",
+        "exit_price": "",
+        "exit_reason": "",
+        "pnl_abs": "",
+        "pnl_pct": "",
+        "notes": plan.get("notes", ""),
+    })
+
+    write_stock_positions(rows)
+    return pos_id
+
+def last_close_prices(tickers: List[str]) -> Dict[str, float]:
+    """
+    Fetch last available daily Close for each ticker.
+    Returns { "AAPL": 195.12, ... }
+    """
+    tickers = sorted({(t or "").strip().upper() for t in tickers if (t or "").strip()})
+    if not tickers:
+        return {}
+
+    try:
+        df = yf.download(
+            tickers=" ".join(tickers),
+            period="7d",
+            interval="1d",
+            auto_adjust=False,
+            progress=False,
+            group_by="column",
+        )
+    except Exception:
+        return {}
+
+    prices: Dict[str, float] = {}
+
+    # Multi-ticker download => columns like ('Close','AAPL')
+    if isinstance(df.columns, pd.MultiIndex):
+        if ("Close" in df.columns.get_level_values(0)) and (len(df) > 0):
+            close = df["Close"].dropna(how="all")
+            if len(close) > 0:
+                last = close.iloc[-1].to_dict()
+                for k, v in last.items():
+                    try:
+                        prices[str(k).upper()] = float(v)
+                    except Exception:
+                        pass
+        return prices
+
+    # Single ticker download => columns like 'Close'
+    if "Close" in df.columns and len(df) > 0:
+        try:
+            v = float(df["Close"].dropna().iloc[-1])
+            prices[tickers[0]] = v
+        except Exception:
+            pass
+
+    return prices
+
+def update_and_close_stock_positions(today: dt.date, mkt: Dict[str, float | bool]) -> Dict[str, List[str]]:
+    """Update OPEN stock positions and close them if stop/target hit (paper, based on latest close)."""
+    ensure_stock_files()
+    rows = load_stock_positions()
+    if not rows:
+        return {"stops": [], "targets": []}
+
+    open_rows = [r for r in rows if (r.get("status") or "").upper() == "OPEN"]
+    if not open_rows:
+        return {"stops": [], "targets": []}
+
+    tickers = sorted({(r.get("ticker") or "").strip().upper() for r in open_rows if (r.get("ticker") or "").strip()})
+    prices: Dict[str, float] = {}
+
+    for tkr in tickers:
+        try:
+            df = yf.download(tkr, period="7d", interval="1d", auto_adjust=False, progress=False)
+            df.dropna(inplace=True)
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            if not df.empty:
+                prices[tkr] = float(df["Close"].iloc[-1])
+        except Exception:
+            continue
+
+    stops: List[str] = []
+    targets: List[str] = []
+
+    changed = False
+    for r in rows:
+        if (r.get("status") or "").upper() != "OPEN":
+            continue
+
+        tkr = (r.get("ticker") or "").strip().upper()
+        px = prices.get(tkr)
+        if px is None:
+            continue
+
+        try:
+            entry = float(r.get("entry_price") or 0.0)
+            stop = float(r.get("stop_price") or 0.0)
+            target = float(r.get("target_price") or 0.0)
+            sh = int(float(r.get("shares") or 0))
+        except Exception:
+            continue
+
+        if sh <= 0 or entry <= 0:
+            continue
+
+        # Optional: move stop to breakeven after +1R
+        if STOCK_USE_BREAKEVEN_TRAIL:
             try:
-                cur = float(r.get("current_price") or 0.0)
+                risk_ps = float(r.get("risk_per_share") or 0.0)
             except Exception:
-                cur = 0.0
+                risk_ps = 0.0
+            if risk_ps > 0 and (px - entry) >= (STOCK_BREAKEVEN_AFTER_R * risk_ps):
+                new_stop = max(stop, entry)
+                if new_stop != stop:
+                    stop = new_stop
+                    r["stop_price"] = f"{stop:.2f}"
+                    changed = True
 
-        r["current_price"] = f"{float(cur):.2f}" if cur else ""
-        pct = ((cur - entry) / entry) if (entry and cur) else 0.0
-        r["pct_change"] = f"{pct*100.0:.2f}" if (entry and cur) else ""
+        exit_reason = None
+        if stop > 0 and px <= stop:
+            exit_reason = "STOP"
+        elif target > 0 and px >= target:
+            exit_reason = "TARGET"
 
-        flag = retirement_should_be_breakeven_only(entry, cur) if (entry and cur) else False
-        r["flag_breakeven_only"] = "1" if flag else "0"
-        r["breakeven_target"] = f"{entry:.2f}" if flag else ""
+        if not exit_reason:
+            continue
 
-        mv_by_acct[acct] = mv_by_acct.get(acct, 0.0) + float(cur or 0.0) * float(shares or 0.0)
+        pnl_abs = (px - entry) * sh
+        pnl_pct = (px - entry) / entry
 
-    save_retirement_positions(rows)
-    return mv_by_acct
+        r["status"] = "CLOSED"
+        r["exit_date"] = today.isoformat()
+        r["exit_price"] = f"{px:.2f}"
+        r["exit_reason"] = exit_reason
+        r["pnl_abs"] = f"{pnl_abs:.2f}"
+        r["pnl_pct"] = f"{pnl_pct*100:.2f}"
+        changed = True
+
+        append_stock_trade({
+            "id": r.get("id", ""),
+            "account": r.get("account", ""),
+            "ticker": tkr,
+            "entry_date": r.get("entry_date", ""),
+            "entry_price": r.get("entry_price", ""),
+            "shares": r.get("shares", ""),
+            "exit_date": r.get("exit_date", ""),
+            "exit_price": r.get("exit_price", ""),
+            "reason": exit_reason,
+            "pnl_abs": r.get("pnl_abs", ""),
+            "pnl_pct": r.get("pnl_pct", ""),
+        })
+
+        if exit_reason == "STOP":
+            stops.append(f"{tkr} @{px:.2f}")
+        else:
+            targets.append(f"{tkr} @{px:.2f}")
+
+    if changed:
+        write_stock_positions(rows)
+
+    return {"stops": stops, "targets": targets}
 
 
-# ----------------------------
+# ============================================================
 # CSP planning / bookkeeping (paper)
-# ----------------------------
+# ============================================================
 
 def _iso_week_id(d: dt.date) -> str:
     y, w, _ = d.isocalendar()
     return f"{y}-W{w:02d}"
 
+
 def ensure_positions_files() -> None:
-    # CSP positions file
     if not os.path.isfile(CSP_POSITIONS_FILE):
         with open(CSP_POSITIONS_FILE, "w", newline="") as f:
             w = csv.DictWriter(f, fieldnames=CSP_POSITIONS_COLUMNS)
             w.writeheader()
-    # CC positions file
     if not os.path.isfile(CC_POSITIONS_FILE):
         with open(CC_POSITIONS_FILE, "w", newline="") as f:
             w = csv.DictWriter(f, fieldnames=CC_POSITIONS_COLUMNS)
             w.writeheader()
+
 
 def load_csv_rows(path: str) -> List[dict]:
     if not os.path.isfile(path):
@@ -328,12 +754,14 @@ def load_csv_rows(path: str) -> List[dict]:
     with open(path, "r", newline="") as f:
         return list(csv.DictReader(f))
 
+
 def write_csv_rows(path: str, rows: List[dict], fieldnames: List[str]) -> None:
     with open(path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
         for r in rows:
-            w.writerow({k: r.get(k, "") for k in fieldnames})
+            w.writerow(r)
+
 
 def append_csp_ledger_row(row: dict) -> None:
     fieldnames = ["date","week_id","ticker","expiry","strike","contracts","credit_mid","cash_reserved","est_premium","tier"]
@@ -344,6 +772,7 @@ def append_csp_ledger_row(row: dict) -> None:
             w.writeheader()
         w.writerow(row)
 
+
 def csp_already_logged(ledger_rows: List[dict], week_id: str, ticker: str, expiry: str, strike: float) -> bool:
     for r in ledger_rows:
         try:
@@ -353,8 +782,6 @@ def csp_already_logged(ledger_rows: List[dict], week_id: str, ticker: str, expir
             continue
     return False
 
-def is_csp_eligible(stock_row: pd.Series) -> bool:
-    return bool(stock_row["Close"] > stock_row["SMA_200"] and stock_row["Volume"] > 1_000_000)
 
 def _pick_expiry_in_dte_range(ticker_obj: yf.Ticker, dte_min: int, dte_max: int) -> Tuple[Optional[str], Optional[int]]:
     today = dt.date.today()
@@ -372,6 +799,7 @@ def _pick_expiry_in_dte_range(ticker_obj: yf.Ticker, dte_min: int, dte_max: int)
             return exp_str, dte
     return None, None
 
+
 def _suggest_put_strike(stock_last: pd.Series, atr_mult: float) -> float:
     close = float(stock_last["Close"])
     ema21 = float(stock_last["EMA_21"])
@@ -380,6 +808,7 @@ def _suggest_put_strike(stock_last: pd.Series, atr_mult: float) -> float:
         return ema21 - (atr_mult * atr14)
     return close * 0.92
 
+
 def _round_strike_to_chain(puts_df: pd.DataFrame, target_strike: float) -> float:
     strikes = sorted([float(s) for s in puts_df["strike"].tolist()])
     below = [s for s in strikes if s <= target_strike]
@@ -387,21 +816,25 @@ def _round_strike_to_chain(puts_df: pd.DataFrame, target_strike: float) -> float
         return strikes[0]
     return below[-1]
 
+
 def evaluate_csp_candidate(
     ticker: str,
     df: pd.DataFrame,
     atr_mult: float = 0.50,
 ) -> Optional[dict]:
-    """Evaluate a single CSP candidate.
+    """Evaluate a single CSP candidate (enforces share price cap)."""
+    if df is None or df.empty:
+        return None
 
-    HARD RULE: underlying must be <= CSP_MAX_SHARE_PRICE (e.g. <= $65).
-    """
+    stock_last = df.iloc[-1]
     try:
-        last = df.iloc[-1]
-        close_px = float(last.get("Close", 0) or 0)
-        if close_px <= 0 or close_px > CSP_MAX_SHARE_PRICE:
-            return None
+        close_px = float(stock_last.get("Close", 0) or 0)
+    except Exception:
+        close_px = 0.0
+    if close_px > CSP_MAX_SHARE_PRICE:
+        return None
 
+    try:
         t = yf.Ticker(ticker)
         exp_str, dte = _pick_expiry_in_dte_range(t, CSP_TARGET_DTE_MIN, CSP_TARGET_DTE_MAX)
         if not exp_str:
@@ -412,7 +845,7 @@ def evaluate_csp_candidate(
         if puts.empty:
             return None
 
-        raw_strike = _suggest_put_strike(last, atr_mult=atr_mult)
+        raw_strike = _suggest_put_strike(stock_last, atr_mult=atr_mult)
         strike = _round_strike_to_chain(puts, raw_strike)
 
         row = puts.loc[puts["strike"] == strike]
@@ -430,7 +863,7 @@ def evaluate_csp_candidate(
             return None
         if oi < CSP_MIN_OI or vol < CSP_MIN_VOLUME:
             return None
-        if float(CSP_MIN_IV or 0.0) > 0 and iv < float(CSP_MIN_IV):
+        if CSP_MIN_IV and iv < CSP_MIN_IV:
             return None
 
         mid = (bid + ask) / 2.0
@@ -442,7 +875,7 @@ def evaluate_csp_candidate(
 
         est_premium = mid * 100.0 * contracts
         cash_reserved = cash_required_per_contract * contracts
-        yield_pct = est_premium / cash_reserved
+        yield_pct = est_premium / cash_reserved if cash_reserved > 0 else 0.0
 
         return {
             "ticker": ticker,
@@ -463,12 +896,14 @@ def evaluate_csp_candidate(
     except Exception:
         return None
 
+
 def csp_regime(vix_close: float) -> str:
     if vix_close < 18:
         return "LOW_IV"
     if vix_close <= 25:
         return "NORMAL"
     return "HIGH_IV"
+
 
 def classify_csp_tier(idea: dict) -> str:
     prem = float(idea["est_premium"])
@@ -480,6 +915,7 @@ def classify_csp_tier(idea: dict) -> str:
     if prem >= CSP_MIN_PREMIUM_CONSERVATIVE and y >= CSP_MIN_YIELD_CONSERVATIVE:
         return "CONSERVATIVE"
     return "REJECT"
+
 
 def score_csp_idea(idea: dict) -> float:
     prem = float(idea["est_premium"])
@@ -493,10 +929,12 @@ def score_csp_idea(idea: dict) -> float:
     s += 0.5 if 30 <= dte <= 40 else 0.0
     return float(s)
 
+
 def allowed_tiers_for_regime(reg: str) -> set:
     if reg == "LOW_IV":
         return {"CONSERVATIVE", "BALANCED"}
     return {"CONSERVATIVE", "BALANCED", "AGGRESSIVE"}
+
 
 def plan_weekly_csp_orders(
     csp_candidates: List[dict],
@@ -570,8 +1008,10 @@ def plan_weekly_csp_orders(
         "total_remaining_after": max(total_remaining, 0.0),
     }
 
+
 def make_csp_position_id(ticker: str, expiry: str, strike: float, open_date: str) -> str:
     return f"{ticker}-{expiry}-{float(strike):.2f}-{open_date}"
+
 
 def add_csp_position_from_selected(today: str, week_id: str, idea: dict) -> str:
     ensure_positions_files()
@@ -611,6 +1051,7 @@ def add_csp_position_from_selected(today: str, week_id: str, idea: dict) -> str:
     write_csv_rows(CSP_POSITIONS_FILE, rows, CSP_POSITIONS_COLUMNS)
     return pos_id
 
+
 def update_open_csp_status(today: dt.date) -> None:
     ensure_positions_files()
     rows = load_csv_rows(CSP_POSITIONS_FILE)
@@ -630,9 +1071,8 @@ def update_open_csp_status(today: dt.date) -> None:
             df.dropna(inplace=True)
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
-            if df.empty:
-                continue
-            last_close[tkr] = float(df["Close"].iloc[-1])
+            if not df.empty:
+                last_close[tkr] = float(df["Close"].iloc[-1])
         except Exception:
             continue
 
@@ -664,6 +1104,7 @@ def update_open_csp_status(today: dt.date) -> None:
         r["itm_otm"] = "ITM" if px < strike else "OTM"
 
     write_csv_rows(CSP_POSITIONS_FILE, rows, CSP_POSITIONS_COLUMNS)
+
 
 def process_csp_expirations(today: dt.date) -> Dict[str, List[str]]:
     ensure_positions_files()
@@ -725,6 +1166,7 @@ def process_csp_expirations(today: dt.date) -> Dict[str, List[str]]:
     write_csv_rows(CSP_POSITIONS_FILE, rows, CSP_POSITIONS_COLUMNS)
     return {"expired": expired, "assigned": assigned}
 
+
 def get_open_csp_tickers(today: dt.date) -> set:
     rows = load_csv_rows(CSP_POSITIONS_FILE)
     out = set()
@@ -745,17 +1187,18 @@ def get_open_csp_tickers(today: dt.date) -> set:
     return out
 
 
-# ----------------------------
-# CC planning from assigned lots (classic wheel)
-# ----------------------------
+# ============================================================
+# CC planning from assigned CSPs (classic wheel)
+# ============================================================
 
 def decide_cc_strike(current_price: float, assigned_strike: float) -> Tuple[str, Optional[float]]:
-    pct_from = (current_price - assigned_strike) / assigned_strike
+    pct_from = (current_price - assigned_strike) / assigned_strike if assigned_strike > 0 else 0.0
     if abs(pct_from) <= 0.02:
         return "SELL_CC", max(current_price, assigned_strike) * 1.02
     if -0.08 <= pct_from < -0.02:
         return "SELL_CC", assigned_strike
     return "WAIT", None
+
 
 def _round_call_strike_to_chain(calls_df: pd.DataFrame, target_strike: float) -> float:
     strikes = sorted([float(s) for s in calls_df["strike"].tolist()])
@@ -764,11 +1207,14 @@ def _round_call_strike_to_chain(calls_df: pd.DataFrame, target_strike: float) ->
         return strikes[-1]
     return above[0]
 
+
 def plan_covered_calls(today: dt.date, assigned_rows: List[dict], open_cc_tickers: set) -> List[dict]:
     ideas: List[dict] = []
     for pos in assigned_rows:
         ticker = (pos.get("ticker") or "").strip().upper()
-        if not ticker or ticker in open_cc_tickers:
+        if not ticker:
+            continue
+        if ticker in open_cc_tickers:
             continue
 
         try:
@@ -788,6 +1234,8 @@ def plan_covered_calls(today: dt.date, assigned_rows: List[dict], open_cc_ticker
 
         try:
             df = add_indicators(download_ohlcv(ticker))
+            if df.empty:
+                continue
             last = df.iloc[-1]
             current_price = float(last["Close"])
         except Exception:
@@ -802,7 +1250,6 @@ def plan_covered_calls(today: dt.date, assigned_rows: List[dict], open_cc_ticker
             exp_str, _ = _pick_expiry_in_dte_range(t, 14, 30)
             if not exp_str:
                 continue
-
             chain = t.option_chain(exp_str)
             calls = chain.calls.copy()
             if calls.empty:
@@ -821,7 +1268,7 @@ def plan_covered_calls(today: dt.date, assigned_rows: List[dict], open_cc_ticker
                 "expiry": exp_str,
                 "strike": float(strike),
                 "contracts": int(contracts),
-                "mid": float(mid),
+                "credit_mid": float(mid),
                 "reason": f"Wheel CC vs assigned {assigned_strike:.0f}",
             })
         except Exception:
@@ -829,19 +1276,18 @@ def plan_covered_calls(today: dt.date, assigned_rows: List[dict], open_cc_ticker
 
     return ideas
 
+
 def load_open_cc_tickers() -> set:
     ensure_positions_files()
     rows = load_csv_rows(CC_POSITIONS_FILE)
-    out = set()
-    for r in rows:
-        if (r.get("status") or "").upper() == "OPEN":
-            t = (r.get("ticker") or "").strip().upper()
-            if t:
-                out.add(t)
-    return out
+    return {(r.get("ticker") or "").strip().upper()
+            for r in rows
+            if (r.get("status") or "").upper() == "OPEN"}
+
 
 def make_cc_position_id(ticker: str, expiry: str, strike: float, open_date: str) -> str:
     return f"{ticker}-{expiry}-{float(strike):.2f}-{open_date}"
+
 
 def add_cc_position_from_candidate(today: str, idea: dict) -> str:
     ensure_positions_files()
@@ -857,7 +1303,7 @@ def add_cc_position_from_candidate(today: str, idea: dict) -> str:
         "expiry": idea["expiry"],
         "strike": f"{float(idea['strike']):.2f}",
         "contracts": str(int(idea["contracts"])),
-        "credit_mid": f"{float(idea['mid']):.2f}",
+        "credit_mid": f"{float(idea['credit_mid']):.2f}",
         "status": "OPEN",
         "close_date": "",
         "close_type": "",
