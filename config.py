@@ -10,6 +10,8 @@ WEBHOOK_URL = ""
 # Stock swing / tactical tracking (paper)
 STOCK_POSITIONS_FILE = "stock_positions.csv"
 STOCK_TRADES_FILE = "stock_trades.csv"
+STOCK_FILLS_FILE = "stock_fills.csv"
+STOCK_MONTHLY_DIR = "stock_monthly"
 
 # Legacy single-account swing tracking is replaced by the files above
 # (kept only if you still want them elsewhere)
@@ -28,6 +30,15 @@ WHEEL_MONTHLY_DIR = "wheel_monthly"
 
 # Retirement holdings tracking (stock-only “inventory”, separate from swing trades)
 RETIREMENT_POSITIONS_FILE = "retirement_positions.csv"
+
+# ============================================================
+# Stock scale-in (average-down) rules (paper)
+# ============================================================
+STOCK_MAX_ADDS_PER_POSITION = 1
+STOCK_ADD_COOLDOWN_DAYS = 5
+STOCK_ADD_MIN_DRAWdown_PCT = 0.03   # require position to be down at least this much vs avg entry to consider an ADD
+STOCK_ADD_NEAR_EMA21_ATR = 0.50     # must be within +/- this * ATR of EMA21
+STOCK_ADD_RSI14_MIN = 45
 
 # ============================================================
 # Accounts / Allocation
@@ -75,6 +86,10 @@ ALLOW_MULTI_ACCOUNT_SAME_TICKER = False
 STOCK_MIN_POSITION_VALUE_INDIVIDUAL = 1_500
 STOCK_MIN_POSITION_VALUE_RETIREMENT = 3_000
 
+# --- Stock sizing caps (swing stocks) ---
+STOCK_MAX_POSITION_PCT_INDIVIDUAL = 0.15   # 15% of account per stock
+STOCK_MAX_POSITION_PCT_RETIREMENT = 0.15 
+
 # Gating by market regime
 # - INDIVIDUAL swing trades are strict
 # - IRA/ROTH tactical trades are slightly less strict (still avoid broken markets)
@@ -86,10 +101,6 @@ STOCK_GATE_RETIREMENT = "SOFT"     # SOFT   = SPY>200 & VIX<25
 # We size shares to keep risk per trade within these caps.
 STOCK_RISK_PCT_INDIVIDUAL = 0.050   # 5.0% of INDIVIDUAL_STOCK_CAP per trade
 STOCK_RISK_PCT_RETIREMENT = 0.050   # 5.0% of account per trade
-
-# Max position size as a % of account MV (avoid concentration)
-STOCK_MAX_POSITION_PCT_INDIVIDUAL = 0.10
-STOCK_MAX_POSITION_PCT_RETIREMENT = 0.5
 
 # Targets / exits
 STOCK_TARGET_R_MULTIPLE = 2.0           # take-profit at ~2R
@@ -180,19 +191,12 @@ CSP_POSITIONS_COLUMNS = [
     "week_id",
     "ticker",
     "expiry",
-    "dte_open",
     "strike",
     "contracts",
-    "credit_mid",
+    "premium",
     "cash_reserved",
-    "est_premium",
     "tier",
     "status",
-    "underlying_last",
-    "strike_diff",
-    "strike_diff_pct",
-    "dte_remaining",
-    "itm_otm",
     "close_date",
     "close_type",
     "underlying_close_at_expiry",
@@ -208,8 +212,8 @@ CC_POSITIONS_COLUMNS = [
     "expiry",
     "strike",
     "contracts",
-    "credit_mid",
-    "status",  # OPEN / EXPIRED / CALLED_AWAY
+    "premium",
+    "status",
     "close_date",
     "close_type",
     "notes",

@@ -16,6 +16,8 @@ from config import (
 
     # files
     STOCK_POSITIONS_FILE, STOCK_TRADES_FILE,
+    STOCK_FILLS_FILE,
+    STOCK_MONTHLY_DIR,
     RETIREMENT_POSITIONS_FILE,
     CSP_LEDGER_FILE, CSP_POSITIONS_FILE, CC_POSITIONS_FILE,
 
@@ -30,6 +32,11 @@ from config import (
     STOCK_REQUIRE_NEXTDAY_VALIDATION,
     STOCK_RISK_PCT_INDIVIDUAL, STOCK_RISK_PCT_RETIREMENT,
     STOCK_MAX_POSITION_PCT_INDIVIDUAL, STOCK_MAX_POSITION_PCT_RETIREMENT,
+    STOCK_MAX_ADDS_PER_POSITION,
+    STOCK_ADD_COOLDOWN_DAYS,
+    STOCK_ADD_MIN_DRAWdown_PCT,
+    STOCK_ADD_NEAR_EMA21_ATR,
+    STOCK_ADD_RSI14_MIN,
     STOCK_TARGET_R_MULTIPLE,
     STOCK_BREAKEVEN_AFTER_R,
     STOCK_USE_BREAKEVEN_TRAIL,
@@ -82,6 +89,7 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     df["ATR_14"] = ta.volatility.average_true_range(high=high, low=low, close=close, window=14)
     df["RSI_2"] = ta.momentum.rsi(close, window=2)
+    df["RSI_14"] = ta.momentum.rsi(close, window=14)
     df["ADX_14"] = ta.trend.adx(high=high, low=low, close=close, window=14)
 
     df["VOL_SMA_10"] = volume.rolling(window=10).mean()
@@ -137,6 +145,15 @@ def market_context(today: dt.date) -> Dict[str, float | bool]:
     qqq_df = download_ohlcv("QQQ")
     vix_df = download_ohlcv("^VIX")
     return market_context_from_dfs(spy_df, qqq_df, vix_df)
+
+def trading_allowed(mkt: Dict) -> bool:
+    return bool(
+        mkt.get("spy_above_200")
+        and mkt.get("spy_above_50")
+        and mkt.get("spy_above_21")
+        and mkt.get("qqq_above_50")
+        and mkt.get("vix_below_25")
+    )
 
 
 # ============================================================
@@ -329,11 +346,15 @@ STOCK_POS_FIELDS = [
     "entry_date",
     "entry_price",
     "shares",
+    "adds",
+    "last_add_date",
+    "initial_entry_price",
+    "initial_shares",
     "stop_price",
     "target_price",
     "risk_per_share",
     "r_multiple_target",
-    "status",          # OPEN / CLOSED
+    "status",
     "exit_date",
     "exit_price",
     "exit_reason",
@@ -341,7 +362,6 @@ STOCK_POS_FIELDS = [
     "pnl_pct",
     "notes",
 ]
-
 STOCK_TRADE_FIELDS = [
     "id",
     "account",
@@ -356,6 +376,17 @@ STOCK_TRADE_FIELDS = [
     "pnl_pct",
 ]
 
+STOCK_FILL_FIELDS = [
+    "date",
+    "account",
+    "ticker",
+    "action",   # OPEN / ADD / CLOSE
+    "price",
+    "shares",
+    "reason",
+]
+
+
 
 def ensure_stock_files() -> None:
     if not os.path.isfile(STOCK_POSITIONS_FILE):
@@ -365,6 +396,10 @@ def ensure_stock_files() -> None:
     if not os.path.isfile(STOCK_TRADES_FILE):
         with open(STOCK_TRADES_FILE, "w", newline="") as f:
             w = csv.DictWriter(f, fieldnames=STOCK_TRADE_FIELDS)
+            w.writeheader()
+    if not os.path.isfile(STOCK_FILLS_FILE):
+        with open(STOCK_FILLS_FILE, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=STOCK_FILL_FIELDS)
             w.writeheader()
 
 
@@ -388,6 +423,74 @@ def append_stock_trade(row: dict) -> None:
     with open(STOCK_TRADES_FILE, "a", newline="") as f:
         w = csv.DictWriter(f, fieldnames=STOCK_TRADE_FIELDS)
         w.writerow({k: row.get(k, "") for k in STOCK_TRADE_FIELDS})
+
+def append_stock_fill(row: dict) -> None:
+    ensure_stock_files()
+    with open(STOCK_FILLS_FILE, "a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=STOCK_FILL_FIELDS)
+        w.writerow({k: row.get(k, "") for k in STOCK_FILL_FIELDS})
+
+def rebuild_stock_monthly_from_trades() -> None:
+    """Rebuild one CSV per month from stock_trades.csv (realized P/L on closes)."""
+    ensure_stock_files()
+    if not os.path.isfile(STOCK_TRADES_FILE):
+        return
+    with open(STOCK_TRADES_FILE, "r", newline="") as f:
+        rows = list(csv.DictReader(f))
+    if not rows:
+        return
+
+    os.makedirs(STOCK_MONTHLY_DIR, exist_ok=True)
+
+    by_month: Dict[str, List[dict]] = {}
+    for r in rows:
+        d = (r.get("exit_date") or "").strip()
+        if len(d) < 7:
+            continue
+        month = d[:7]
+        by_month.setdefault(month, []).append(r)
+
+    out_fields = ["date","account","ticker","shares","entry_price","exit_price","reason","pnl_abs","pnl_pct"]
+
+    for month, mrows in sorted(by_month.items()):
+        out_rows: List[dict] = []
+        total = 0.0
+        for r in mrows:
+            try:
+                pnl = float(r.get("pnl_abs") or 0.0)
+            except Exception:
+                pnl = 0.0
+            total += pnl
+            out_rows.append({
+                "date": (r.get("exit_date") or ""),
+                "account": (r.get("account") or ""),
+                "ticker": (r.get("ticker") or ""),
+                "shares": (r.get("shares") or ""),
+                "entry_price": (r.get("entry_price") or ""),
+                "exit_price": (r.get("exit_price") or ""),
+                "reason": (r.get("reason") or ""),
+                "pnl_abs": f"{pnl:.2f}",
+                "pnl_pct": (r.get("pnl_pct") or ""),
+            })
+
+        out_rows.append({
+            "date": "",
+            "account": "",
+            "ticker": "TOTAL",
+            "shares": "",
+            "entry_price": "",
+            "exit_price": "",
+            "reason": "",
+            "pnl_abs": f"{total:.2f}",
+            "pnl_pct": "",
+        })
+
+        path = os.path.join(STOCK_MONTHLY_DIR, f"{month}.csv")
+        with open(path, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=out_fields)
+            w.writeheader()
+            for rr in out_rows:
+                w.writerow(rr)
 
 
 def _stock_position_id(account: str, ticker: str, entry_date: str) -> str:
@@ -428,7 +531,6 @@ def _account_cap(account: str) -> float:
         return float(INDIVIDUAL_STOCK_CAP)
     return float(ACCOUNT_SIZES.get(account, 0))
 
-
 def plan_stock_trade(
     *,
     account: str,
@@ -464,11 +566,11 @@ def plan_stock_trade(
     if not nextday_valid_for_entry(signal, last):
         return None
 
-    # If retirement holding is breakeven-only, don't add new risk in that ticker.
+    # Retirement guardrail
     if account in (IRA, ROTH) and retirement_breakeven_only:
         return None
 
-    # Stop logic
+    # --- Stop / target logic ---
     if signal == "PULLBACK":
         stop = ema21 - (STOCK_STOP_ATR_PULLBACK * atr) if atr > 0 else ema21 * 0.97
         risk_ps = max(close - stop, 0.01)
@@ -480,32 +582,38 @@ def plan_stock_trade(
         risk_ps = max(close - stop, 0.01)
         target = close + STOCK_TARGET_R_MULTIPLE * risk_ps
 
-    cap = _account_cap(account)
-    if cap <= 0:
+    # --- Account sizing ---
+    acct_size = _account_cap(account)
+    if acct_size <= 0:
         return None
 
-    # utilization cap (retirement keeps buffer)
-    util_cap = cap * (RETIREMENT_MAX_EQUITY_UTIL_PCT if account in (IRA, ROTH) else 1.0)
+    # Retirement keeps a utilization buffer
+    util_cap = acct_size * (
+        RETIREMENT_MAX_EQUITY_UTIL_PCT if account in (IRA, ROTH) else 1.0
+    )
 
-    # Max position value constraint (this is what capped your MS size to 141 shares)
+    # --- Hard caps ---
     max_pos_value = util_cap * _max_pos_pct_for_account(account)
-
-    # Risk budget per trade
     risk_cap = util_cap * _risk_pct_for_account(account)
 
-    # 1) shares by risk budget
-    shares = int(risk_cap // risk_ps)
-    if shares < 1:
+    # --- 1) Risk-based sizing ---
+    risk_shares = int(risk_cap / risk_ps)
+    if risk_shares < 1:
         return None
 
-    # 2) shares by max position value
-    shares = min(shares, int(max_pos_value // close))
-    if shares < 1:
+    # --- 2) Position value cap ---
+    value_cap_shares = int(max_pos_value / close)
+    if value_cap_shares < 1:
         return None
 
-    # 3) shares by remaining available allocation (current MV already deployed)
-    remaining = max(util_cap - float(acct_current_mv or 0.0), 0.0)
-    shares = min(shares, int(remaining // close))
+    # --- 3) Remaining account capacity ---
+    remaining_value = max(util_cap - float(acct_current_mv or 0.0), 0.0)
+    remaining_shares = int(remaining_value / close)
+    if remaining_shares < 1:
+        return None
+
+    # --- Final shares = most restrictive ---
+    shares = min(risk_shares, value_cap_shares, remaining_shares)
     if shares < 1:
         return None
 
@@ -519,8 +627,229 @@ def plan_stock_trade(
         "shares": int(shares),
         "risk_per_share": float(risk_ps),
         "r_multiple_target": float(STOCK_TARGET_R_MULTIPLE),
-        "notes": f"{signal} plan (EOD close={close:.2f})",
+        "notes": (
+            f"{signal} plan | "
+            f"risk_cap=${risk_cap:,.0f}, "
+            f"max_pos=${max_pos_value:,.0f}"
+        ),
     }
+
+
+def plan_stock_add(
+    *,
+    today: dt.date,
+    position: dict,
+    df: pd.DataFrame,
+    mkt: Dict[str, float | bool],
+    acct_current_mv: float,
+) -> Optional[dict]:
+    """Plan a single technical scale-in (ADD) for an existing OPEN stock position.
+
+    Rules (anti-emotion):
+      - must be down vs avg entry by STOCK_ADD_MIN_DRAWdown_PCT
+      - trend intact: Close > SMA_50
+      - location: Close near EMA_21 (within +/- STOCK_ADD_NEAR_EMA21_ATR * ATR_14)
+      - confirmation: reclaim EMA_21 (yesterday below, today above)
+      - momentum improving: RSI_14 >= STOCK_ADD_RSI14_MIN and rising
+      - same risk/value caps used for initial entry
+      - max adds + cooldown enforced
+    """
+    try:
+        if (position.get("status") or "").upper() != "OPEN":
+            return None
+        account = (position.get("account") or "").strip().upper()
+        ticker = (position.get("ticker") or "").strip().upper()
+        entry = float(position.get("entry_price") or 0.0)
+        sh = int(float(position.get("shares") or 0))
+        stop = float(position.get("stop_price") or 0.0)
+        adds = int(float(position.get("adds") or 0))
+        last_add_date = (position.get("last_add_date") or "").strip()
+    except Exception:
+        return None
+
+    if not ticker or entry <= 0 or sh <= 0 or stop <= 0:
+        return None
+    if not trading_allowed(mkt):
+        return None
+    if adds >= int(STOCK_MAX_ADDS_PER_POSITION):
+        return None
+
+    # Cooldown between adds
+    if last_add_date:
+        try:
+            prev = dt.date.fromisoformat(last_add_date)
+            if (today - prev).days < int(STOCK_ADD_COOLDOWN_DAYS):
+                return None
+        except Exception:
+            pass
+
+    if df is None or df.empty or len(df) < 60:
+        return None
+
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+
+    try:
+        close = float(last["Close"])
+        prev_close = float(prev["Close"])
+        ema21 = float(last.get("EMA_21", 0.0) or 0.0)
+        prev_ema21 = float(prev.get("EMA_21", 0.0) or 0.0)
+        sma50 = float(last.get("SMA_50", 0.0) or 0.0)
+        atr = float(last.get("ATR_14", 0.0) or 0.0)
+        rsi14 = float(last.get("RSI_14", 0.0) or 0.0)
+        rsi14_prev = float(prev.get("RSI_14", 0.0) or 0.0)
+    except Exception:
+        return None
+
+    if close <= 0 or ema21 <= 0 or sma50 <= 0:
+        return None
+
+    # Must be meaningfully below avg entry (real average-down, not just scaling up)
+    if close > entry * (1.0 - float(STOCK_ADD_MIN_DRAWdown_PCT)):
+        return None
+
+    # Never add if we're at/through stop.
+    if close <= stop:
+        return None
+
+    # Trend guardrail
+    if close < sma50:
+        return None
+
+    # Location filter near EMA21
+    if atr > 0:
+        band = float(STOCK_ADD_NEAR_EMA21_ATR) * atr
+        if abs(close - ema21) > band:
+            return None
+
+    # Confirmation: reclaim EMA21
+    if not (prev_close < prev_ema21 and close > ema21):
+        return None
+
+    # Momentum improving
+    if rsi14 < float(STOCK_ADD_RSI14_MIN):
+        return None
+    if rsi14_prev and rsi14 <= rsi14_prev:
+        return None
+
+    cap = _account_cap(account)
+    if cap <= 0:
+        return None
+
+    util_cap = cap * (RETIREMENT_MAX_EQUITY_UTIL_PCT if account in (IRA, ROTH) else 1.0)
+
+    # Same caps as entry sizing
+    max_pos_value = util_cap * _max_pos_pct_for_account(account)
+    risk_cap = util_cap * _risk_pct_for_account(account)
+
+    # --- Remaining overall account capacity (prevents adds when account is already "full") ---
+    remaining_account_value = max(util_cap - float(acct_current_mv or 0.0), 0.0)
+    if remaining_account_value <= 0:
+        return None
+
+    # --- Current position value & remaining room under per-position cap ---
+    current_pos_value = close * sh
+    remaining_pos_value = max(max_pos_value - current_pos_value, 0.0)
+    if remaining_pos_value <= 0:
+        return None
+
+    # --- Risk-based total shares cap (total position risk <= risk_cap) ---
+    risk_ps = max(close - stop, 0.01)
+
+    # max total shares allowed by risk
+    max_total_shares_by_risk = int(risk_cap / risk_ps)
+    if max_total_shares_by_risk <= sh:
+        return None
+    remaining_risk_shares = max_total_shares_by_risk - sh
+
+    # --- Value-based add caps ---
+    max_add_by_pos_value = int(remaining_pos_value / close)
+    max_add_by_acct_value = int(remaining_account_value / close)
+
+    # --- Desired scale-in size ---
+    # Conservative: add up to 50% of current shares, but never exceed caps
+    desired_add = max(int(sh * 0.5), 1)
+
+    add_shares = min(desired_add, remaining_risk_shares, max_add_by_pos_value, max_add_by_acct_value)
+    if add_shares <= 0:
+        return None
+
+    return {
+        "account": account,
+        "ticker": ticker,
+        "add_date": today.isoformat(),
+        "add_price": close,
+        "add_shares": add_shares,
+        "reason": "ADD: reclaim EMA21 near support (trend intact)",
+    }
+
+
+def execute_stock_add(today: dt.date, plan: dict) -> None:
+    """Paper execution for a stock ADD: update weighted avg entry + shares."""
+    ensure_stock_files()
+    rows = load_stock_positions()
+
+    acct = (plan.get("account") or "").strip().upper()
+    tkr = (plan.get("ticker") or "").strip().upper()
+    add_price = float(plan.get("add_price") or 0.0)
+    add_shares = int(float(plan.get("add_shares") or 0))
+    add_date = (plan.get("add_date") or today.isoformat())
+
+    if not acct or not tkr or add_price <= 0 or add_shares <= 0:
+        return
+
+    for r in rows:
+        if (r.get("status") or "").upper() != "OPEN":
+            continue
+        if (r.get("account") or "").strip().upper() != acct:
+            continue
+        if (r.get("ticker") or "").strip().upper() != tkr:
+            continue
+
+        try:
+            old_avg = float(r.get("entry_price") or 0.0)
+            old_sh = int(float(r.get("shares") or 0))
+        except Exception:
+            continue
+        if old_avg <= 0 or old_sh <= 0:
+            continue
+
+        new_sh = old_sh + add_shares
+        new_avg = (old_avg * old_sh + add_price * add_shares) / float(new_sh)
+
+        r["entry_price"] = f"{new_avg:.2f}"
+        r["shares"] = str(new_sh)
+
+        try:
+            adds = int(float(r.get("adds") or 0))
+        except Exception:
+            adds = 0
+        r["adds"] = str(adds + 1)
+        r["last_add_date"] = add_date
+
+        # Preserve initial_* fields if blank
+        if not (r.get("initial_entry_price") or "").strip():
+            r["initial_entry_price"] = f"{old_avg:.2f}"
+        if not (r.get("initial_shares") or "").strip():
+            r["initial_shares"] = str(old_sh)
+
+        note = (r.get("notes") or "").strip()
+        add_note = f"{add_date} ADD {add_shares}@{add_price:.2f}"
+        r["notes"] = (note + (" | " if note else "") + add_note)
+
+        break
+
+    write_stock_positions(rows)
+
+    append_stock_fill({
+        "date": add_date,
+        "account": acct,
+        "ticker": tkr,
+        "action": "ADD",
+        "price": f"{add_price:.2f}",
+        "shares": str(add_shares),
+        "reason": plan.get("reason", ""),
+    })
 
 
 def execute_stock_plan(today: dt.date, plan: dict) -> str:
@@ -717,6 +1046,16 @@ def update_and_close_stock_positions(today: dt.date, mkt: Dict[str, float | bool
             "pnl_pct": r.get("pnl_pct", ""),
         })
 
+        append_stock_fill({
+            "date": today.isoformat(),
+            "account": r.get("account", ""),
+            "ticker": tkr,
+            "action": "CLOSE",
+            "price": f"{px:.2f}",
+            "shares": str(int(sh)),
+            "reason": exit_reason,
+        })
+
         if exit_reason == "STOP":
             stops.append(f"{tkr} @{px:.2f}")
         else:
@@ -763,14 +1102,34 @@ def write_csv_rows(path: str, rows: List[dict], fieldnames: List[str]) -> None:
             w.writerow(r)
 
 
+
 def append_csp_ledger_row(row: dict) -> None:
-    fieldnames = ["date","week_id","ticker","expiry","strike","contracts","credit_mid","cash_reserved","est_premium","tier"]
+    """Append a CSP OPEN entry to the simple CSP ledger.
+
+    We store *total premium dollars* in 'premium' (not per-contract credit).
+    If caller provides only credit_mid, we compute premium.
+    """
+    fieldnames = ["date","week_id","ticker","expiry","strike","contracts","premium","cash_reserved","tier"]
     file_exists = os.path.isfile(CSP_LEDGER_FILE)
+
+    # normalize
+    try:
+        contracts = int(float(row.get("contracts") or 0)) or 1
+    except Exception:
+        contracts = 1
+    if "premium" not in row or row.get("premium") in ("", None):
+        try:
+            credit_mid = float(row.get("credit_mid") or 0.0)
+            row["premium"] = f"{credit_mid * 100.0 * contracts:.2f}"
+        except Exception:
+            row["premium"] = ""
+
     with open(CSP_LEDGER_FILE, mode="a", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
         if not file_exists:
             w.writeheader()
-        w.writerow(row)
+        w.writerow({k: row.get(k, "") for k in fieldnames})
+
 
 
 def csp_already_logged(ledger_rows: List[dict], week_id: str, ticker: str, expiry: str, strike: float) -> bool:
@@ -1030,16 +1389,10 @@ def add_csp_position_from_selected(today: str, week_id: str, idea: dict) -> str:
         "dte_open": str(int(idea["dte"])),
         "strike": f"{float(idea['strike']):.2f}",
         "contracts": str(int(idea["contracts"])),
-        "credit_mid": f"{float(idea['mid']):.2f}",
         "cash_reserved": f"{float(idea['cash_reserved']):.2f}",
-        "est_premium": f"{float(idea['est_premium']):.2f}",
+        "premium": f"{float(idea['est_premium']):.2f}",
         "tier": idea.get("tier", ""),
         "status": "OPEN",
-        "underlying_last": "",
-        "strike_diff": "",
-        "strike_diff_pct": "",
-        "dte_remaining": "",
-        "itm_otm": "",
         "close_date": "",
         "close_type": "",
         "underlying_close_at_expiry": "",
@@ -1159,7 +1512,7 @@ def process_csp_expirations(today: dt.date) -> Dict[str, List[str]]:
             r["status"] = "ASSIGNED"
             r["close_type"] = "ASSIGNED_ITM"
             r["shares_if_assigned"] = str(shares)
-            est_prem = float(r.get("est_premium") or 0.0)
+            est_prem = float(r.get("premium") or r.get("est_premium") or 0.0)
             r["assignment_cost_basis"] = f"{(strike*shares - est_prem):.2f}"
             assigned.append(f"{ticker} {exp_str} {strike:.0f}P -> {shares} sh")
 
@@ -1303,7 +1656,7 @@ def add_cc_position_from_candidate(today: str, idea: dict) -> str:
         "expiry": idea["expiry"],
         "strike": f"{float(idea['strike']):.2f}",
         "contracts": str(int(idea["contracts"])),
-        "credit_mid": f"{float(idea['credit_mid']):.2f}",
+        "premium": f"{float(idea['credit_mid'])*100.0*int(idea['contracts']):.2f}",
         "status": "OPEN",
         "close_date": "",
         "close_type": "",

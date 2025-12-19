@@ -195,7 +195,7 @@ def create_lots_from_new_assignments(today: dt.date) -> None:
             strike=strike,
             contracts=int(float(r.get("contracts") or 0)),
             shares=shares,
-            premium=float(r.get("est_premium") or 0.0),
+            premium=float(r.get("premium") or r.get("est_premium") or 0.0),
             wheel_value=strike * shares,
             notes=f"Assigned from CSP {csp_id}",
         )
@@ -532,9 +532,9 @@ def backfill_open_events_from_positions(today: dt.date) -> None:
 
         prem = 0.0
         try:
-            prem = float(r.get("est_premium") or 0.0)
+            prem = float(r.get("premium") or r.get("est_premium") or 0.0)
             if prem <= 0:
-                prem = float(r.get("credit_mid") or 0.0) * 100.0 * float(r.get("contracts") or 0.0)
+                prem = float(r.get("premium") or 0.0) * float(r.get("contracts") or 0.0)
         except Exception:
             prem = 0.0
 
@@ -562,7 +562,7 @@ def backfill_open_events_from_positions(today: dt.date) -> None:
 
         prem = 0.0
         try:
-            prem = float(r.get("credit_mid") or 0.0) * 100.0 * float(r.get("contracts") or 0.0)
+            prem = float(r.get("premium") or 0.0) * float(r.get("contracts") or 0.0)
         except Exception:
             prem = 0.0
 
