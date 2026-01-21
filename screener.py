@@ -11,7 +11,13 @@ from config import (
     ACCOUNT_SIZES,
     INDIVIDUAL_STOCK_CAP,
     CSP_LEDGER_FILE,
+    CSP_POSITIONS_FILE,
+    CSP_ATR_MULTS,
 )
+
+# Prevent duplicate retirement stock entries (same ticker in IRA and ROTH)
+PREVENT_DUPLICATE_RETIREMENT_TICKERS = True
+
 
 import strategies as strat
 from wheel import (
@@ -34,7 +40,8 @@ from wheel import (
 
 # If False: prevents opening the same ticker in multiple accounts (IRA/ROTH/INDIVIDUAL)
 # If True: allows MS in IRA and also MS in ROTH, etc.
-ALLOW_DUPLICATE_TICKERS_ACROSS_ACCOUNTS = True
+ALLOW_DUPLICATE_TICKERS_ACROSS_ACCOUNTS = True  # allows same ticker in INDIVIDUAL vs retirement
+
 
 
 # ============================================================
@@ -149,11 +156,29 @@ def build_csp_candidates() -> List[dict]:
         try:
             df = strat.add_indicators(strat.download_ohlcv(tkr))
             last = df.iloc[-1]
-            if not strat.is_eligible(last):
+
+            # CSP scan uses a less restrictive eligibility filter than stock entries
+            if not strat.is_csp_eligible(last):
                 continue
-            c = strat.evaluate_csp_candidate(tkr, df)
-            if c:
-                candidates.append(c)
+
+            best = None
+            best_score = -1e9
+
+            # Try a couple of ATR distances to find a liquid strike without moving meaningfully closer to the money.
+            for atr_mult in CSP_ATR_MULTS:
+                c = strat.evaluate_csp_candidate(tkr, df, atr_mult=float(atr_mult))
+                if not c:
+                    continue
+
+                # Simple heuristic: prioritize yield, then premium
+                s = float(c.get("yield_pct", 0.0)) * 100.0 + float(c.get("est_premium", 0.0)) / 100.0
+                if s > best_score:
+                    best = c
+                    best_score = s
+
+            if best:
+                candidates.append(best)
+
         except Exception:
             continue
     return candidates
@@ -465,8 +490,65 @@ def run_screener() -> None:
                     f"[{r['source']}]"
                 )
             print("")
+
+
+    # --- Open CSP positions (paper or live) ---
+    try:
+        csp_rows = strat.load_csv_rows(CSP_POSITIONS_FILE)
+        open_csps = []
+        for r in csp_rows:
+            if (r.get("status") or "").upper() != "OPEN":
+                continue
+            exp = (r.get("expiry") or "").strip()
+            try:
+                if exp and dt.date.fromisoformat(exp) < today:
+                    continue
+            except Exception:
+                pass
+            open_csps.append(r)
+
+        if open_csps:
+            print("\n🧾 OPEN CSP POSITIONS")
+            for r in open_csps[:10]:
+                tkr = (r.get("ticker") or "").strip().upper()
+                exp = (r.get("expiry") or "").strip()
+                strike = r.get("strike") or ""
+                prem = r.get("premium") or r.get("est_premium") or ""
+                dte_open = r.get("dte_open") or ""
+                print(f"  {tkr:<6} {exp} {strike}P | prem {prem} | dte_open {dte_open}")
+    except Exception:
+        pass
+
     else:
         print("\n📌 OPEN STOCK HOLDINGS: none\n")
+
+
+    # --- Open CSP positions (paper or live) ---
+    try:
+        csp_rows = strat.load_csv_rows(CSP_POSITIONS_FILE)
+        open_csps = []
+        for r in csp_rows:
+            if (r.get("status") or "").upper() != "OPEN":
+                continue
+            exp = (r.get("expiry") or "").strip()
+            try:
+                if exp and dt.date.fromisoformat(exp) < today:
+                    continue
+            except Exception:
+                pass
+            open_csps.append(r)
+
+        if open_csps:
+            print("\n🧾 OPEN CSP POSITIONS")
+            for r in open_csps[:10]:
+                tkr = (r.get("ticker") or "").strip().upper()
+                exp = (r.get("expiry") or "").strip()
+                strike = r.get("strike") or ""
+                prem = r.get("premium") or r.get("est_premium") or ""
+                dte_open = r.get("dte_open") or ""
+                print(f"  {tkr:<6} {exp} {strike}P | prem {prem} | dte_open {dte_open}")
+    except Exception:
+        pass
 
     # Close any stock swing positions first (stop/target hits, paper)
     closes = strat.update_and_close_stock_positions(today, mkt)
@@ -497,6 +579,7 @@ def run_screener() -> None:
                 open_by_acct[acct].add(tkr)
 
         open_any = set().union(*open_by_acct.values())
+        open_retirement = set().union(open_by_acct.get(IRA,set()), open_by_acct.get(ROTH,set()))
 
         print("\n📈 STOCK ENTRIES (planned)")
         planned = 0
@@ -521,7 +604,10 @@ def run_screener() -> None:
                 be_only = (f"{acct}:{tkr}" in ret_by_key and (ret_by_key[f"{acct}:{tkr}"].get("flag_breakeven_only") == "1"))
 
                 existing_set = open_by_acct.get(acct, set())
-                if not ALLOW_DUPLICATE_TICKERS_ACROSS_ACCOUNTS:
+                # Prevent same ticker being opened in BOTH IRA and ROTH
+                if PREVENT_DUPLICATE_RETIREMENT_TICKERS and acct in (IRA, ROTH):
+                    existing_set = open_retirement
+                elif not ALLOW_DUPLICATE_TICKERS_ACROSS_ACCOUNTS:
                     existing_set = open_any
 
                 plan = strat.plan_stock_trade(
@@ -548,6 +634,8 @@ def run_screener() -> None:
             stock_opened.append(f"{picked_acct}:{tkr}")
             open_by_acct[picked_acct].add(tkr)
             open_any.add(tkr)
+            if picked_acct in (IRA, ROTH):
+                open_retirement.add(tkr)
             acct_mv[picked_acct] = float(acct_mv.get(picked_acct, 0.0)) + float(picked_plan["entry_price"]) * int(picked_plan["shares"])
 
             risk = (picked_plan["entry_price"] - picked_plan["stop_price"]) * int(picked_plan["shares"])

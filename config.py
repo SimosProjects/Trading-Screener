@@ -117,27 +117,30 @@ STOCK_STOP_ATR_BREAKOUT = 1.2  # stop = breakout_level - ATR*X
 
 STOCKS: List[str] = [
     # Mega-cap quality
-    "AAPL","MSFT","AMZN","GOOGL","META","NVDA","AVGO","TSM","ASML",
+    "AAPL","MSFT","AMZN","GOOGL","META","NVDA","AVGO","TSM","ASML","INTC",
 
     # Payments / financial quality
-    "V","MA","JPM","BAC","MS","GS","AXP",
+    "V","MA","JPM","BAC","MS","GS","AXP","SOFI",
 
     # Healthcare (defensive growth)
     "LLY","ABBV","UNH","VRTX","REGN",
 
     # Consumer staples / resilient demand
-    "WMT","COST","KO","PEP",
+    "WMT","COST","KO","PEP","CELH","BROS",
 
     # Industrials / infrastructure
     "CAT","DE","CARR",
 
     # Profitable tech infrastructure
-    "ANET","CRWD","PANW",
+    "ANET","CRWD","PANW","MU",
+
+    # High risk growth
+    "RKLB", "JOBY", "ACHR","SOUN", "BBAI","ASTS",
 
     # Tactical Growth
     "AMD","MU","INTC","ON","LSCC","MCHP","SMCI",
     "NFLX","LULU","CMG","TGT","ABNB","UBER",
-    "PLTR","SHOP","SNOW","MDB","NET","ZS","BILL",
+    "PLTR","SHOP","SNOW","MDB","NET","ZS","BILL","PL",
 ]
 
 # CSP universe (kept focused; price cap is enforced in strategies.evaluate_csp_candidate)
@@ -169,8 +172,8 @@ CSP_STOCKS: List[str] = list(dict.fromkeys(
         "DKNG","AFRM","HIMS",
         "CELH","BROS",
 
-        # High-IV under $65 candidates (price cap is enforced anyway)
-        "BBAI","SOUN","QUBT","CLSK","RKLB","JOBY","ASTS","ACHR",
+        # High-IV candidates
+        "BBAI","SOUN","QUBT","CLSK","RKLB","JOBY","ASTS","ACHR","PL",
     ]
 ))
 
@@ -191,6 +194,7 @@ CSP_POSITIONS_COLUMNS = [
     "week_id",
     "ticker",
     "expiry",
+    "dte_open",
     "strike",
     "contracts",
     "premium",
@@ -224,7 +228,7 @@ CSP_TARGET_DTE_MIN = 25
 CSP_TARGET_DTE_MAX = 45
 
 # ---- Risk / sizing ----
-CSP_MAX_CASH_PER_TRADE = 6_500  # => $65/share max if 1 contract
+CSP_MAX_CASH_PER_TRADE = 10_000  # => $100/share max if 1 contract
 
 # ---- Liquidity filters ----
 CSP_MIN_OI = 100
@@ -232,20 +236,23 @@ CSP_MIN_VOLUME = 10
 CSP_MIN_BID = 0.10
 
 # Optional IV sanity check (set to 0.0/None to disable)
-CSP_MIN_IV = 0.30
-
+CSP_MIN_IV = 0.20  # lowered: IV filter is redundant with premium/yield; lower IV does not increase risk
 # ---- Strike selection ----
 CSP_STRIKE_MODE = "ema21_atr"
 
-# ---- Premium / yield tiers ----
-CSP_MIN_PREMIUM_CONSERVATIVE = 200
-CSP_MIN_PREMIUM_BALANCED = 300
-CSP_MIN_PREMIUM_AGGRESSIVE = 400
 
-CSP_MIN_YIELD_CONSERVATIVE = 0.03
-CSP_MIN_YIELD_BALANCED = 0.04
-CSP_MIN_YIELD_AGGRESSIVE = 0.05
+# Try a small set of ATR distances to find a liquid strike.
+# Higher = farther OTM (lower risk, less premium).
+CSP_ATR_MULTS = [0.60, 0.50]
+# ---- Premium / yield tiers ----
+CSP_MIN_PREMIUM_CONSERVATIVE = 150
+CSP_MIN_PREMIUM_BALANCED = 250
+CSP_MIN_PREMIUM_AGGRESSIVE = 350
+
+CSP_MIN_YIELD_CONSERVATIVE = 0.020
+CSP_MIN_YIELD_BALANCED = 0.025
+CSP_MIN_YIELD_AGGRESSIVE = 0.03
 
 # ---- Tier caps ----
-CSP_MAX_AGGRESSIVE_TOTAL = 2
-CSP_MAX_AGGRESSIVE_PER_WEEK = 1
+CSP_MAX_AGGRESSIVE_TOTAL = 4
+CSP_MAX_AGGRESSIVE_PER_WEEK = 2

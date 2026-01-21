@@ -172,6 +172,35 @@ def is_eligible(stock_row: pd.Series) -> bool:
     return bool(close > sma50 and ema21 > sma50 and adx > 20)
 
 
+def is_csp_eligible(stock_row: pd.Series) -> bool:
+    """Eligibility filter for CSP scanning (lower risk, long-term trend focused).
+
+    Rationale:
+    - CSPs are premium-selling / mean-reversion friendly, so requiring short-term momentum
+      (EMA21 > SMA50) is unnecessarily restrictive.
+    - To keep risk controlled, we still require the stock to be above its 200SMA and not in a weak trend.
+    """
+    try:
+        close = float(stock_row["Close"])
+        sma200 = float(stock_row.get("SMA_200", 0) or 0)
+        adx = float(stock_row.get("ADX_14", 0) or 0)
+    except Exception:
+        return False
+
+    if sma200 <= 0:
+        return False
+
+    # Structural uptrend (keeps CSP assignment risk lower than selling puts in a downtrend)
+    if close < sma200:
+        return False
+
+    # Avoid very weak/trendy-down tapes
+    if adx and adx < 15:
+        return False
+
+    return True
+
+
 def pullback_signal(stock_row: pd.Series) -> bool:
     # Very short-term oversold + close near EMA21
     try:
