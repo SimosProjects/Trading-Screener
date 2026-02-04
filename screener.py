@@ -141,8 +141,23 @@ def scan_stock_entries_and_watchlist() -> Tuple[List[dict], List[dict]]:
         except Exception:
             continue
 
+    # Sort then de-duplicate by ticker (preserves first occurrence after sort)
     entries = sorted(entries, key=lambda x: (x["signal"], x["rsi2"]))
     watch = sorted(watch, key=lambda x: (x["note"], x["rsi2"]))
+
+    def _dedupe(rows: List[dict]) -> List[dict]:
+        seen = set()
+        out: List[dict] = []
+        for r in rows:
+            t = (r.get("ticker") or "").strip().upper()
+            if not t or t in seen:
+                continue
+            seen.add(t)
+            out.append(r)
+        return out
+
+    entries = _dedupe(entries)
+    watch = _dedupe(watch)
     return entries, watch
 
 
@@ -490,38 +505,8 @@ def run_screener() -> None:
                     f"[{r['source']}]"
                 )
             print("")
-
-
-    # --- Open CSP positions (paper or live) ---
-    try:
-        csp_rows = strat.load_csv_rows(CSP_POSITIONS_FILE)
-        open_csps = []
-        for r in csp_rows:
-            if (r.get("status") or "").upper() != "OPEN":
-                continue
-            exp = (r.get("expiry") or "").strip()
-            try:
-                if exp and dt.date.fromisoformat(exp) < today:
-                    continue
-            except Exception:
-                pass
-            open_csps.append(r)
-
-        if open_csps:
-            print("\n🧾 OPEN CSP POSITIONS")
-            for r in open_csps[:10]:
-                tkr = (r.get("ticker") or "").strip().upper()
-                exp = (r.get("expiry") or "").strip()
-                strike = r.get("strike") or ""
-                prem = r.get("premium") or r.get("est_premium") or ""
-                dte_open = r.get("dte_open") or ""
-                print(f"  {tkr:<6} {exp} {strike}P | prem {prem} | dte_open {dte_open}")
-    except Exception:
-        pass
-
     else:
         print("\n📌 OPEN STOCK HOLDINGS: none\n")
-
 
     # --- Open CSP positions (paper or live) ---
     try:
@@ -671,6 +656,10 @@ def run_screener() -> None:
     new_csp_orders: List[dict] = []
     if ENABLE_CSP and allow_conservative_premium(mkt) and week_remaining > 0:
         candidates = build_csp_candidates()
+        # Block opening a new CSP on a ticker that already has ANY OPEN CSP.
+        open_csp_tickers = strat.load_open_csp_tickers(today)
+        if open_csp_tickers:
+            candidates = [c for c in candidates if (c.get('ticker') or '').strip().upper() not in open_csp_tickers]
 
         total_remaining = max(float(exposure["cap"]) - float(exposure["total_exposure"]), 0.0)
 
@@ -695,7 +684,10 @@ def run_screener() -> None:
                 )
 
             for o in orders:
-                csp_id = strat.add_csp_position_from_selected(today.isoformat(), exposure["week_id"], o)
+                csp_id, created = strat.add_csp_position_from_selected(today.isoformat(), exposure["week_id"], o)
+                if not created:
+                    continue
+
 
                 try:
                     ledger_rows = strat.load_csv_rows(CSP_LEDGER_FILE)

@@ -1397,23 +1397,65 @@ def plan_weekly_csp_orders(
     }
 
 
+def load_open_csp_tickers(today: Optional[dt.date] = None) -> set:
+    """Return tickers that currently have an OPEN CSP in CSP_POSITIONS_FILE.
+
+    If 'today' is provided, CSPs whose expiry is before 'today' are ignored (defensive in case
+    an expiry hasn't been processed/closed yet).
+    """
+    ensure_positions_files()
+    rows = load_csv_rows(CSP_POSITIONS_FILE)
+    out = set()
+    for r in rows:
+        if (r.get("status") or "").strip().upper() != "OPEN":
+            continue
+        tkr = (r.get("ticker") or "").strip().upper()
+        if not tkr:
+            continue
+        if today:
+            exp_str = (r.get("expiry") or "").strip()
+            try:
+                if exp_str and dt.date.fromisoformat(exp_str) < today:
+                    continue
+            except Exception:
+                pass
+        out.add(tkr)
+    return out
+
+
 def make_csp_position_id(ticker: str, expiry: str, strike: float, open_date: str) -> str:
     return f"{ticker}-{expiry}-{float(strike):.2f}-{open_date}"
 
 
-def add_csp_position_from_selected(today: str, week_id: str, idea: dict) -> str:
+def add_csp_position_from_selected(today: str, week_id: str, idea: dict) -> Tuple[str, bool]:
+    """Add a CSP position row to CSP_POSITIONS_FILE.
+
+    Returns (pos_id, created). If there's already an OPEN CSP for the ticker, this will NOT
+    create a new position (regardless of expiry/strike).
+    """
     ensure_positions_files()
     rows = load_csv_rows(CSP_POSITIONS_FILE)
-    pos_id = make_csp_position_id(idea["ticker"], idea["expiry"], idea["strike"], today)
+
+    tkr = (idea.get("ticker") or "").strip().upper()
+    if tkr:
+        for r in rows:
+            if (r.get("status") or "").strip().upper() != "OPEN":
+                continue
+            if (r.get("ticker") or "").strip().upper() == tkr:
+                # Existing open CSP blocks new ones for same ticker.
+                existing_id = (r.get("id") or "").strip()
+                return (existing_id or make_csp_position_id(tkr, r.get("expiry") or "", float(r.get("strike") or 0.0), r.get("open_date") or today), False)
+
+    pos_id = make_csp_position_id(tkr, idea["expiry"], idea["strike"], today)
 
     if any((r.get("id") or "") == pos_id for r in rows):
-        return pos_id
+        return (pos_id, False)
 
     rows.append({
         "id": pos_id,
         "open_date": today,
         "week_id": week_id,
-        "ticker": idea["ticker"],
+        "ticker": tkr,
         "expiry": idea["expiry"],
         "dte_open": str(int(idea["dte"])),
         "strike": f"{float(idea['strike']):.2f}",
@@ -1431,7 +1473,7 @@ def add_csp_position_from_selected(today: str, week_id: str, idea: dict) -> str:
     })
 
     write_csv_rows(CSP_POSITIONS_FILE, rows, CSP_POSITIONS_COLUMNS)
-    return pos_id
+    return (pos_id, True)
 
 
 def update_open_csp_status(today: dt.date) -> None:

@@ -115,7 +115,7 @@ STOCK_STOP_ATR_BREAKOUT = 1.2  # stop = breakout_level - ATR*X
 # Universe
 # ============================================================
 
-STOCKS: List[str] = [
+STOCKS: List[str] = list(dict.fromkeys([
     # Mega-cap quality
     "AAPL","MSFT","AMZN","GOOGL","META","NVDA","AVGO","TSM","ASML","INTC",
 
@@ -141,7 +141,7 @@ STOCKS: List[str] = [
     "AMD","MU","INTC","ON","LSCC","MCHP","SMCI",
     "NFLX","LULU","CMG","TGT","ABNB","UBER",
     "PLTR","SHOP","SNOW","MDB","NET","ZS","BILL","PL",
-]
+]))
 
 # CSP universe (kept focused; price cap is enforced in strategies.evaluate_csp_candidate)
 CSP_STOCKS: List[str] = list(dict.fromkeys(
