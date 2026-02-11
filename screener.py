@@ -13,6 +13,13 @@ from config import (
     CSP_LEDGER_FILE,
     CSP_POSITIONS_FILE,
     CSP_ATR_MULTS,
+    CSP_DEFENSIVE_STOCKS,
+    CSP_RISK_OFF_VIX,
+    CSP_RISK_OFF_MIN_OTM_PCT_DEFENSIVE,
+    CSP_RISK_OFF_MIN_OTM_PCT_RISKY,
+    CSP_NORMAL_MIN_OTM_PCT,
+    CSP_STRIKE_BASE_NORMAL,
+    CSP_STRIKE_BASE_RISK_OFF,
 )
 
 # Prevent duplicate retirement stock entries (same ticker in IRA and ROTH)
@@ -86,9 +93,20 @@ def allow_retirement_tactical(mkt: Dict) -> bool:
         and mkt.get("vix_below_25")
     )
 
-def allow_conservative_premium(mkt: Dict) -> bool:
-    """Conservative income strategies (CSPs)."""
-    return bool(mkt.get("spy_above_200") and mkt.get("vix_below_25"))
+def csp_mode(mkt: Dict) -> str:
+    """Return CSP mode based on market regime.
+    - NORMAL: broader CSP universe + moderate cushion
+    - RISK_OFF: defensive-only + farther OTM + slower MA base
+    """
+    try:
+        vix = float(mkt.get("vix_close") or 99.0)
+    except Exception:
+        vix = 99.0
+
+    spy_above_200 = bool(mkt.get("spy_above_200"))
+    if (not spy_above_200) or (vix > float(CSP_RISK_OFF_VIX)):
+        return "RISK_OFF"
+    return "NORMAL"
 
 def scan_stock_entries_and_watchlist() -> Tuple[List[dict], List[dict]]:
     """
@@ -165,37 +183,93 @@ def scan_stock_entries_and_watchlist() -> Tuple[List[dict], List[dict]]:
 # CSP + CC planning (signals from strategies; exposure from wheel)
 # ============================================================
 
-def build_csp_candidates() -> List[dict]:
+def build_csp_candidates(mkt: Dict, mode: str) -> List[dict]:
     candidates: List[dict] = []
+
+    defensive_set = set(CSP_DEFENSIVE_STOCKS)
+
+    if mode == "RISK_OFF":
+        print(
+            f"\n🛡️  CSP MODE: RISK_OFF | VIX {float(mkt.get('vix_close') or 0):.2f} > {float(CSP_RISK_OFF_VIX):.1f}"
+            f" | Universe: DEFENSIVE ONLY ({len(defensive_set)} tickers)"
+            f" | Strike base: {CSP_STRIKE_BASE_RISK_OFF} | Min OTM: {float(CSP_RISK_OFF_MIN_OTM_PCT_DEFENSIVE)*100:.0f}%"
+        )
+    else:
+        print(
+            f"\n🟦 CSP MODE: NORMAL | VIX {float(mkt.get('vix_close') or 0):.2f} <= {float(CSP_RISK_OFF_VIX):.1f}"
+            f" | Universe: STANDARD ({len(CSP_STOCKS)} tickers)"
+            f" | Strike base: {CSP_STRIKE_BASE_NORMAL} | Min OTM: {float(CSP_NORMAL_MIN_OTM_PCT)*100:.0f}%"
+        )
+
     for tkr in CSP_STOCKS:
         try:
-            df = strat.add_indicators(strat.download_ohlcv(tkr))
+            tkr_u = (tkr or "").strip().upper()
+            if not tkr_u:
+                continue
+
+            defensive = tkr_u in defensive_set
+
+            # In risk-off regime, only allow defensive names (keep risk contained).
+            if mode == "RISK_OFF" and not defensive:
+                continue
+
+            df = strat.add_indicators(strat.download_ohlcv(tkr_u))
+            if df is None or df.empty:
+                continue
             last = df.iloc[-1]
 
-            # CSP scan uses a less restrictive eligibility filter than stock entries
-            if not strat.is_csp_eligible(last):
-                continue
+            # Eligibility: structural (NORMAL) vs restrained defensive (RISK_OFF)
+            if mode == "NORMAL":
+                if not strat.is_csp_eligible(last, allow_below_200=False):
+                    continue
+                min_otm = float(CSP_NORMAL_MIN_OTM_PCT)
+                base_ma = str(CSP_STRIKE_BASE_NORMAL)
+            else:
+                if not strat.is_csp_eligible(last, allow_below_200=True):
+                    continue
+                min_otm = float(CSP_RISK_OFF_MIN_OTM_PCT_DEFENSIVE if defensive else CSP_RISK_OFF_MIN_OTM_PCT_RISKY)
+                base_ma = str(CSP_STRIKE_BASE_RISK_OFF)
 
             best = None
             best_score = -1e9
 
-            # Try a couple of ATR distances to find a liquid strike without moving meaningfully closer to the money.
+            # Try multiple ATR distances; now biased to cushion + yield.
             for atr_mult in CSP_ATR_MULTS:
-                c = strat.evaluate_csp_candidate(tkr, df, atr_mult=float(atr_mult))
+                c = strat.evaluate_csp_candidate(
+                    tkr_u, df, atr_mult=float(atr_mult),
+                    risk_off=(mode == "RISK_OFF"),
+                    min_otm_pct=min_otm,
+                    base_ma=base_ma,
+                )
                 if not c:
                     continue
 
-                # Simple heuristic: prioritize yield, then premium
-                s = float(c.get("yield_pct", 0.0)) * 100.0 + float(c.get("est_premium", 0.0)) / 100.0
-                if s > best_score:
+                close = float(last.get("Close", 0) or 0)
+                strike = float(c.get("strike", 0) or 0)
+                cushion = (close - strike) / close if close > 0 else 0.0
+
+                # Score: prefer cushion first in RISK_OFF, then yield, then premium.
+                score = 0.0
+                if mode == "RISK_OFF":
+                    score += cushion * 100.0
+                    score += float(c.get("yield_pct", 0.0)) * 50.0
+                else:
+                    score += float(c.get("yield_pct", 0.0)) * 100.0
+                    score += cushion * 20.0
+                score += float(c.get("est_premium", 0.0)) / 250.0
+
+                if score > best_score:
                     best = c
-                    best_score = s
+                    best_score = score
 
             if best:
+                best["mode"] = mode
+                best["defensive"] = bool(defensive)
                 candidates.append(best)
 
         except Exception:
             continue
+
     return candidates
 
 
@@ -385,7 +459,13 @@ def run_screener() -> None:
     mkt = strat.market_context(today)
     trading_on = allow_swing_trades(mkt)
     retire_on = allow_retirement_tactical(mkt)
+    csp_regime = csp_mode(mkt)
     print_market_context(mkt, trading_on, retire_on)
+    if ENABLE_CSP:
+        # Printed once per run (build_csp_candidates prints regime details).
+        print(f"\n🧾 CSP engine: ENABLED | Regime: {csp_regime}")
+    else:
+        print("\n🧾 CSP engine: DISABLED")
 
     # --- Ensure files + maintenance ALWAYS ---
     ensure_wheel_files()
@@ -654,8 +734,8 @@ def run_screener() -> None:
 
     # --- CSP planning ---
     new_csp_orders: List[dict] = []
-    if ENABLE_CSP and allow_conservative_premium(mkt) and week_remaining > 0:
-        candidates = build_csp_candidates()
+    if ENABLE_CSP and csp_regime in ("NORMAL", "RISK_OFF") and week_remaining > 0:
+        candidates = build_csp_candidates(mkt, csp_regime)
         # Block opening a new CSP on a ticker that already has ANY OPEN CSP.
         open_csp_tickers = strat.load_open_csp_tickers(today)
         if open_csp_tickers:

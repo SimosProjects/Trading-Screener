@@ -32,11 +32,6 @@ from config import (
     STOCK_REQUIRE_NEXTDAY_VALIDATION,
     STOCK_RISK_PCT_INDIVIDUAL, STOCK_RISK_PCT_RETIREMENT,
     STOCK_MAX_POSITION_PCT_INDIVIDUAL, STOCK_MAX_POSITION_PCT_RETIREMENT,
-    STOCK_MAX_ADDS_PER_POSITION,
-    STOCK_ADD_COOLDOWN_DAYS,
-    STOCK_ADD_MIN_DRAWdown_PCT,
-    STOCK_ADD_NEAR_EMA21_ATR,
-    STOCK_ADD_RSI14_MIN,
     STOCK_TARGET_R_MULTIPLE,
     STOCK_BREAKEVEN_AFTER_R,
     STOCK_USE_BREAKEVEN_TRAIL,
@@ -49,6 +44,7 @@ from config import (
     CSP_MAX_CASH_PER_TRADE,
     CSP_MIN_OI, CSP_MIN_VOLUME, CSP_MIN_BID, CSP_MIN_IV,
     CSP_STRIKE_MODE,
+    CSP_STRIKE_BASE_NORMAL,
     CSP_MIN_PREMIUM_CONSERVATIVE, CSP_MIN_PREMIUM_BALANCED, CSP_MIN_PREMIUM_AGGRESSIVE,
     CSP_MIN_YIELD_CONSERVATIVE, CSP_MIN_YIELD_BALANCED, CSP_MIN_YIELD_AGGRESSIVE,
     CSP_MAX_AGGRESSIVE_TOTAL, CSP_MAX_AGGRESSIVE_PER_WEEK,
@@ -85,6 +81,7 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["SMA_50"] = ta.trend.sma_indicator(close, window=50)
     df["SMA_200"] = ta.trend.sma_indicator(close, window=200)
     df["EMA_21"] = ta.trend.ema_indicator(close, window=21)
+    df["EMA_50"] = ta.trend.ema_indicator(close, window=50)
     df["EMA_10"] = ta.trend.ema_indicator(close, window=10)
 
     df["ATR_14"] = ta.volatility.average_true_range(high=high, low=low, close=close, window=14)
@@ -172,32 +169,42 @@ def is_eligible(stock_row: pd.Series) -> bool:
     return bool(close > sma50 and ema21 > sma50 and adx > 20)
 
 
-def is_csp_eligible(stock_row: pd.Series) -> bool:
-    """Eligibility filter for CSP scanning (lower risk, long-term trend focused).
+def is_csp_eligible(stock_row: pd.Series, *, allow_below_200: bool = False) -> bool:
+    """Eligibility filter for CSP scanning.
 
-    Rationale:
-    - CSPs are premium-selling / mean-reversion friendly, so requiring short-term momentum
-      (EMA21 > SMA50) is unnecessarily restrictive.
-    - To keep risk controlled, we still require the stock to be above its 200SMA and not in a weak trend.
+    Default (allow_below_200=False) is conservative:
+      - Require Close > SMA200 (structural uptrend)
+      - Avoid ultra-low ADX (often choppy / directionless)
+
+    Risk-off variant (allow_below_200=True) is *defensive-only* oriented:
+      - Allow names below SMA200, but require Close > SMA50 (avoid true waterfalls)
+      - Looser ADX floor
     """
     try:
         close = float(stock_row["Close"])
+        sma50 = float(stock_row.get("SMA_50", 0) or 0)
         sma200 = float(stock_row.get("SMA_200", 0) or 0)
         adx = float(stock_row.get("ADX_14", 0) or 0)
     except Exception:
         return False
 
-    if sma200 <= 0:
+    if sma50 <= 0:
         return False
 
-    # Structural uptrend (keeps CSP assignment risk lower than selling puts in a downtrend)
-    if close < sma200:
-        return False
+    if not allow_below_200:
+        if sma200 <= 0:
+            return False
+        if close < sma200:
+            return False
+        if adx and adx < 15:
+            return False
+        return True
 
-    # Avoid very weak/trendy-down tapes
-    if adx and adx < 15:
+    # risk-off: keep it very restrained
+    if close < sma50:
         return False
-
+    if adx and adx < 10:
+        return False
     return True
 
 
@@ -664,223 +671,6 @@ def plan_stock_trade(
     }
 
 
-def plan_stock_add(
-    *,
-    today: dt.date,
-    position: dict,
-    df: pd.DataFrame,
-    mkt: Dict[str, float | bool],
-    acct_current_mv: float,
-) -> Optional[dict]:
-    """Plan a single technical scale-in (ADD) for an existing OPEN stock position.
-
-    Rules (anti-emotion):
-      - must be down vs avg entry by STOCK_ADD_MIN_DRAWdown_PCT
-      - trend intact: Close > SMA_50
-      - location: Close near EMA_21 (within +/- STOCK_ADD_NEAR_EMA21_ATR * ATR_14)
-      - confirmation: reclaim EMA_21 (yesterday below, today above)
-      - momentum improving: RSI_14 >= STOCK_ADD_RSI14_MIN and rising
-      - same risk/value caps used for initial entry
-      - max adds + cooldown enforced
-    """
-    try:
-        if (position.get("status") or "").upper() != "OPEN":
-            return None
-        account = (position.get("account") or "").strip().upper()
-        ticker = (position.get("ticker") or "").strip().upper()
-        entry = float(position.get("entry_price") or 0.0)
-        sh = int(float(position.get("shares") or 0))
-        stop = float(position.get("stop_price") or 0.0)
-        adds = int(float(position.get("adds") or 0))
-        last_add_date = (position.get("last_add_date") or "").strip()
-    except Exception:
-        return None
-
-    if not ticker or entry <= 0 or sh <= 0 or stop <= 0:
-        return None
-    if not trading_allowed(mkt):
-        return None
-    if adds >= int(STOCK_MAX_ADDS_PER_POSITION):
-        return None
-
-    # Cooldown between adds
-    if last_add_date:
-        try:
-            prev = dt.date.fromisoformat(last_add_date)
-            if (today - prev).days < int(STOCK_ADD_COOLDOWN_DAYS):
-                return None
-        except Exception:
-            pass
-
-    if df is None or df.empty or len(df) < 60:
-        return None
-
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
-
-    try:
-        close = float(last["Close"])
-        prev_close = float(prev["Close"])
-        ema21 = float(last.get("EMA_21", 0.0) or 0.0)
-        prev_ema21 = float(prev.get("EMA_21", 0.0) or 0.0)
-        sma50 = float(last.get("SMA_50", 0.0) or 0.0)
-        atr = float(last.get("ATR_14", 0.0) or 0.0)
-        rsi14 = float(last.get("RSI_14", 0.0) or 0.0)
-        rsi14_prev = float(prev.get("RSI_14", 0.0) or 0.0)
-    except Exception:
-        return None
-
-    if close <= 0 or ema21 <= 0 or sma50 <= 0:
-        return None
-
-    # Must be meaningfully below avg entry (real average-down, not just scaling up)
-    if close > entry * (1.0 - float(STOCK_ADD_MIN_DRAWdown_PCT)):
-        return None
-
-    # Never add if we're at/through stop.
-    if close <= stop:
-        return None
-
-    # Trend guardrail
-    if close < sma50:
-        return None
-
-    # Location filter near EMA21
-    if atr > 0:
-        band = float(STOCK_ADD_NEAR_EMA21_ATR) * atr
-        if abs(close - ema21) > band:
-            return None
-
-    # Confirmation: reclaim EMA21
-    if not (prev_close < prev_ema21 and close > ema21):
-        return None
-
-    # Momentum improving
-    if rsi14 < float(STOCK_ADD_RSI14_MIN):
-        return None
-    if rsi14_prev and rsi14 <= rsi14_prev:
-        return None
-
-    cap = _account_cap(account)
-    if cap <= 0:
-        return None
-
-    util_cap = cap * (RETIREMENT_MAX_EQUITY_UTIL_PCT if account in (IRA, ROTH) else 1.0)
-
-    # Same caps as entry sizing
-    max_pos_value = util_cap * _max_pos_pct_for_account(account)
-    risk_cap = util_cap * _risk_pct_for_account(account)
-
-    # --- Remaining overall account capacity (prevents adds when account is already "full") ---
-    remaining_account_value = max(util_cap - float(acct_current_mv or 0.0), 0.0)
-    if remaining_account_value <= 0:
-        return None
-
-    # --- Current position value & remaining room under per-position cap ---
-    current_pos_value = close * sh
-    remaining_pos_value = max(max_pos_value - current_pos_value, 0.0)
-    if remaining_pos_value <= 0:
-        return None
-
-    # --- Risk-based total shares cap (total position risk <= risk_cap) ---
-    risk_ps = max(close - stop, 0.01)
-
-    # max total shares allowed by risk
-    max_total_shares_by_risk = int(risk_cap / risk_ps)
-    if max_total_shares_by_risk <= sh:
-        return None
-    remaining_risk_shares = max_total_shares_by_risk - sh
-
-    # --- Value-based add caps ---
-    max_add_by_pos_value = int(remaining_pos_value / close)
-    max_add_by_acct_value = int(remaining_account_value / close)
-
-    # --- Desired scale-in size ---
-    # Conservative: add up to 50% of current shares, but never exceed caps
-    desired_add = max(int(sh * 0.5), 1)
-
-    add_shares = min(desired_add, remaining_risk_shares, max_add_by_pos_value, max_add_by_acct_value)
-    if add_shares <= 0:
-        return None
-
-    return {
-        "account": account,
-        "ticker": ticker,
-        "add_date": today.isoformat(),
-        "add_price": close,
-        "add_shares": add_shares,
-        "reason": "ADD: reclaim EMA21 near support (trend intact)",
-    }
-
-
-def execute_stock_add(today: dt.date, plan: dict) -> None:
-    """Paper execution for a stock ADD: update weighted avg entry + shares."""
-    ensure_stock_files()
-    rows = load_stock_positions()
-
-    acct = (plan.get("account") or "").strip().upper()
-    tkr = (plan.get("ticker") or "").strip().upper()
-    add_price = float(plan.get("add_price") or 0.0)
-    add_shares = int(float(plan.get("add_shares") or 0))
-    add_date = (plan.get("add_date") or today.isoformat())
-
-    if not acct or not tkr or add_price <= 0 or add_shares <= 0:
-        return
-
-    for r in rows:
-        if (r.get("status") or "").upper() != "OPEN":
-            continue
-        if (r.get("account") or "").strip().upper() != acct:
-            continue
-        if (r.get("ticker") or "").strip().upper() != tkr:
-            continue
-
-        try:
-            old_avg = float(r.get("entry_price") or 0.0)
-            old_sh = int(float(r.get("shares") or 0))
-        except Exception:
-            continue
-        if old_avg <= 0 or old_sh <= 0:
-            continue
-
-        new_sh = old_sh + add_shares
-        new_avg = (old_avg * old_sh + add_price * add_shares) / float(new_sh)
-
-        r["entry_price"] = f"{new_avg:.2f}"
-        r["shares"] = str(new_sh)
-
-        try:
-            adds = int(float(r.get("adds") or 0))
-        except Exception:
-            adds = 0
-        r["adds"] = str(adds + 1)
-        r["last_add_date"] = add_date
-
-        # Preserve initial_* fields if blank
-        if not (r.get("initial_entry_price") or "").strip():
-            r["initial_entry_price"] = f"{old_avg:.2f}"
-        if not (r.get("initial_shares") or "").strip():
-            r["initial_shares"] = str(old_sh)
-
-        note = (r.get("notes") or "").strip()
-        add_note = f"{add_date} ADD {add_shares}@{add_price:.2f}"
-        r["notes"] = (note + (" | " if note else "") + add_note)
-
-        break
-
-    write_stock_positions(rows)
-
-    append_stock_fill({
-        "date": add_date,
-        "account": acct,
-        "ticker": tkr,
-        "action": "ADD",
-        "price": f"{add_price:.2f}",
-        "shares": str(add_shares),
-        "reason": plan.get("reason", ""),
-    })
-
-
 def execute_stock_plan(today: dt.date, plan: dict) -> str:
     """Paper 'execution': record OPEN stock position immediately (filled at close)."""
     ensure_stock_files()
@@ -1188,13 +978,38 @@ def _pick_expiry_in_dte_range(ticker_obj: yf.Ticker, dte_min: int, dte_max: int)
     return None, None
 
 
-def _suggest_put_strike(stock_last: pd.Series, atr_mult: float) -> float:
+def _suggest_put_strike(
+    stock_last: pd.Series,
+    atr_mult: float,
+    *,
+    risk_off: bool = False,
+    min_otm_pct: float = 0.0,
+    base_ma: str = "EMA_21",
+) -> float:
     close = float(stock_last["Close"])
-    ema21 = float(stock_last["EMA_21"])
-    atr14 = float(stock_last["ATR_14"])
+    atr14 = float(stock_last.get("ATR_14", 0) or 0)
+
+    # Choose base level (slower MA when risk-off to avoid "chasing down")
+    base = close
+    base_ma_u = (base_ma or "").upper()
+    if base_ma_u == "SMA_50":
+        base = float(stock_last.get("SMA_50", close) or close)
+    elif base_ma_u == "EMA_50":
+        base = float(stock_last.get("EMA_50", close) or close)
+    elif base_ma_u == "EMA_21":
+        base = float(stock_last.get("EMA_21", close) or close)
+
     if CSP_STRIKE_MODE == "ema21_atr":
-        return ema21 - (atr_mult * atr14)
-    return close * 0.92
+        raw = base - (atr_mult * atr14)
+    else:
+        raw = close * 0.92
+
+    # Enforce minimum % OTM cushion
+    if min_otm_pct and close > 0:
+        otm_cap = close * (1.0 - float(min_otm_pct))
+        raw = min(raw, otm_cap)
+
+    return float(raw)
 
 
 def _round_strike_to_chain(puts_df: pd.DataFrame, target_strike: float) -> float:
@@ -1209,6 +1024,10 @@ def evaluate_csp_candidate(
     ticker: str,
     df: pd.DataFrame,
     atr_mult: float = 0.50,
+    *,
+    risk_off: bool = False,
+    min_otm_pct: float = 0.0,
+    base_ma: str = CSP_STRIKE_BASE_NORMAL,
 ) -> Optional[dict]:
     """Evaluate a single CSP candidate (enforces share price cap)."""
     if df is None or df.empty:
@@ -1233,7 +1052,7 @@ def evaluate_csp_candidate(
         if puts.empty:
             return None
 
-        raw_strike = _suggest_put_strike(stock_last, atr_mult=atr_mult)
+        raw_strike = _suggest_put_strike(stock_last, atr_mult=atr_mult, risk_off=risk_off, min_otm_pct=min_otm_pct, base_ma=base_ma)
         strike = _round_strike_to_chain(puts, raw_strike)
 
         row = puts.loc[puts["strike"] == strike]
@@ -1279,7 +1098,7 @@ def evaluate_csp_candidate(
             "est_premium": float(est_premium),
             "yield_pct": float(yield_pct),
             "atr_mult": float(atr_mult),
-            "reason": f"Strike≈EMA21-{atr_mult:.2f}*ATR (raw {raw_strike:.2f})",
+            "reason": f"Strike≈{base_ma}-{atr_mult:.2f}*ATR, minOTM={min_otm_pct:.0%} (raw {raw_strike:.2f})",
         }
     except Exception:
         return None
@@ -1476,60 +1295,6 @@ def add_csp_position_from_selected(today: str, week_id: str, idea: dict) -> Tupl
     return (pos_id, True)
 
 
-def update_open_csp_status(today: dt.date) -> None:
-    ensure_positions_files()
-    rows = load_csv_rows(CSP_POSITIONS_FILE)
-    if not rows:
-        return
-
-    open_tickers = sorted({
-        (r.get("ticker") or "").strip().upper()
-        for r in rows
-        if (r.get("status") or "").upper() == "OPEN"
-    })
-
-    last_close: Dict[str, float] = {}
-    for tkr in open_tickers:
-        try:
-            df = yf.download(tkr, period="7d", interval="1d", auto_adjust=False, progress=False)
-            df.dropna(inplace=True)
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
-            if not df.empty:
-                last_close[tkr] = float(df["Close"].iloc[-1])
-        except Exception:
-            continue
-
-    for r in rows:
-        if (r.get("status") or "").upper() != "OPEN":
-            continue
-
-        tkr = (r.get("ticker") or "").strip().upper()
-        exp_str = (r.get("expiry") or "").strip()
-        try:
-            exp = dt.date.fromisoformat(exp_str)
-            r["dte_remaining"] = str((exp - today).days)
-        except Exception:
-            pass
-
-        try:
-            strike = float(r.get("strike") or 0.0)
-        except Exception:
-            strike = 0.0
-
-        px = last_close.get(tkr)
-        if not px or strike <= 0:
-            continue
-
-        diff = px - strike
-        r["underlying_last"] = f"{px:.2f}"
-        r["strike_diff"] = f"{diff:.2f}"
-        r["strike_diff_pct"] = f"{(diff/strike)*100:.2f}"
-        r["itm_otm"] = "ITM" if px < strike else "OTM"
-
-    write_csv_rows(CSP_POSITIONS_FILE, rows, CSP_POSITIONS_COLUMNS)
-
-
 def process_csp_expirations(today: dt.date) -> Dict[str, List[str]]:
     ensure_positions_files()
     rows = load_csv_rows(CSP_POSITIONS_FILE)
@@ -1589,26 +1354,6 @@ def process_csp_expirations(today: dt.date) -> Dict[str, List[str]]:
 
     write_csv_rows(CSP_POSITIONS_FILE, rows, CSP_POSITIONS_COLUMNS)
     return {"expired": expired, "assigned": assigned}
-
-
-def get_open_csp_tickers(today: dt.date) -> set:
-    rows = load_csv_rows(CSP_POSITIONS_FILE)
-    out = set()
-    for r in rows:
-        if (r.get("status") or "").upper() != "OPEN":
-            continue
-        tkr = (r.get("ticker") or "").strip().upper()
-        if not tkr:
-            continue
-        exp_str = (r.get("expiry") or "").strip()
-        try:
-            exp = dt.date.fromisoformat(exp_str)
-            if exp < today:
-                continue
-        except Exception:
-            pass
-        out.add(tkr)
-    return out
 
 
 # ============================================================

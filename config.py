@@ -1,50 +1,41 @@
-# config.py
+"""config.py
+
+Project configuration.
+
+"""
+
 from __future__ import annotations
 from typing import Dict, List
 
 # ---- Discord Webhook ---- #
-# Keep OUT of git (use env var in the future if you want)
+# Keep OUT of git
 WEBHOOK_URL = ""
 
 # ---- Files ---- #
-# Stock swing / tactical tracking (paper)
+# Stock swing / tactical tracking
 STOCK_POSITIONS_FILE = "stock_positions.csv"
 STOCK_TRADES_FILE = "stock_trades.csv"
 STOCK_FILLS_FILE = "stock_fills.csv"
 STOCK_MONTHLY_DIR = "stock_monthly"
 
-# Legacy single-account swing tracking is replaced by the files above
-# (kept only if you still want them elsewhere)
-POSITIONS_FILE = "open_positions.csv"
-TRADES_LOG_FILE = "closed_trades.csv"
-
-# Wheel / options tracking (paper)
+# Wheel / options tracking
 CSP_LEDGER_FILE = "csp_ledger.csv"
 CSP_POSITIONS_FILE = "csp_positions.csv"
 CC_POSITIONS_FILE = "cc_positions.csv"
 
-# Institutional-ish wheel tracking
+# Wheel tracking
 WHEEL_EVENTS_FILE = "wheel_events.csv"
 WHEEL_LOTS_FILE = "wheel_lots.csv"
 WHEEL_MONTHLY_DIR = "wheel_monthly"
 
-# Retirement holdings tracking (stock-only “inventory”, separate from swing trades)
+# Retirement holdings
 RETIREMENT_POSITIONS_FILE = "retirement_positions.csv"
-
-# ============================================================
-# Stock scale-in (average-down) rules (paper)
-# ============================================================
-STOCK_MAX_ADDS_PER_POSITION = 1
-STOCK_ADD_COOLDOWN_DAYS = 5
-STOCK_ADD_MIN_DRAWdown_PCT = 0.03   # require position to be down at least this much vs avg entry to consider an ADD
-STOCK_ADD_NEAR_EMA21_ATR = 0.50     # must be within +/- this * ATR of EMA21
-STOCK_ADD_RSI14_MIN = 45
 
 # ============================================================
 # Accounts / Allocation
 # ============================================================
 
-# Named accounts used everywhere
+# Named accounts
 INDIVIDUAL = "INDIVIDUAL"
 IRA = "IRA"
 ROTH = "ROTH"
@@ -66,7 +57,7 @@ INDIVIDUAL_STOCK_CAP_PCT = 1.0 - WHEEL_CAP_PCT
 INDIVIDUAL_STOCK_CAP = int(ACCOUNT_SIZES[INDIVIDUAL] * INDIVIDUAL_STOCK_CAP_PCT)
 
 # Retirement accounts can be more aggressive but still capped by account size
-RETIREMENT_MAX_EQUITY_UTIL_PCT = 0.98  # keep a little cash buffer
+RETIREMENT_MAX_EQUITY_UTIL_PCT = 0.98  # cash buffer
 
 # If a retirement holding is down >= 10%, only allow selling at breakeven (entry)
 RETIREMENT_BREAKEVEN_ONLY_DD_PCT = 0.10
@@ -76,35 +67,19 @@ RETIREMENT_BREAKEVEN_ONLY_DD_PCT = 0.10
 # ============================================================
 
 # “Run after close” means entries are detected using EOD data.
-# We build entry plans meant to be still valid the next day.
 STOCK_REQUIRE_NEXTDAY_VALIDATION = True
-
-# If False, a ticker can only be OPEN in ONE account at a time (INDIVIDUAL/IRA/ROTH)
-ALLOW_MULTI_ACCOUNT_SAME_TICKER = False
-
-# Minimum position market value (helps avoid tiny positions when risk_per_share is large)
-STOCK_MIN_POSITION_VALUE_INDIVIDUAL = 1_500
-STOCK_MIN_POSITION_VALUE_RETIREMENT = 3_000
 
 # --- Stock sizing caps (swing stocks) ---
 STOCK_MAX_POSITION_PCT_INDIVIDUAL = 0.15   # 15% of account per stock
 STOCK_MAX_POSITION_PCT_RETIREMENT = 0.15 
 
-# Gating by market regime
-# - INDIVIDUAL swing trades are strict
-# - IRA/ROTH tactical trades are slightly less strict (still avoid broken markets)
-STOCK_GATE_INDIVIDUAL = "STRICT"   # STRICT = SPY>200 & SPY>50 & SPY>21 & QQQ>50 & VIX<25
-STOCK_GATE_RETIREMENT = "SOFT"     # SOFT   = SPY>200 & VIX<25
-
 # Risk / sizing
-# Risk is defined as (entry - stop) * shares.
-# We size shares to keep risk per trade within these caps.
 STOCK_RISK_PCT_INDIVIDUAL = 0.050   # 5.0% of INDIVIDUAL_STOCK_CAP per trade
 STOCK_RISK_PCT_RETIREMENT = 0.050   # 5.0% of account per trade
 
 # Targets / exits
 STOCK_TARGET_R_MULTIPLE = 2.0           # take-profit at ~2R
-STOCK_BREAKEVEN_AFTER_R = 1.0           # optional: move stop to breakeven after +1R
+STOCK_BREAKEVEN_AFTER_R = 1.0           # move stop to breakeven after +1R
 STOCK_USE_BREAKEVEN_TRAIL = True
 
 # Stop building blocks
@@ -112,7 +87,7 @@ STOCK_STOP_ATR_PULLBACK = 1.0  # stop = EMA21 - ATR*X for pullbacks
 STOCK_STOP_ATR_BREAKOUT = 1.2  # stop = breakout_level - ATR*X
 
 # ============================================================
-# Universe
+# Stock Universe
 # ============================================================
 
 STOCKS: List[str] = list(dict.fromkeys([
@@ -143,9 +118,15 @@ STOCKS: List[str] = list(dict.fromkeys([
     "PLTR","SHOP","SNOW","MDB","NET","ZS","BILL","PL",
 ]))
 
-# CSP universe (kept focused; price cap is enforced in strategies.evaluate_csp_candidate)
+# CSP Universe
 CSP_STOCKS: List[str] = list(dict.fromkeys(
     STOCKS + [
+        # ETFs / lower-beta
+        "SPLG","SCHD","JEPI","XLU","XLF","EEM",
+
+        # Defensive single names
+        "KO","PFE","VZ","T","GIS","KHC","BAC","OXY",
+
         # Financials / payments
         "BAC","C","SOFI","AXP",
 
@@ -177,11 +158,33 @@ CSP_STOCKS: List[str] = list(dict.fromkeys(
     ]
 ))
 
+
+# CSP tickers to allow even in "risk-off" market regime (high VIX / SPY below 200SMA).
+# These should be liquid, lower-beta names and/or broad ETFs.
+CSP_DEFENSIVE_STOCKS: List[str] = [
+    # ETFs
+    "SPLG","SCHD","JEPI","XLU","XLF","EEM",
+    # Large / defensive-ish single names
+    "KO","PFE","VZ","T","GIS","KHC","BAC",
+    # Energy/commodity
+    "OXY",
+]
+
+# Market-regime controls for CSP scan
+CSP_RISK_OFF_VIX = 25.0  # VIX > this => "RISK_OFF" (defensive-only + farther OTM)
+CSP_RISK_OFF_MIN_OTM_PCT_DEFENSIVE = 0.10  # at least 10% OTM when risk-off (defensive)
+CSP_RISK_OFF_MIN_OTM_PCT_RISKY = 0.15      # at least 15% OTM when risk-off
+CSP_NORMAL_MIN_OTM_PCT = 0.06              # baseline cushion
+
+# Strike base for puts
+CSP_STRIKE_BASE_NORMAL = "EMA_21"          # fast, but fine when trend is healthy
+CSP_STRIKE_BASE_RISK_OFF = "SMA_50"        # slower, avoids chasing price down
+
 # ---- Market data ---- #
 DATA_PERIOD = "1y"
 DATA_INTERVAL = "1d"
 
-# ---- CSP enable ---- #
+# ---- CSP enabled flag ---- #
 ENABLE_CSP = True
 
 # ============================================================
@@ -228,30 +231,31 @@ CSP_TARGET_DTE_MIN = 25
 CSP_TARGET_DTE_MAX = 45
 
 # ---- Risk / sizing ----
-CSP_MAX_CASH_PER_TRADE = 10_000  # => $100/share max if 1 contract
+CSP_MAX_CASH_PER_TRADE = 8_000  # => $80/share max if 1 contract
 
 # ---- Liquidity filters ----
 CSP_MIN_OI = 100
 CSP_MIN_VOLUME = 10
 CSP_MIN_BID = 0.10
 
-# Optional IV sanity check (set to 0.0/None to disable)
-CSP_MIN_IV = 0.20  # lowered: IV filter is redundant with premium/yield; lower IV does not increase risk
+# IV sanity check (set to 0.0/None to disable)
+CSP_MIN_IV = 0.20  # IV filter is redundant with premium/yield; lower IV does not increase risk
+
 # ---- Strike selection ----
 CSP_STRIKE_MODE = "ema21_atr"
 
-
 # Try a small set of ATR distances to find a liquid strike.
 # Higher = farther OTM (lower risk, less premium).
-CSP_ATR_MULTS = [0.60, 0.50]
-# ---- Premium / yield tiers ----
-CSP_MIN_PREMIUM_CONSERVATIVE = 150
-CSP_MIN_PREMIUM_BALANCED = 250
-CSP_MIN_PREMIUM_AGGRESSIVE = 350
+CSP_ATR_MULTS = [1.50, 1.25, 1.00]  # safer strikes (farther OTM)
 
-CSP_MIN_YIELD_CONSERVATIVE = 0.020
-CSP_MIN_YIELD_BALANCED = 0.025
-CSP_MIN_YIELD_AGGRESSIVE = 0.03
+# ---- Premium / yield tiers ----
+CSP_MIN_PREMIUM_CONSERVATIVE = 100
+CSP_MIN_PREMIUM_BALANCED = 175
+CSP_MIN_PREMIUM_AGGRESSIVE = 250
+
+CSP_MIN_YIELD_CONSERVATIVE = 0.010
+CSP_MIN_YIELD_BALANCED = 0.015
+CSP_MIN_YIELD_AGGRESSIVE = 0.020
 
 # ---- Tier caps ----
 CSP_MAX_AGGRESSIVE_TOTAL = 4
