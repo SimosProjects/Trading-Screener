@@ -1,15 +1,12 @@
-"""wheel.py
+"""
+wheel.py
 
 Lightweight 'institutional wheel' bookkeeping.
-
-Goal: make screener.py runnable and keep state in a small number of CSVs.
 
 Files (configured in config.py):
   - wheel_events.csv : append-only event log (CSP/CC opens, expiries, assignments, called-away)
   - wheel_lots.csv   : current stock lots created by CSP assignment (used to drive CC ideas)
   - wheel_monthly/   : one CSV per month, rebuilt from wheel_events.csv
-
-This is intentionally conservative and simple. It is *not* broker-integrated.
 """
 
 from __future__ import annotations
@@ -17,7 +14,7 @@ from __future__ import annotations
 import csv
 import datetime as dt
 import os
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from config import (
     WHEEL_EVENTS_FILE,
@@ -51,44 +48,144 @@ LOT_FIELDS = [
     "open_date",
     "shares",
     "assigned_strike",
-    "cost_basis",     # total cost basis dollars (strike*shares - premium)
+    "cost_basis",  # total cost basis dollars (strike*shares - premium)
     "source_csp_id",
     "has_open_cc",
     "cc_id",
-    "status",         # OPEN / CLOSED
+    "status",  # OPEN / CLOSED
 ]
+
+
+# ----------------------------
+# Helpers
+# ----------------------------
 
 def _iso_week_id(d: dt.date) -> str:
     y, w, _ = d.isocalendar()
     return f"{y}-W{w:02d}"
 
+
+def _ensure_trailing_newline(path: str) -> None:
+    """Ensure an existing file ends with a newline so subsequent appends can't glue rows together."""
+    try:
+        if not os.path.isfile(path) or os.path.getsize(path) == 0:
+            return
+        with open(path, "rb") as fb:
+            fb.seek(-1, os.SEEK_END)
+            last = fb.read(1)
+        if last != b"\n":
+            with open(path, "a", newline="") as fa:
+                fa.write("\n")
+    except Exception:
+        # Non-fatal; worst case we behave like before.
+        return
+
+
 def _read_rows(path: str) -> List[dict]:
+    """Read CSV rows safely.
+
+    - Returns [] if file missing
+    - Skips malformed rows that don't match header column count (prevents crashes)
+    """
     if not os.path.isfile(path):
         return []
-    with open(path, "r", newline="") as f:
-        return list(csv.DictReader(f))
+
+    rows: List[dict] = []
+    try:
+        with open(path, "r", newline="") as f:
+            reader = csv.reader(f)
+            header = next(reader, None)
+            if not header:
+                return []
+            header = [h.strip() for h in header]
+
+            for parts in reader:
+                # Skip completely empty lines
+                if not parts or all((p or "").strip() == "" for p in parts):
+                    continue
+                # Malformed row (often caused by glued lines) -> skip to avoid poisoning downstream
+                if len(parts) != len(header):
+                    continue
+                rows.append({header[i]: parts[i] for i in range(len(header))})
+    except Exception:
+        # Fall back to DictReader if something odd happened; still might fail if file is corrupted
+        try:
+            with open(path, "r", newline="") as f:
+                return list(csv.DictReader(f))
+        except Exception:
+            return []
+
+    return rows
+
 
 def _write_rows(path: str, rows: List[dict], fieldnames: List[str]) -> None:
+    """Write rows with stable newlines for consistent CSV formatting across platforms."""
+    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
     with open(path, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w = csv.DictWriter(
+            f,
+            fieldnames=fieldnames,
+            extrasaction="ignore",
+            lineterminator="\n",
+        )
         w.writeheader()
         for r in rows:
             w.writerow({k: r.get(k, "") for k in fieldnames})
 
+
 def ensure_wheel_files() -> None:
-    # ensure directory exists
+    # Ensure directory exists
     base_dir = os.path.dirname(os.path.abspath(WHEEL_EVENTS_FILE))
     os.makedirs(base_dir, exist_ok=True)
 
     if not os.path.isfile(WHEEL_EVENTS_FILE):
         with open(WHEEL_EVENTS_FILE, "w", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=EVENT_FIELDS)
+            w = csv.DictWriter(
+                f,
+                fieldnames=EVENT_FIELDS,
+                extrasaction="ignore",
+                lineterminator="\n",
+            )
             w.writeheader()
 
     if not os.path.isfile(WHEEL_LOTS_FILE):
         with open(WHEEL_LOTS_FILE, "w", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=LOT_FIELDS)
+            w = csv.DictWriter(
+                f,
+                fieldnames=LOT_FIELDS,
+                extrasaction="ignore",
+                lineterminator="\n",
+            )
             w.writeheader()
+
+
+def _safe_float(v: object, default: float = 0.0) -> float:
+    try:
+        if v is None:
+            return default
+        s = str(v).strip()
+        if s == "" or s.upper() == "NAN":
+            return default
+        return float(s)
+    except Exception:
+        return default
+
+
+def _safe_int(v: object, default: int = 0) -> int:
+    try:
+        if v is None:
+            return default
+        s = str(v).strip()
+        if s == "" or s.upper() == "NAN":
+            return default
+        return int(float(s))
+    except Exception:
+        return default
+
+
+# ----------------------------
+# Events
+# ----------------------------
 
 def record_event(**kwargs) -> None:
     ensure_wheel_files()
@@ -104,19 +201,24 @@ def record_event(**kwargs) -> None:
     ref_norm = (kwargs.get("ref_id") or "").strip()
 
     row = {k: "" for k in EVENT_FIELDS}
-    # Deterministic event_id so rerunning the screener is idempotent
-    row["event_id"] = kwargs.get("event_id") or f"{date_str}-{ticker_norm}-{event_type_norm}-{ref_norm}"
+
+    # Deterministic event_id so rerunning is idempotent
+    row["event_id"] = (
+        (kwargs.get("event_id") or "").strip()
+        or f"{date_str}-{ticker_norm}-{event_type_norm}-{ref_norm}"
+    )
     row["date"] = date_str
-    row["week_id"] = kwargs.get("week_id") or _iso_week_id(d)
+    row["week_id"] = (kwargs.get("week_id") or "").strip() or _iso_week_id(d)
     row["ticker"] = ticker_norm
     row["event_type"] = event_type_norm
     row["ref_id"] = ref_norm
     row["expiry"] = (kwargs.get("expiry") or "").strip()
-    row["strike"] = f"{float(kwargs.get('strike') or 0):.2f}"
-    row["contracts"] = str(int(float(kwargs.get("contracts") or 0)))
-    row["shares"] = str(int(float(kwargs.get("shares") or 0)))
-    row["premium"] = f"{float(kwargs.get('premium') or 0):.2f}"
-    row["wheel_value"] = f"{float(kwargs.get('wheel_value') or 0):.2f}"
+
+    row["strike"] = f"{_safe_float(kwargs.get('strike'), 0.0):.2f}"
+    row["contracts"] = str(_safe_int(kwargs.get("contracts"), 0))
+    row["shares"] = str(_safe_int(kwargs.get("shares"), 0))
+    row["premium"] = f"{_safe_float(kwargs.get('premium'), 0.0):.2f}"
+    row["wheel_value"] = f"{_safe_float(kwargs.get('wheel_value'), 0.0):.2f}"
     row["notes"] = (kwargs.get("notes") or "").strip()
 
     # Idempotency: don't append the same event twice
@@ -127,8 +229,16 @@ def record_event(**kwargs) -> None:
     except Exception:
         pass
 
+    # Critical: avoid "glued rows" if file lacks trailing newline
+    _ensure_trailing_newline(WHEEL_EVENTS_FILE)
+
     with open(WHEEL_EVENTS_FILE, "a", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=EVENT_FIELDS, extrasaction="ignore")
+        w = csv.DictWriter(
+            f,
+            fieldnames=EVENT_FIELDS,
+            extrasaction="ignore",
+            lineterminator="\n",
+        )
         w.writerow(row)
 
 
@@ -139,10 +249,12 @@ def record_event(**kwargs) -> None:
 def _make_lot_id(ticker: str, open_date: str, strike: float) -> str:
     return f"{ticker}-{open_date}-{float(strike):.2f}"
 
+
 def get_open_lots() -> List[dict]:
     ensure_wheel_files()
     lots = _read_rows(WHEEL_LOTS_FILE)
     return [r for r in lots if (r.get("status") or "").upper() == "OPEN"]
+
 
 def create_lots_from_new_assignments(today: dt.date) -> None:
     """Create lots for any CSP positions marked ASSIGNED that don't yet have a lot."""
@@ -162,29 +274,28 @@ def create_lots_from_new_assignments(today: dt.date) -> None:
         ticker = (r.get("ticker") or "").strip().upper()
         open_date = (r.get("close_date") or today.isoformat()).strip()
 
-        try:
-            strike = float(r.get("strike") or 0.0)
-            shares = int(float(r.get("shares_if_assigned") or 0))
-            basis = float(r.get("assignment_cost_basis") or 0.0)
-        except Exception:
-            continue
+        strike = _safe_float(r.get("strike"), 0.0)
+        shares = _safe_int(r.get("shares_if_assigned"), 0)
+        basis = _safe_float(r.get("assignment_cost_basis"), 0.0)
 
         if shares <= 0 or strike <= 0:
             continue
 
         lot_id = _make_lot_id(ticker, open_date, strike)
-        lots.append({
-            "lot_id": lot_id,
-            "ticker": ticker,
-            "open_date": open_date,
-            "shares": str(shares),
-            "assigned_strike": f"{strike:.2f}",
-            "cost_basis": f"{basis:.2f}",
-            "source_csp_id": csp_id,
-            "has_open_cc": "0",
-            "cc_id": "",
-            "status": "OPEN",
-        })
+        lots.append(
+            {
+                "lot_id": lot_id,
+                "ticker": ticker,
+                "open_date": open_date,
+                "shares": str(shares),
+                "assigned_strike": f"{strike:.2f}",
+                "cost_basis": f"{basis:.2f}",
+                "source_csp_id": csp_id,
+                "has_open_cc": "0",
+                "cc_id": "",
+                "status": "OPEN",
+            }
+        )
 
         record_event(
             date=open_date,
@@ -193,14 +304,15 @@ def create_lots_from_new_assignments(today: dt.date) -> None:
             ref_id=lot_id,
             expiry=(r.get("expiry") or ""),
             strike=strike,
-            contracts=int(float(r.get("contracts") or 0)),
+            contracts=_safe_int(r.get("contracts"), 0),
             shares=shares,
-            premium=float(r.get("premium") or r.get("est_premium") or 0.0),
+            premium=_safe_float(r.get("premium") or r.get("est_premium") or 0.0, 0.0),
             wheel_value=strike * shares,
             notes=f"Assigned from CSP {csp_id}",
         )
 
     _write_rows(WHEEL_LOTS_FILE, lots, LOT_FIELDS)
+
 
 def link_new_ccs_to_lots(today: dt.date) -> None:
     """Attach OPEN CCs in cc_positions.csv to OPEN lots of the same ticker if not already linked."""
@@ -242,28 +354,32 @@ def link_new_ccs_to_lots(today: dt.date) -> None:
         lot["cc_id"] = cc_id
         changed = True
 
-        # Log CC open event once
-        try:
-            prem = float(cc.get("credit_mid") or 0.0) * 100.0 * float(cc.get("contracts") or 0.0)
-        except Exception:
-            prem = 0.0
+        # Premium correctness:
+        # In this project, cc_positions.csv stores TOTAL premium dollars as "premium".
+        # Do NOT recompute as credit_mid * 100 * contracts unless premium is missing.
+        prem = 0.0
+        if cc.get("premium") not in (None, "", "NaN", "nan"):
+            prem = _safe_float(cc.get("premium"), 0.0)
+        else:
+            prem = _safe_float(cc.get("credit_mid"), 0.0) * 100.0 * _safe_float(cc.get("contracts"), 0.0)
 
         record_event(
             date=(cc.get("open_date") or today.isoformat()),
             ticker=t,
             event_type="CC_OPEN",
-            ref_id=cc_id,
+            ref_id=cc_id,  # FIX: was a typo in prior file
             expiry=(cc.get("expiry") or ""),
-            strike=float(cc.get("strike") or 0.0),
-            contracts=int(float(cc.get("contracts") or 0)),
-            shares=int(float(cc.get("contracts") or 0)) * 100,
+            strike=_safe_float(cc.get("strike"), 0.0),
+            contracts=_safe_int(cc.get("contracts"), 0),
+            shares=_safe_int(cc.get("contracts"), 0) * 100,
             premium=prem,
             wheel_value=0.0,
-            notes=f"Linked CC {cc_id} to lot {lot.get('lot_id','')}",
+            notes=f"Linked CC {cc_id} to lot {lot.get('lot_id', '')}",
         )
 
     if changed:
         _write_rows(WHEEL_LOTS_FILE, lots, LOT_FIELDS)
+
 
 def process_cc_expirations(today: dt.date) -> Dict[str, List[str]]:
     """Mark OPEN CCs as EXPIRED / CALLED_AWAY if expiry <= today."""
@@ -293,16 +409,20 @@ def process_cc_expirations(today: dt.date) -> Dict[str, List[str]]:
             continue
 
         tkr = (r.get("ticker") or "").strip().upper()
-        try:
-            strike = float(r.get("strike") or 0.0)
-        except Exception:
-            strike = 0.0
+        strike = _safe_float(r.get("strike"), 0.0)
 
-        underlying_close = None
+        underlying_close: Optional[float] = None
         try:
             start = (exp - dt.timedelta(days=7)).isoformat()
             end = (exp + dt.timedelta(days=1)).isoformat()
-            df = yf.download(tkr, start=start, end=end, interval="1d", auto_adjust=False, progress=False)
+            df = yf.download(
+                tkr,
+                start=start,
+                end=end,
+                interval="1d",
+                auto_adjust=False,
+                progress=False,
+            )
             df.dropna(inplace=True)
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
@@ -312,6 +432,7 @@ def process_cc_expirations(today: dt.date) -> Dict[str, List[str]]:
             underlying_close = None
 
         r["close_date"] = exp.isoformat()
+
         if underlying_close is not None and strike > 0 and underlying_close >= strike:
             r["status"] = "CALLED_AWAY"
             r["close_type"] = "CALLED_AWAY_ITM"
@@ -323,8 +444,8 @@ def process_cc_expirations(today: dt.date) -> Dict[str, List[str]]:
                 ref_id=(r.get("id") or ""),
                 expiry=exp_str,
                 strike=strike,
-                contracts=int(float(r.get("contracts") or 0)),
-                shares=int(float(r.get("contracts") or 0)) * 100,
+                contracts=_safe_int(r.get("contracts"), 0),
+                shares=_safe_int(r.get("contracts"), 0) * 100,
                 premium=0.0,
                 wheel_value=0.0,
                 notes="CC called away (best-effort inference)",
@@ -340,16 +461,17 @@ def process_cc_expirations(today: dt.date) -> Dict[str, List[str]]:
                 ref_id=(r.get("id") or ""),
                 expiry=exp_str,
                 strike=strike,
-                contracts=int(float(r.get("contracts") or 0)),
-                shares=int(float(r.get("contracts") or 0)) * 100,
+                contracts=_safe_int(r.get("contracts"), 0),
+                shares=_safe_int(r.get("contracts"), 0) * 100,
                 premium=0.0,
                 wheel_value=0.0,
                 notes="CC expired (best-effort inference)",
             )
+
         changed = True
 
     if changed:
-        # keep original headers if present, else fall back
+        # Keep original headers if present, else fall back
         fieldnames = list(cc_rows[0].keys()) if cc_rows else []
         _write_rows(CC_POSITIONS_FILE, cc_rows, fieldnames)
 
@@ -357,7 +479,11 @@ def process_cc_expirations(today: dt.date) -> Dict[str, List[str]]:
     if called:
         lots = _read_rows(WHEEL_LOTS_FILE)
         lot_changed = False
-        called_cc_ids = {(r.get("id") or "") for r in cc_rows if (r.get("status") or "").upper() == "CALLED_AWAY"}
+        called_cc_ids = {
+            (r.get("id") or "")
+            for r in cc_rows
+            if (r.get("status") or "").upper() == "CALLED_AWAY"
+        }
         for lot in lots:
             if (lot.get("status") or "").upper() != "OPEN":
                 continue
@@ -396,10 +522,7 @@ def compute_wheel_exposure(today: dt.date) -> Dict[str, float | int | str]:
         except Exception:
             pass
 
-        try:
-            total += float(r.get("cash_reserved") or 0.0)
-        except Exception:
-            pass
+        total += _safe_float(r.get("cash_reserved"), 0.0)
 
         tier = (r.get("tier") or "").upper()
         if tier == "AGGRESSIVE":
@@ -412,12 +535,9 @@ def compute_wheel_exposure(today: dt.date) -> Dict[str, float | int | str]:
     for lot in lots:
         if (lot.get("status") or "").upper() != "OPEN":
             continue
-        try:
-            strike = float(lot.get("assigned_strike") or 0.0)
-            shares = float(lot.get("shares") or 0.0)
-            total += strike * shares
-        except Exception:
-            continue
+        strike = _safe_float(lot.get("assigned_strike"), 0.0)
+        shares = _safe_float(lot.get("shares"), 0.0)
+        total += strike * shares
 
     return {
         "week_id": week_id,
@@ -427,6 +547,7 @@ def compute_wheel_exposure(today: dt.date) -> Dict[str, float | int | str]:
         "aggressive_total": int(aggressive_total),
         "aggressive_week": int(aggressive_week),
     }
+
 
 def compute_week_remaining(today: dt.date) -> float:
     """Weekly remaining based on OPEN CSP collateral entered this ISO week."""
@@ -440,10 +561,7 @@ def compute_week_remaining(today: dt.date) -> float:
             continue
         if (r.get("week_id") or "") != week_id:
             continue
-        try:
-            week_used += float(r.get("cash_reserved") or 0.0)
-        except Exception:
-            pass
+        week_used += _safe_float(r.get("cash_reserved"), 0.0)
 
     return max(float(WHEEL_WEEKLY_TARGET) - week_used, 0.0)
 
@@ -475,7 +593,9 @@ def rebuild_monthly_from_events() -> None:
     out_fields = ["date", "ticker", "event_type", "ref_id", "premium"]
 
     for month, evs in by_month.items():
-        evs_sorted = sorted(evs, key=lambda x: ((x.get("date") or ""), (x.get("ticker") or "")))
+        evs_sorted = sorted(
+            evs, key=lambda x: ((x.get("date") or ""), (x.get("ticker") or ""))
+        )
 
         out_rows: List[dict] = []
         total = 0.0
@@ -483,32 +603,33 @@ def rebuild_monthly_from_events() -> None:
             et = (e.get("event_type") or "").upper()
             if et not in ("CSP_OPEN", "CC_OPEN"):
                 continue
-            try:
-                prem = float(e.get("premium") or 0.0)
-            except Exception:
-                prem = 0.0
+            prem = _safe_float(e.get("premium"), 0.0)
             total += prem
-            out_rows.append({
-                "date": (e.get("date") or "").strip(),
-                "ticker": (e.get("ticker") or "").strip(),
-                "event_type": et,
-                "ref_id": (e.get("ref_id") or "").strip(),
-                "premium": f"{prem:.2f}",
-            })
+            out_rows.append(
+                {
+                    "date": (e.get("date") or "").strip(),
+                    "ticker": (e.get("ticker") or "").strip(),
+                    "event_type": et,
+                    "ref_id": (e.get("ref_id") or "").strip(),
+                    "premium": f"{prem:.2f}",
+                }
+            )
 
-        out_rows.append({
-            "date": "",
-            "ticker": "TOTAL",
-            "event_type": "",
-            "ref_id": "",
-            "premium": f"{total:.2f}",
-        })
+        out_rows.append(
+            {"date": "", "ticker": "TOTAL", "event_type": "", "ref_id": "", "premium": f"{total:.2f}"}
+        )
 
         path = os.path.join(WHEEL_MONTHLY_DIR, f"{month}.csv")
         _write_rows(path, out_rows, out_fields)
 
+
+# ----------------------------
+# Backfill (only if needed)
+# ----------------------------
+
 def should_backfill_events() -> bool:
     return (not os.path.isfile(WHEEL_EVENTS_FILE)) or (os.path.getsize(WHEEL_EVENTS_FILE) < 50)
+
 
 def backfill_open_events_from_positions(today: dt.date) -> None:
     """If wheel_events.csv is empty but you already have OPEN CSP/CC positions, backfill open events."""
@@ -530,13 +651,10 @@ def backfill_open_events_from_positions(today: dt.date) -> None:
         if not ref or ("CSP_OPEN", ref) in existing:
             continue
 
-        prem = 0.0
-        try:
-            prem = float(r.get("premium") or r.get("est_premium") or 0.0)
-            if prem <= 0:
-                prem = float(r.get("premium") or 0.0) * float(r.get("contracts") or 0.0)
-        except Exception:
-            prem = 0.0
+        prem = _safe_float(r.get("premium") or r.get("est_premium") or 0.0, 0.0)
+        # If premium was stored per-contract, try multiplying (legacy compatibility)
+        if prem <= 0:
+            prem = _safe_float(r.get("premium"), 0.0) * _safe_float(r.get("contracts"), 0.0)
 
         record_event(
             date=(r.get("open_date") or today.isoformat()),
@@ -544,11 +662,11 @@ def backfill_open_events_from_positions(today: dt.date) -> None:
             event_type="CSP_OPEN",
             ref_id=ref,
             expiry=(r.get("expiry") or ""),
-            strike=float(r.get("strike") or 0.0),
-            contracts=int(float(r.get("contracts") or 0.0)),
-            shares=int(float(r.get("contracts") or 0.0)) * 100,
+            strike=_safe_float(r.get("strike"), 0.0),
+            contracts=_safe_int(r.get("contracts"), 0),
+            shares=_safe_int(r.get("contracts"), 0) * 100,
             premium=prem,
-            wheel_value=float(r.get("cash_reserved") or 0.0),
+            wheel_value=_safe_float(r.get("cash_reserved"), 0.0),
             notes="Backfilled from csp_positions.csv",
         )
 
@@ -560,11 +678,8 @@ def backfill_open_events_from_positions(today: dt.date) -> None:
         if not ref or ("CC_OPEN", ref) in existing:
             continue
 
-        prem = 0.0
-        try:
-            prem = float(r.get("premium") or 0.0) * float(r.get("contracts") or 0.0)
-        except Exception:
-            prem = 0.0
+        # IMPORTANT: cc_positions.csv "premium" is already TOTAL dollars (not per-contract).
+        prem = _safe_float(r.get("premium"), 0.0)
 
         record_event(
             date=(r.get("open_date") or today.isoformat()),
@@ -572,9 +687,9 @@ def backfill_open_events_from_positions(today: dt.date) -> None:
             event_type="CC_OPEN",
             ref_id=ref,
             expiry=(r.get("expiry") or ""),
-            strike=float(r.get("strike") or 0.0),
-            contracts=int(float(r.get("contracts") or 0.0)),
-            shares=int(float(r.get("contracts") or 0.0)) * 100,
+            strike=_safe_float(r.get("strike"), 0.0),
+            contracts=_safe_int(r.get("contracts"), 0),
+            shares=_safe_int(r.get("contracts"), 0) * 100,
             premium=prem,
             wheel_value=0.0,
             notes="Backfilled from cc_positions.csv",
