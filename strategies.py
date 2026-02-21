@@ -895,15 +895,42 @@ def _iso_week_id(d: dt.date) -> str:
     return f"{y}-W{w:02d}"
 
 
+
+
+def ensure_csv_header(path: str, fieldnames: List[str]) -> None:
+    """Ensure CSV exists and header matches fieldnames.
+
+    If the file exists with a different header, rewrite it in-place and preserve existing
+    rows, filling missing fields with blank strings.
+    """
+    if not os.path.isfile(path):
+        with open(path, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=fieldnames)
+            w.writeheader()
+        return
+
+    with open(path, "r", newline="") as f:
+        reader = csv.reader(f)
+        try:
+            header = next(reader)
+        except StopIteration:
+            header = []
+
+    header = [h.strip() for h in header]
+    if header == fieldnames:
+        return
+
+    rows = load_csv_rows(path)
+    with open(path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w.writeheader()
+        for r in rows:
+            out = {k: r.get(k, "") for k in fieldnames}
+            w.writerow(out)
+
 def ensure_positions_files() -> None:
-    if not os.path.isfile(CSP_POSITIONS_FILE):
-        with open(CSP_POSITIONS_FILE, "w", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=CSP_POSITIONS_COLUMNS)
-            w.writeheader()
-    if not os.path.isfile(CC_POSITIONS_FILE):
-        with open(CC_POSITIONS_FILE, "w", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=CC_POSITIONS_COLUMNS)
-            w.writeheader()
+    ensure_csv_header(CSP_POSITIONS_FILE, CSP_POSITIONS_COLUMNS)
+    ensure_csv_header(CC_POSITIONS_FILE, CC_POSITIONS_COLUMNS)
 
 
 def load_csv_rows(path: str) -> List[dict]:
@@ -928,7 +955,7 @@ def append_csp_ledger_row(row: dict) -> None:
     We store *total premium dollars* in 'premium' (not per-contract credit).
     If caller provides only credit_mid, we compute premium.
     """
-    fieldnames = ["date","week_id","ticker","expiry","strike","contracts","premium","cash_reserved","tier"]
+    fieldnames = ["date","week_id","account","ticker","expiry","strike","contracts","premium","cash_reserved","tier"]
     file_exists = os.path.isfile(CSP_LEDGER_FILE)
 
     # normalize
@@ -1246,7 +1273,7 @@ def make_csp_position_id(ticker: str, expiry: str, strike: float, open_date: str
     return f"{ticker}-{expiry}-{float(strike):.2f}-{open_date}"
 
 
-def add_csp_position_from_selected(today: str, week_id: str, idea: dict) -> Tuple[str, bool]:
+def add_csp_position_from_selected(today: str, week_id: str, idea: dict, account: str = INDIVIDUAL) -> Tuple[str, bool]:
     """Add a CSP position row to CSP_POSITIONS_FILE.
 
     Returns (pos_id, created). If there's already an OPEN CSP for the ticker, this will NOT
@@ -1274,6 +1301,7 @@ def add_csp_position_from_selected(today: str, week_id: str, idea: dict) -> Tupl
         "id": pos_id,
         "open_date": today,
         "week_id": week_id,
+        "account": account,
         "ticker": tkr,
         "expiry": idea["expiry"],
         "dte_open": str(int(idea["dte"])),
@@ -1468,6 +1496,7 @@ def add_cc_position_from_candidate(today: str, idea: dict) -> str:
     rows.append({
         "id": cc_id,
         "open_date": today,
+        "account": (idea.get("account") or INDIVIDUAL),
         "ticker": idea["ticker"],
         "expiry": idea["expiry"],
         "strike": f"{float(idea['strike']):.2f}",

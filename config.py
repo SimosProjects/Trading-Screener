@@ -42,8 +42,8 @@ ROTH = "ROTH"
 
 ACCOUNT_SIZES: Dict[str, int] = {
     INDIVIDUAL: 125_000,
-    IRA: 100_000,
-    ROTH: 100_000,
+    IRA: 150_000,
+    ROTH: 150_000,
 }
 
 # Wheel allocation is ONLY for INDIVIDUAL account
@@ -51,6 +51,20 @@ WHEEL_ACCOUNT = INDIVIDUAL
 WHEEL_CAP_PCT = 0.80
 WHEEL_CAP = int(ACCOUNT_SIZES[WHEEL_ACCOUNT] * WHEEL_CAP_PCT)
 WHEEL_WEEKLY_TARGET = WHEEL_CAP / 5.0
+
+
+# Wheel allocation per account (INDIVIDUAL + retirement).
+# These drive per-account exposure limits for CSP/CC activity.
+WHEEL_CAPS: Dict[str, int] = {
+    INDIVIDUAL: int(ACCOUNT_SIZES[INDIVIDUAL] * WHEEL_CAP_PCT),
+    IRA: int(ACCOUNT_SIZES[IRA] * WHEEL_CAP_PCT),
+    ROTH: int(ACCOUNT_SIZES[ROTH] * WHEEL_CAP_PCT),
+}
+
+WHEEL_WEEKLY_TARGETS: Dict[str, float] = {
+    acct: cap / 5.0 for acct, cap in WHEEL_CAPS.items()
+}
+
 
 # INDIVIDUAL stock (non-wheel) cap is the remaining % (e.g., 20%)
 INDIVIDUAL_STOCK_CAP_PCT = 1.0 - WHEEL_CAP_PCT
@@ -195,6 +209,7 @@ CSP_POSITIONS_COLUMNS = [
     "id",
     "open_date",
     "week_id",
+    "account",
     "ticker",
     "expiry",
     "dte_open",
@@ -215,6 +230,7 @@ CSP_POSITIONS_COLUMNS = [
 CC_POSITIONS_COLUMNS = [
     "id",
     "open_date",
+    "account",
     "ticker",
     "expiry",
     "strike",

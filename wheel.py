@@ -20,8 +20,11 @@ from config import (
     WHEEL_EVENTS_FILE,
     WHEEL_LOTS_FILE,
     WHEEL_MONTHLY_DIR,
-    WHEEL_CAP,
-    WHEEL_WEEKLY_TARGET,
+    WHEEL_CAPS,
+    WHEEL_WEEKLY_TARGETS,
+    INDIVIDUAL,
+    IRA,
+    ROTH,
     CSP_POSITIONS_FILE,
     CC_POSITIONS_FILE,
 )
@@ -30,6 +33,7 @@ EVENT_FIELDS = [
     "event_id",
     "date",
     "week_id",
+    "account",
     "ticker",
     "event_type",
     "ref_id",
@@ -45,6 +49,7 @@ EVENT_FIELDS = [
 LOT_FIELDS = [
     "lot_id",
     "ticker",
+    "account",
     "open_date",
     "shares",
     "assigned_strike",
@@ -54,7 +59,6 @@ LOT_FIELDS = [
     "cc_id",
     "status",  # OPEN / CLOSED
 ]
-
 
 # ----------------------------
 # Helpers
@@ -286,6 +290,7 @@ def create_lots_from_new_assignments(today: dt.date) -> None:
             {
                 "lot_id": lot_id,
                 "ticker": ticker,
+                "account": (r.get("account") or INDIVIDUAL).strip().upper(),
                 "open_date": open_date,
                 "shares": str(shares),
                 "assigned_strike": f"{strike:.2f}",
@@ -300,6 +305,7 @@ def create_lots_from_new_assignments(today: dt.date) -> None:
         record_event(
             date=open_date,
             ticker=ticker,
+            account=(r.get("account") or INDIVIDUAL).strip().upper(),
             event_type="CSP_ASSIGNED",
             ref_id=lot_id,
             expiry=(r.get("expiry") or ""),
@@ -324,11 +330,12 @@ def link_new_ccs_to_lots(today: dt.date) -> None:
     cc_rows = _read_rows(CC_POSITIONS_FILE)
     open_ccs = [r for r in cc_rows if (r.get("status") or "").upper() == "OPEN"]
 
-    cc_by_ticker: Dict[str, dict] = {}
+    cc_by_key: Dict[str, dict] = {}
     for r in open_ccs:
         t = (r.get("ticker") or "").strip().upper()
+        a = (r.get("account") or INDIVIDUAL).strip().upper()
         if t:
-            cc_by_ticker[t] = r
+            cc_by_key[f"{a}:{t}"] = r
 
     changed = False
     for lot in lots:
@@ -342,7 +349,7 @@ def link_new_ccs_to_lots(today: dt.date) -> None:
         if (lot.get("has_open_cc") or "").strip() in ("1", "true", "TRUE"):
             continue
 
-        cc = cc_by_ticker.get(t)
+        cc = cc_by_key.get(f"{(lot.get('account') or INDIVIDUAL).strip().upper()}:{t}")
         if not cc:
             continue
 
@@ -366,6 +373,7 @@ def link_new_ccs_to_lots(today: dt.date) -> None:
         record_event(
             date=(cc.get("open_date") or today.isoformat()),
             ticker=t,
+            account=(cc.get("account") or INDIVIDUAL).strip().upper(),
             event_type="CC_OPEN",
             ref_id=cc_id,  # FIX: was a typo in prior file
             expiry=(cc.get("expiry") or ""),
@@ -501,20 +509,27 @@ def process_cc_expirations(today: dt.date) -> Dict[str, List[str]]:
 # Exposure + weekly remaining
 # ----------------------------
 
-def compute_wheel_exposure(today: dt.date) -> Dict[str, float | int | str]:
-    """Compute wheel exposure (INDIVIDUAL wheel account only)."""
+def compute_wheel_exposure(today: dt.date, account: str = INDIVIDUAL) -> Dict[str, float | int | str]:
+    """Compute wheel exposure for a single account."""
     ensure_wheel_files()
+
+    acct = (account or INDIVIDUAL).strip().upper()
+    week_id = _iso_week_id(today)
 
     total = 0.0
     aggressive_total = 0
     aggressive_week = 0
-    week_id = _iso_week_id(today)
 
     # CSP collateral
     csp_rows = _read_rows(CSP_POSITIONS_FILE)
     for r in csp_rows:
         if (r.get("status") or "").upper() != "OPEN":
             continue
+
+        r_acct = (r.get("account") or INDIVIDUAL).strip().upper()
+        if r_acct != acct:
+            continue
+
         try:
             exp = dt.date.fromisoformat((r.get("expiry") or "").strip())
             if exp < today:
@@ -535,35 +550,50 @@ def compute_wheel_exposure(today: dt.date) -> Dict[str, float | int | str]:
     for lot in lots:
         if (lot.get("status") or "").upper() != "OPEN":
             continue
+        l_acct = (lot.get("account") or INDIVIDUAL).strip().upper()
+        if l_acct != acct:
+            continue
         strike = _safe_float(lot.get("assigned_strike"), 0.0)
         shares = _safe_float(lot.get("shares"), 0.0)
         total += strike * shares
 
+    cap = float(WHEEL_CAPS.get(acct, 0.0))
+    weekly_target = float(WHEEL_WEEKLY_TARGETS.get(acct, 0.0))
+
     return {
         "week_id": week_id,
-        "cap": float(WHEEL_CAP),
-        "weekly_target": float(WHEEL_WEEKLY_TARGET),
+        "cap": cap,
+        "weekly_target": weekly_target,
         "total_exposure": float(total),
         "aggressive_total": int(aggressive_total),
         "aggressive_week": int(aggressive_week),
     }
 
 
-def compute_week_remaining(today: dt.date) -> float:
-    """Weekly remaining based on OPEN CSP collateral entered this ISO week."""
-    exp = compute_wheel_exposure(today)
+def compute_week_remaining(today: dt.date, account: str = INDIVIDUAL) -> float:
+    """Weekly remaining based on OPEN CSP collateral entered this ISO week for a single account."""
+    exp = compute_wheel_exposure(today, account=account)
     week_id = exp["week_id"]
+
+    acct = (account or INDIVIDUAL).strip().upper()
 
     week_used = 0.0
     csp_rows = _read_rows(CSP_POSITIONS_FILE)
     for r in csp_rows:
         if (r.get("status") or "").upper() != "OPEN":
             continue
+
+        r_acct = (r.get("account") or INDIVIDUAL).strip().upper()
+        if r_acct != acct:
+            continue
+
         if (r.get("week_id") or "") != week_id:
             continue
+
         week_used += _safe_float(r.get("cash_reserved"), 0.0)
 
-    return max(float(WHEEL_WEEKLY_TARGET) - week_used, 0.0)
+    weekly_target = float(WHEEL_WEEKLY_TARGETS.get(acct, 0.0))
+    return max(weekly_target - week_used, 0.0)
 
 
 # ----------------------------

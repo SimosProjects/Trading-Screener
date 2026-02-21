@@ -396,13 +396,15 @@ def build_discord_alert(
 
 
 def print_final_exposure_summary(today: dt.date, ret_by_key: dict, ret_flagged: list) -> None:
-    exposure = compute_wheel_exposure(today)
-    week_remaining = compute_week_remaining(today)
+    print("\n💼 WHEEL EXPOSURE (options)")
+    for acct in (INDIVIDUAL, IRA, ROTH):
+        exposure = compute_wheel_exposure(today, account=acct)
+        week_remaining = compute_week_remaining(today, account=acct)
 
-    print("\n💼 WHEEL EXPOSURE (INDIVIDUAL options)")
-    print(f"  Total exposure: ${exposure['total_exposure']:,.0f} / ${exposure['cap']:,.0f}")
-    print(f"  Weekly target:  ${exposure['weekly_target']:,.0f}")
-    print(f"  Weekly remaining: ${week_remaining:,.0f}")
+        print(f"  [{acct}]")
+        print(f"    Total exposure: ${float(exposure['total_exposure']):,.0f} / ${float(exposure['cap']):,.0f}")
+        print(f"    Weekly target:  ${float(exposure['weekly_target']):,.0f}")
+        print(f"    Weekly remaining: ${float(week_remaining):,.0f}")
 
     stock_pos_rows = strat.load_stock_positions()
     open_stock = [r for r in stock_pos_rows if (r.get("status") or "").upper() == "OPEN"]
@@ -446,8 +448,6 @@ def print_final_exposure_summary(today: dt.date, ret_by_key: dict, ret_flagged: 
         f"  MV ${indiv_stock_mv:,.0f} / ${float(INDIVIDUAL_STOCK_CAP):,.0f} | "
         f"Remaining ${max(float(INDIVIDUAL_STOCK_CAP)-indiv_stock_mv, 0.0):,.0f}"
     )
-
-
 # ============================================================
 # MAIN
 # ============================================================
