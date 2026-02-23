@@ -741,6 +741,14 @@ def run_screener() -> None:
         if open_csp_tickers:
             candidates = [c for c in candidates if (c.get('ticker') or '').strip().upper() not in open_csp_tickers]
 
+        # Block opening a new CSP on a ticker that already has ANY OPEN CC (wheel call strategy).
+        open_cc_tickers = strat.load_open_cc_tickers()
+        if open_cc_tickers:
+            candidates = [
+                c for c in candidates
+                if (c.get("ticker") or "").strip().upper() not in open_cc_tickers
+            ]
+
         total_remaining = max(float(exposure["cap"]) - float(exposure["total_exposure"]), 0.0)
 
         plan = strat.plan_weekly_csp_orders(

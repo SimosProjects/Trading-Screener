@@ -41,7 +41,7 @@ IRA = "IRA"
 ROTH = "ROTH"
 
 ACCOUNT_SIZES: Dict[str, int] = {
-    INDIVIDUAL: 125_000,
+    INDIVIDUAL: 100_000,
     IRA: 100_000,
     ROTH: 100_000,
 }
@@ -91,83 +91,100 @@ STOCK_STOP_ATR_BREAKOUT = 1.2  # stop = breakout_level - ATR*X
 # ============================================================
 
 STOCKS: List[str] = list(dict.fromkeys([
-    # Mega-cap quality
-    "AAPL","MSFT","AMZN","GOOGL","META","NVDA","AVGO","TSM","ASML","INTC",
+    # =========================
+    # Tier A – Mega Cap Quality
+    # =========================
+    "AAPL","MSFT","AMZN","GOOGL","META","NVDA",
+    "AVGO","TSM","ASML","ORCL","CRM",
+    "V","MA","JPM","GS","MS",
+    "LLY","ABBV","UNH","VRTX",
+    "WMT","COST","KO","PEP",
+    "HD","LOW",
+    "MCD","SBUX",
+    "ADBE","INTU",
 
-    # Payments / financial quality
-    "V","MA","JPM","BAC","MS","GS","AXP","SOFI",
+    # =========================
+    # Tier B – High Quality Mid Caps
+    # =========================
+    "ANET","PANW","CRWD",
+    "CDNS","SNPS",
+    "LULU","CMG",
+    "DE","CAT",
+    "SHW",
+    "ZTS",
+    "ELV",
+    "ADSK",
 
-    # Healthcare (defensive growth)
-    "LLY","ABBV","UNH","VRTX","REGN",
+    # =========================
+    # Tier C – Cyclical but Liquid
+    # =========================
+    "AMD","MU","INTC","ON","MCHP",
+    "XOM","CVX",
+    "COP",
+    "CARR",
+    "TGT",
+    "ABNB","UBER",
+    "NFLX",
 
-    # Consumer staples / resilient demand
-    "WMT","COST","KO","PEP","CELH","BROS",
-
-    # Industrials / infrastructure
-    "CAT","DE","CARR",
-
-    # Profitable tech infrastructure
-    "ANET","CRWD","PANW","MU",
-
-    # High risk growth
-    "RKLB", "JOBY", "ACHR","SOUN", "BBAI","ASTS",
-
-    # Tactical Growth
-    "AMD","MU","INTC","ON","LSCC","MCHP","SMCI",
-    "NFLX","LULU","CMG","TGT","ABNB","UBER",
-    "PLTR","SHOP","SNOW","MDB","NET","ZS","BILL","PL",
+    # =========================
+    # Select Growth
+    # =========================
+    "PLTR","SHOP","NET","MDB","SNOW","BROS","CELH",
 ]))
 
 # CSP Universe
 CSP_STOCKS: List[str] = list(dict.fromkeys(
     STOCKS + [
-        # ETFs / lower-beta
-        "SPLG","SCHD","JEPI","XLU","XLF","EEM",
+        # =========================
+        # Core ETFs (wheel stabilizers)
+        # =========================
+        "SPLG","SPY","QQQ","TQQQ",
+        "SCHD","JEPI",
+        "XLU","XLF","XLE","XLV",
+        "SMH",
 
-        # Defensive single names
-        "KO","PFE","VZ","T","GIS","KHC","BAC","OXY",
+        # =========================
+        # Additional Defensive
+        # =========================
+        "PFE","MRK","BMY",
+        "PG","CL",
+        "GIS","KHC",
 
-        # Financials / payments
-        "BAC","C","SOFI","AXP",
+        # =========================
+        # Financial breadth
+        # =========================
+        "BAC","C","AXP",
+        "BLK",
 
-        # Consumer / retail
-        "TGT","WMT","UBER","CMCSA",
+        # =========================
+        # Industrial breadth
+        # =========================
+        "ETN","PH",
+        "EMR",
 
-        # Semiconductors (selectively)
-        "INTC","MU","ON","LSCC","MCHP",
-
-        # Industrials / autos
-        "F","CARR",
-
-        # Healthcare
-        "ABBV","UNH","VRTX","EXAS",
-
-        # Energy
-        "XOM","CVX",
-
-        # Media / entertainment
-        "DIS",
-
-        # Tactical CSPs
-        "PLTR","SHOP","NET","SNOW",
-        "DKNG","AFRM","HIMS",
-        "CELH","BROS",
-
-        # High-IV candidates
-        "BBAI","SOUN","QUBT","CLSK","RKLB","JOBY","ASTS","ACHR","PL",
+        # =========================
+        # Retail / consumer
+        # =========================
+        "TJX",
+        "ROST",
     ]
 ))
 
-
-# CSP tickers to allow even in "risk-off" market regime (high VIX / SPY below 200SMA).
-# These should be liquid, lower-beta names and/or broad ETFs.
 CSP_DEFENSIVE_STOCKS: List[str] = [
-    # ETFs
-    "SPLG","SCHD","JEPI","XLU","XLF","EEM",
-    # Large / defensive-ish single names
-    "KO","PFE","VZ","T","GIS","KHC","BAC",
-    # Energy/commodity
-    "OXY",
+    # Broad ETFs
+    "SPY","SPLG","SCHD","JEPI","XLU","XLF","XLV",
+
+    # Consumer staples
+    "KO","PEP","PG","CL","GIS","KHC",
+
+    # Healthcare large cap
+    "ABBV","MRK","UNH","LLY",
+
+    # Financial large cap
+    "JPM","BAC",
+
+    # Energy majors
+    "XOM","CVX",
 ]
 
 # Market-regime controls for CSP scan
