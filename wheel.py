@@ -21,19 +21,23 @@ import yfinance as yf
 
 from utils import get_logger, iso_week_id, safe_float, safe_int, atomic_write
 from config import (
+    INDIVIDUAL,
+    IRA_ACCOUNTS,
     WHEEL_EVENTS_FILE,
     WHEEL_LOTS_FILE,
     WHEEL_MONTHLY_DIR,
-    WHEEL_CAP,
-    WHEEL_WEEKLY_TARGET,
+    WHEEL_CAPS,
+    WHEEL_WEEKLY_TARGETS,
     CSP_POSITIONS_FILE,
     CC_POSITIONS_FILE,
+    STOCK_TRADES_FILE,
 )
 
 log = get_logger(__name__)
 
 EVENT_FIELDS = [
     "event_id",
+    "account",
     "date",
     "week_id",
     "ticker",
@@ -50,6 +54,7 @@ EVENT_FIELDS = [
 
 LOT_FIELDS = [
     "lot_id",
+    "account",
     "ticker",
     "open_date",
     "shares",
@@ -175,6 +180,26 @@ def _safe_int(v: object, default: int = 0) -> int:
     return safe_int(v, default)
 
 
+
+def _append_stock_trade_record(row: dict) -> None:
+    """Append one row to stock_trades.csv from wheel.py without importing strategies.
+
+    Keeps wheel.py free of a circular import.  Field order matches
+    STOCK_TRADE_FIELDS in strategies.py — any new fields added there
+    should be mirrored here.
+    """
+    fields = [
+        "id", "account", "ticker", "entry_date", "entry_price",
+        "shares", "exit_date", "exit_price", "reason", "close_type",
+        "pnl_abs", "pnl_pct",
+    ]
+    file_exists = os.path.isfile(STOCK_TRADES_FILE)
+    with open(STOCK_TRADES_FILE, "a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore", lineterminator="\n")
+        if not file_exists:
+            w.writeheader()
+        w.writerow({k: row.get(k, "") for k in fields})
+
 # ----------------------------
 # Events
 # ----------------------------
@@ -199,6 +224,7 @@ def record_event(**kwargs) -> None:
         (kwargs.get("event_id") or "").strip()
         or f"{date_str}-{ticker_norm}-{event_type_norm}-{ref_norm}"
     )
+    row["account"] = (kwargs.get("account") or INDIVIDUAL).strip().upper()
     row["date"] = date_str
     row["week_id"] = (kwargs.get("week_id") or "").strip() or _iso_week_id(d)
     row["ticker"] = ticker_norm
@@ -266,6 +292,8 @@ def create_lots_from_new_assignments(today: dt.date) -> None:
 
         ticker = (r.get("ticker") or "").strip().upper()
         open_date = (r.get("close_date") or today.isoformat()).strip()
+        # Inherit account from the parent CSP; default to INDIVIDUAL for pre-4b rows.
+        acct = (r.get("account") or INDIVIDUAL).strip().upper()
 
         strike = _safe_float(r.get("strike"), 0.0)
         shares = _safe_int(r.get("shares_if_assigned"), 0)
@@ -278,6 +306,7 @@ def create_lots_from_new_assignments(today: dt.date) -> None:
         lots.append(
             {
                 "lot_id": lot_id,
+                "account": acct,
                 "ticker": ticker,
                 "open_date": open_date,
                 "shares": str(shares),
@@ -294,6 +323,7 @@ def create_lots_from_new_assignments(today: dt.date) -> None:
 
         record_event(
             date=open_date,
+            account=acct,
             ticker=ticker,
             event_type="CSP_ASSIGNED",
             ref_id=lot_id,
@@ -360,9 +390,10 @@ def link_new_ccs_to_lots(today: dt.date) -> None:
 
         record_event(
             date=(cc.get("open_date") or today.isoformat()),
+            account=(cc.get("account") or INDIVIDUAL).strip().upper(),
             ticker=t,
             event_type="CC_OPEN",
-            ref_id=cc_id,  # FIX: was a typo in prior file
+            ref_id=cc_id,
             expiry=(cc.get("expiry") or ""),
             strike=_safe_float(cc.get("strike"), 0.0),
             contracts=_safe_int(cc.get("contracts"), 0),
@@ -437,6 +468,7 @@ def process_cc_expirations(today: dt.date) -> Dict[str, List[str]]:
             called.append(f"{tkr} {exp_str} {strike:.0f}C")
             record_event(
                 date=exp.isoformat(),
+                account=(r.get("account") or INDIVIDUAL).strip().upper(),
                 ticker=tkr,
                 event_type="CC_CALLED_AWAY",
                 ref_id=(r.get("id") or ""),
@@ -454,6 +486,7 @@ def process_cc_expirations(today: dt.date) -> Dict[str, List[str]]:
             expired.append(f"{tkr} {exp_str} {strike:.0f}C")
             record_event(
                 date=exp.isoformat(),
+                account=(r.get("account") or INDIVIDUAL).strip().upper(),
                 ticker=tkr,
                 event_type="CC_EXPIRED",
                 ref_id=(r.get("id") or ""),
@@ -503,9 +536,43 @@ def process_cc_expirations(today: dt.date) -> Dict[str, List[str]]:
             prem = _safe_float(cc_row.get("premium"), 0.0)
 
             if cc_id in called_cc_ids:
-                # Stock called away — close the lot, no basis update needed
+                # Stock called away — close the lot and record realized P&L
+                # on the call-away date so it flows into the stock monthly.
                 lot["status"] = "CLOSED"
                 lot["has_open_cc"] = "0"
+
+                tkr_lot   = (lot.get("ticker") or "").strip().upper()
+                sh_lot    = _safe_int(lot.get("shares"), 0)
+                cc_row    = closed_cc_by_id[cc_id]
+                cc_strike = _safe_float(cc_row.get("strike"), 0.0)
+                cc_exp    = (cc_row.get("expiry") or "").strip()
+                cc_acct   = (cc_row.get("account") or INDIVIDUAL).strip().upper()
+                net_basis = _safe_float(lot.get("net_cost_basis") or lot.get("cost_basis"), 0.0)
+                proceeds  = cc_strike * sh_lot
+                pnl_abs   = proceeds - net_basis
+                pnl_pct   = (pnl_abs / net_basis * 100.0) if net_basis > 0 else 0.0
+                entry_price_per_sh = (net_basis / sh_lot) if sh_lot > 0 else 0.0
+
+                if sh_lot > 0 and cc_strike > 0:
+                    _append_stock_trade_record({
+                        "id":          f"{tkr_lot}-{cc_exp}-CALLED_AWAY",
+                        "account":     cc_acct,
+                        "ticker":      tkr_lot,
+                        "entry_date":  (lot.get("open_date") or ""),
+                        "entry_price": f"{entry_price_per_sh:.4f}",
+                        "shares":      str(sh_lot),
+                        "exit_date":   cc_exp,
+                        "exit_price":  f"{cc_strike:.2f}",
+                        "reason":      "CC_CALLED_AWAY",
+                        "close_type":  "CC_CALLED_AWAY",
+                        "pnl_abs":     f"{pnl_abs:.2f}",
+                        "pnl_pct":     f"{pnl_pct:.2f}",
+                    })
+                    log.info(
+                        "CC called away — %s %s sh, proceeds $%.2f, "
+                        "net_basis $%.2f, P&L $%.2f (%.1f%%)",
+                        tkr_lot, sh_lot, proceeds, net_basis, pnl_abs, pnl_pct,
+                    )
             else:
                 # CC expired worthless — collect the premium, reduce basis, clear CC link
                 prev_collected = _safe_float(lot.get("cc_premium_collected"), 0.0)
@@ -539,19 +606,34 @@ def process_cc_expirations(today: dt.date) -> Dict[str, List[str]]:
 # Exposure + weekly remaining
 # ----------------------------
 
-def compute_wheel_exposure(today: dt.date) -> Dict[str, float | int | str]:
-    """Compute wheel exposure (INDIVIDUAL wheel account only)."""
+def compute_wheel_exposure(
+    today: dt.date,
+    account: str = INDIVIDUAL,
+) -> Dict[str, float | int | str]:
+    """Compute wheel exposure for one account.
+
+    Defaults to INDIVIDUAL so all existing callers continue to work unchanged.
+    Steps 4d+ will call this once per account to get per-account caps/remaining.
+
+    Rows that pre-date Step 4b (no 'account' column) are treated as INDIVIDUAL
+    so legacy data never falls through the filter silently.
+    """
     ensure_wheel_files()
 
+    acct = account.strip().upper()
     total = 0.0
     aggressive_total = 0
     aggressive_week = 0
     week_id = _iso_week_id(today)
 
-    # CSP collateral
+    # CSP collateral — only positions belonging to this account
     csp_rows = _read_rows(CSP_POSITIONS_FILE)
     for r in csp_rows:
         if (r.get("status") or "").upper() != "OPEN":
+            continue
+        # Rows without an account column (pre-4b files) default to INDIVIDUAL
+        row_acct = (r.get("account") or INDIVIDUAL).strip().upper()
+        if row_acct != acct:
             continue
         try:
             exp = dt.date.fromisoformat((r.get("expiry") or "").strip())
@@ -568,28 +650,36 @@ def compute_wheel_exposure(today: dt.date) -> Dict[str, float | int | str]:
             if (r.get("week_id") or "") == week_id:
                 aggressive_week += 1
 
-    # Assigned lots (notional)
+    # Assigned lots (notional) — only lots belonging to this account
     lots = _read_rows(WHEEL_LOTS_FILE)
     for lot in lots:
         if (lot.get("status") or "").upper() != "OPEN":
+            continue
+        lot_acct = (lot.get("account") or INDIVIDUAL).strip().upper()
+        if lot_acct != acct:
             continue
         strike = _safe_float(lot.get("assigned_strike"), 0.0)
         shares = _safe_float(lot.get("shares"), 0.0)
         total += strike * shares
 
     return {
+        "account": acct,
         "week_id": week_id,
-        "cap": float(WHEEL_CAP),
-        "weekly_target": float(WHEEL_WEEKLY_TARGET),
+        "cap": float(WHEEL_CAPS[acct]),
+        "weekly_target": float(WHEEL_WEEKLY_TARGETS[acct]),
         "total_exposure": float(total),
         "aggressive_total": int(aggressive_total),
         "aggressive_week": int(aggressive_week),
     }
 
 
-def compute_week_remaining(today: dt.date) -> float:
-    """Weekly remaining based on OPEN CSP collateral entered this ISO week."""
-    exp = compute_wheel_exposure(today)
+def compute_week_remaining(today: dt.date, account: str = INDIVIDUAL) -> float:
+    """Weekly new-entry capacity remaining for one account this ISO week.
+
+    Defaults to INDIVIDUAL so all existing callers continue to work unchanged.
+    """
+    acct = account.strip().upper()
+    exp = compute_wheel_exposure(today, acct)
     week_id = exp["week_id"]
 
     week_used = 0.0
@@ -599,9 +689,12 @@ def compute_week_remaining(today: dt.date) -> float:
             continue
         if (r.get("week_id") or "") != week_id:
             continue
+        row_acct = (r.get("account") or INDIVIDUAL).strip().upper()
+        if row_acct != acct:
+            continue
         week_used += _safe_float(r.get("cash_reserved"), 0.0)
 
-    return max(float(WHEEL_WEEKLY_TARGET) - week_used, 0.0)
+    return max(float(WHEEL_WEEKLY_TARGETS[acct]) - week_used, 0.0)
 
 
 # ----------------------------
@@ -609,11 +702,24 @@ def compute_week_remaining(today: dt.date) -> float:
 # ----------------------------
 
 def rebuild_monthly_from_events() -> None:
-    """Rebuild one CSV per month from wheel_events.csv.
+    """Rebuild per-account-group monthly wheel CSVs from wheel_events.csv.
 
-    Tracks premium credits (CSP_OPEN, CC_OPEN) and buyback costs
-    (CSP_CLOSE_TP) so the monthly total reflects actual net premium earned.
-    CSP_CLOSE_TP premiums are stored as negative dollars (cash paid out).
+    Produces two files per month:
+      wheel_monthly/YYYY-MM-INDIVIDUAL.csv
+      wheel_monthly/YYYY-MM-IRA.csv  (IRA + ROTH combined, each row tagged)
+
+    Columns:
+      date, account, ticker, event_type, amount, net, notes
+
+    - amount  : cash flow for this event (+premium collected, -buyback paid)
+    - net     : realised net on the closing row of a paired trade (open+close);
+                blank on open rows so you can see both sides but net at a glance
+    - event_type labels:
+        CSP_OPEN       premium collected when put was sold
+        CC_OPEN        premium collected when call was sold
+        CSP_CLOSE_TP   buyback cost (negative) when closed early for profit
+        CSP_EXPIRED    $0 event; confirms expiry with no cost
+        CC_EXPIRED     $0 event; confirms expiry with no cost
     """
     ensure_wheel_files()
     rows = _read_rows(WHEEL_EVENTS_FILE)
@@ -622,46 +728,102 @@ def rebuild_monthly_from_events() -> None:
 
     os.makedirs(WHEEL_MONTHLY_DIR, exist_ok=True)
 
-    by_month: Dict[str, List[dict]] = {}
+    # Relevant event types for the premium income statement
+    INCOME_TYPES = {"CSP_OPEN", "CC_OPEN", "CSP_CLOSE_TP", "CSP_EXPIRED", "CC_EXPIRED"}
+
+    # Build a lookup of open-event amounts keyed by ref_id so we can compute
+    # net profit on close/expiry rows without a second pass.
+    open_premiums: Dict[str, float] = {}
     for r in rows:
+        et = (r.get("event_type") or "").upper()
+        if et in ("CSP_OPEN", "CC_OPEN"):
+            ref = (r.get("ref_id") or "").strip()
+            if ref:
+                open_premiums[ref] = _safe_float(r.get("premium"), 0.0)
+
+    out_fields = ["date", "account", "ticker", "event_type", "amount", "net", "notes"]
+
+    # Bucket rows by (month, file_group)
+    by_bucket: Dict[tuple, List[dict]] = {}
+    for r in rows:
+        et = (r.get("event_type") or "").upper()
+        if et not in INCOME_TYPES:
+            continue
         d = (r.get("date") or "").strip()
         if len(d) < 7:
             continue
-        month = d[:7]
-        by_month.setdefault(month, []).append(r)
+        month  = d[:7]
+        acct   = (r.get("account") or INDIVIDUAL).strip().upper()
+        group  = "IRA" if acct in IRA_ACCOUNTS else "INDIVIDUAL"
+        by_bucket.setdefault((month, group), []).append(r)
 
-    out_fields = ["date", "ticker", "event_type", "ref_id", "premium"]
-
-    for month, evs in by_month.items():
-        evs_sorted = sorted(
-            evs, key=lambda x: ((x.get("date") or ""), (x.get("ticker") or ""))
-        )
+    for (month, group), evs in sorted(by_bucket.items()):
+        evs_sorted = sorted(evs, key=lambda x: (x.get("date") or "", x.get("ticker") or ""))
 
         out_rows: List[dict] = []
         total = 0.0
+
         for e in evs_sorted:
-            et = (e.get("event_type") or "").upper()
-            if et not in ("CSP_OPEN", "CC_OPEN", "CSP_CLOSE_TP"):
-                continue
-            prem = _safe_float(e.get("premium"), 0.0)
-            total += prem
-            out_rows.append(
-                {
-                    "date": (e.get("date") or "").strip(),
-                    "ticker": (e.get("ticker") or "").strip(),
-                    "event_type": et,
-                    "ref_id": (e.get("ref_id") or "").strip(),
-                    "premium": f"{prem:.2f}",
-                }
-            )
+            et     = (e.get("event_type") or "").upper()
+            ref    = (e.get("ref_id") or "").strip()
+            tkr    = (e.get("ticker") or "").strip().upper()
+            acct   = (e.get("account") or INDIVIDUAL).strip().upper()
+            prem   = _safe_float(e.get("premium"), 0.0)
 
-        out_rows.append(
-            {"date": "", "ticker": "TOTAL", "event_type": "", "ref_id": "", "premium": f"{total:.2f}"}
-        )
+            # amount: positive for income, negative for cost
+            if et == "CSP_CLOSE_TP":
+                amount = -abs(prem)   # buyback is a cash outflow
+            else:
+                amount = prem         # open premium or $0 expiry
 
-        path = os.path.join(WHEEL_MONTHLY_DIR, f"{month}.csv")
+            total += amount
+
+            # net: on close/expiry rows, compute realised profit for this cycle
+            net = ""
+            if et in ("CSP_CLOSE_TP",):
+                orig = open_premiums.get(ref, 0.0)
+                net  = f"{orig + amount:.2f}"   # orig is positive; amount is negative buyback
+            elif et in ("CSP_EXPIRED", "CC_EXPIRED"):
+                # Full premium kept — net equals original open premium
+                orig = open_premiums.get(ref, 0.0)
+                net  = f"{orig:.2f}" if orig else ""
+
+            # human-readable notes
+            if et == "CSP_OPEN":
+                exp   = (e.get("expiry") or "").strip()
+                strk  = (e.get("strike") or "").strip()
+                contr = (e.get("contracts") or "").strip()
+                notes = f"{strk}P exp {exp}" + (f" x{contr}" if contr and contr != "1" else "")
+            elif et == "CC_OPEN":
+                exp   = (e.get("expiry") or "").strip()
+                strk  = (e.get("strike") or "").strip()
+                contr = (e.get("contracts") or "").strip()
+                notes = f"{strk}C exp {exp}" + (f" x{contr}" if contr and contr != "1" else "")
+            elif et == "CSP_CLOSE_TP":
+                notes = f"TP buyback — net ${float(net):.0f}" if net else "TP buyback"
+            elif et in ("CSP_EXPIRED", "CC_EXPIRED"):
+                notes = "expired worthless"
+            else:
+                notes = ""
+
+            out_rows.append({
+                "date":       (e.get("date") or "").strip(),
+                "account":    acct,
+                "ticker":     tkr,
+                "event_type": et,
+                "amount":     f"{amount:+.2f}",
+                "net":        net,
+                "notes":      notes,
+            })
+
+        # Summary row
+        out_rows.append({
+            "date": "", "account": "", "ticker": "NET_PREMIUM",
+            "event_type": "", "amount": f"{total:+.2f}", "net": "", "notes": "",
+        })
+
+        path = os.path.join(WHEEL_MONTHLY_DIR, f"{month}-{group}.csv")
         _write_rows(path, out_rows, out_fields)
-
 
 # ----------------------------
 # Backfill (only if needed)
@@ -698,6 +860,7 @@ def backfill_open_events_from_positions(today: dt.date) -> None:
 
         record_event(
             date=(r.get("open_date") or today.isoformat()),
+            account=(r.get("account") or INDIVIDUAL).strip().upper(),
             ticker=(r.get("ticker") or ""),
             event_type="CSP_OPEN",
             ref_id=ref,
@@ -723,6 +886,7 @@ def backfill_open_events_from_positions(today: dt.date) -> None:
 
         record_event(
             date=(r.get("open_date") or today.isoformat()),
+            account=(r.get("account") or INDIVIDUAL).strip().upper(),
             ticker=(r.get("ticker") or ""),
             event_type="CC_OPEN",
             ref_id=ref,

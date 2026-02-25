@@ -22,7 +22,7 @@ from __future__ import annotations
 import datetime as dt
 from typing import List
 
-from utils import get_logger
+from utils import get_logger, iso_week_id as _iso_week_id
 from config import (
     ENABLE_CSP,
     INDIVIDUAL, IRA, ROTH,
@@ -160,86 +160,135 @@ def run_screener() -> None:
     # ── 8. CSP planning + execution ───────────────────────────────
     new_csp_orders: List[dict] = []
     if ENABLE_CSP and csp_regime in ("NORMAL", "RISK_OFF"):
-        exposure       = compute_wheel_exposure(today)
-        week_remaining = compute_week_remaining(today)
 
-        if week_remaining > 0:
-            candidates = build_csp_candidates(mkt, csp_regime)
+        # Build the candidate list once — same universe regardless of account.
+        candidates = build_csp_candidates(mkt, csp_regime)
 
-            # Block new CSP on any ticker already carrying an open CSP or CC.
-            open_csp_tickers = strat.load_open_csp_tickers(today)
-            open_cc_tickers  = strat.load_open_cc_tickers()
-            candidates = [
+        # Global dedup: block any ticker that already has an open CSP or CC
+        # in ANY account.  load_open_* functions are account-blind by design —
+        # we never want two accounts holding the same underlying simultaneously.
+        open_csp_tickers = strat.load_open_csp_tickers(today)
+        open_cc_tickers  = strat.load_open_cc_tickers()
+        candidates = [
+            c for c in candidates
+            if (c.get("ticker") or "").strip().upper() not in open_csp_tickers
+            and (c.get("ticker") or "").strip().upper() not in open_cc_tickers
+        ]
+
+        # Allocation priority: INDIVIDUAL first, then IRA vs ROTH by weekly
+        # utilisation (whichever has used less of its weekly target gets priority).
+        exp_ira  = compute_wheel_exposure(today, IRA)
+        exp_roth = compute_wheel_exposure(today, ROTH)
+        rem_ira  = compute_week_remaining(today, IRA)
+        rem_roth = compute_week_remaining(today, ROTH)
+        retirement_order = (
+            [IRA, ROTH] if rem_ira >= rem_roth else [ROTH, IRA]
+        )
+        account_order = [INDIVIDUAL] + retirement_order
+
+        # Tickers allocated this run — grows as each account claims candidates.
+        # Ensures no ticker appears in more than one account.
+        used_tickers: set = set()
+
+        any_week_cap_hit = True  # flipped to False if at least one account has room
+
+        for acct in account_order:
+            exp            = compute_wheel_exposure(today, acct)
+            week_remaining = compute_week_remaining(today, acct)
+
+            if week_remaining <= 0:
+                print(f"\n🧾 CSP [{acct}]: scanning skipped (weekly cap reached).")
+                continue
+
+            any_week_cap_hit = False
+
+            # Exclude tickers already allocated to a prior account this run.
+            acct_candidates = [
                 c for c in candidates
-                if (c.get("ticker") or "").strip().upper() not in open_csp_tickers
-                and (c.get("ticker") or "").strip().upper() not in open_cc_tickers
+                if (c.get("ticker") or "").strip().upper() not in used_tickers
             ]
 
-            total_remaining = max(float(exposure["cap"]) - float(exposure["total_exposure"]), 0.0)
+            if not acct_candidates:
+                print(f"\n🧾 CSP [{acct}]: no candidates remaining after dedup.")
+                continue
+
+            total_remaining = max(float(exp["cap"]) - float(exp["total_exposure"]), 0.0)
             plan = strat.plan_weekly_csp_orders(
-                candidates,
+                acct_candidates,
                 today=today,
                 vix_close=float(mkt["vix_close"]),
                 total_remaining_cap=total_remaining,
                 week_remaining_cap=float(week_remaining),
-                aggressive_total=int(exposure.get("aggressive_total", 0)),
-                aggressive_week=int(exposure.get("aggressive_week", 0)),
+                aggressive_total=int(exp.get("aggressive_total", 0)),
+                aggressive_week=int(exp.get("aggressive_week", 0)),
             )
 
             orders = plan.get("selected", [])
-            if orders:
-                new_csp_orders = orders
-                print("\n🧾 NEW CSP IDEAS (paper execution)")
-                for o in orders:
-                    print(
-                        f"  {o['ticker']:<6} {o['strike']:.0f}P {o['expiry']} | "
-                        f"est prem ${o['est_premium']:.0f} | cash ${o['cash_reserved']:,.0f} | {o.get('tier','')}"
-                    )
+            if not orders:
+                print(f"\n🧾 CSP [{acct}]: No new entries today.")
+                continue
 
-                for o in orders:
-                    csp_id, created = strat.add_csp_position_from_selected(
-                        today.isoformat(), exposure["week_id"], o
-                    )
-                    if not created:
-                        continue
+            # Tag each order with its account and accumulate for execution.
+            for o in orders:
+                o["account"] = acct
+                used_tickers.add((o.get("ticker") or "").strip().upper())
 
-                    try:
-                        ledger_rows = strat.load_csv_rows(CSP_LEDGER_FILE)
-                        if not strat.csp_already_logged(
-                            ledger_rows, exposure["week_id"],
-                            o["ticker"], o["expiry"], float(o["strike"])
-                        ):
-                            strat.append_csp_ledger_row({
-                                "date":          today.isoformat(),
-                                "week_id":       exposure["week_id"],
-                                "ticker":        o["ticker"],
-                                "expiry":        o["expiry"],
-                                "strike":        f"{float(o['strike']):.2f}",
-                                "contracts":     int(o.get("contracts", 1)),
-                                "premium":       float(o.get("est_premium", 0.0)),
-                                "cash_reserved": float(o.get("cash_reserved", 0.0)),
-                                "tier":          o.get("tier", ""),
-                            })
-                    except Exception as e:
-                        log.warning("CSP ledger append failed for %s: %s", o.get("ticker"), e)
+            new_csp_orders.extend(orders)
 
-                    record_event(
-                        date=today.isoformat(),
-                        ticker=o["ticker"],
-                        event_type="CSP_OPEN",
-                        ref_id=csp_id,
-                        expiry=o["expiry"],
-                        strike=float(o["strike"]),
-                        contracts=int(o.get("contracts", 1)),
-                        shares=int(o.get("contracts", 1)) * 100,
-                        premium=float(o.get("premium") or o.get("est_premium") or 0.0),
-                        wheel_value=float(o.get("cash_reserved", 0.0)),
-                        notes="CSP opened (planned by screener)",
-                    )
-            else:
-                print("\n🧾 CSP: No new entries today.")
-        else:
-            print("\n🧾 CSP scanning skipped (weekly cap reached).")
+            print(f"\n🧾 NEW CSP IDEAS [{acct}] (paper execution)")
+            for o in orders:
+                print(
+                    f"  {o['ticker']:<6} {o['strike']:.0f}P {o['expiry']} | "
+                    f"est prem ${o['est_premium']:.0f} | cash ${o['cash_reserved']:,.0f} | {o.get('tier','')}"
+                )
+
+        if any_week_cap_hit and not new_csp_orders:
+            print("\n🧾 CSP scanning skipped (weekly cap reached for all accounts).")
+
+        # ── Execute all orders (account tag now present on each) ──────
+        # week_id is identical across accounts within a single ISO week.
+        week_id = _iso_week_id(today)
+        for o in new_csp_orders:
+            csp_id, created = strat.add_csp_position_from_selected(
+                today.isoformat(), week_id, o
+            )
+            if not created:
+                continue
+
+            try:
+                ledger_rows = strat.load_csv_rows(CSP_LEDGER_FILE)
+                if not strat.csp_already_logged(
+                    ledger_rows, week_id,
+                    o["ticker"], o["expiry"], float(o["strike"])
+                ):
+                    strat.append_csp_ledger_row({
+                        "date":          today.isoformat(),
+                        "week_id":       week_id,
+                        "ticker":        o["ticker"],
+                        "expiry":        o["expiry"],
+                        "strike":        f"{float(o['strike']):.2f}",
+                        "contracts":     int(o.get("contracts", 1)),
+                        "premium":       float(o.get("est_premium", 0.0)),
+                        "cash_reserved": float(o.get("cash_reserved", 0.0)),
+                        "tier":          o.get("tier", ""),
+                    })
+            except Exception as e:
+                log.warning("CSP ledger append failed for %s: %s", o.get("ticker"), e)
+
+            record_event(
+                date=today.isoformat(),
+                ticker=o["ticker"],
+                event_type="CSP_OPEN",
+                ref_id=csp_id,
+                expiry=o["expiry"],
+                strike=float(o["strike"]),
+                contracts=int(o.get("contracts", 1)),
+                shares=int(o.get("contracts", 1)) * 100,
+                premium=float(o.get("premium") or o.get("est_premium") or 0.0),
+                wheel_value=float(o.get("cash_reserved", 0.0)),
+                notes="CSP opened (planned by screener)",
+            )
+
     else:
         print("\n🧾 CSP scanning skipped (market filter or ENABLE_CSP=False).")
 

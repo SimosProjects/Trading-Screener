@@ -40,19 +40,50 @@ INDIVIDUAL = "INDIVIDUAL"
 IRA = "IRA"
 ROTH = "ROTH"
 
+# Accounts that share the IRA monthly file (both tagged individually inside it)
+IRA_ACCOUNTS = (IRA, ROTH)
+
 ACCOUNT_SIZES: Dict[str, int] = {
     INDIVIDUAL: 100_000,
     IRA: 100_000,
     ROTH: 100_000,
 }
 
-# Wheel allocation is ONLY for INDIVIDUAL account
-WHEEL_ACCOUNT = INDIVIDUAL
-WHEEL_CAP_PCT = 0.80
-WHEEL_CAP = int(ACCOUNT_SIZES[WHEEL_ACCOUNT] * WHEEL_CAP_PCT)
-WHEEL_WEEKLY_TARGET = WHEEL_CAP / 5.0
+# ---- Per-account wheel configuration ----
+# INDIVIDUAL gets 10% margin on top of account size; IRA/ROTH are cash-secured only.
+# weekly_divisor: buying_power * cap_pct / divisor = weekly new-entry target.
+INDIVIDUAL_MARGIN_PCT = 0.10
 
-# INDIVIDUAL stock (non-wheel) cap is the remaining % (e.g., 20%)
+WHEEL_ACCOUNT_CONFIG: Dict[str, dict] = {
+    INDIVIDUAL: {
+        "buying_power":   ACCOUNT_SIZES[INDIVIDUAL] * (1.0 + INDIVIDUAL_MARGIN_PCT),
+        "cap_pct":        0.80,
+        "weekly_divisor": 5.0,
+    },
+    IRA: {
+        "buying_power":   float(ACCOUNT_SIZES[IRA]),
+        "cap_pct":        0.80,
+        "weekly_divisor": 5.0,
+    },
+    ROTH: {
+        "buying_power":   float(ACCOUNT_SIZES[ROTH]),
+        "cap_pct":        0.80,
+        "weekly_divisor": 5.0,
+    },
+}
+
+# Derived caps and weekly targets — recalculate automatically when ACCOUNT_SIZES changes.
+WHEEL_CAPS: Dict[str, int] = {
+    acct: int(cfg["buying_power"] * cfg["cap_pct"])
+    for acct, cfg in WHEEL_ACCOUNT_CONFIG.items()
+}
+WHEEL_WEEKLY_TARGETS: Dict[str, float] = {
+    acct: cfg["buying_power"] * cfg["cap_pct"] / cfg["weekly_divisor"]
+    for acct, cfg in WHEEL_ACCOUNT_CONFIG.items()
+}
+
+# INDIVIDUAL stock (non-wheel) cap is the slice not allocated to the wheel.
+WHEEL_CAP_PCT = WHEEL_ACCOUNT_CONFIG[INDIVIDUAL]["cap_pct"]
 INDIVIDUAL_STOCK_CAP_PCT = 1.0 - WHEEL_CAP_PCT
 INDIVIDUAL_STOCK_CAP = int(ACCOUNT_SIZES[INDIVIDUAL] * INDIVIDUAL_STOCK_CAP_PCT)
 
@@ -210,6 +241,7 @@ ENABLE_CSP = True
 
 CSP_POSITIONS_COLUMNS = [
     "id",
+    "account",
     "open_date",
     "week_id",
     "ticker",
@@ -231,6 +263,7 @@ CSP_POSITIONS_COLUMNS = [
 
 CC_POSITIONS_COLUMNS = [
     "id",
+    "account",
     "open_date",
     "ticker",
     "expiry",

@@ -83,12 +83,14 @@ def build_discord_alert(
     if new_csps:
         lines.append("— New CSP ideas —")
         for x in new_csps[:10]:
-            lines.append(f"{x['ticker']} {x['strike']:.0f}P {x['expiry']} ~${x['est_premium']:.0f}")
+            acct_tag = f"[{x['account']}] " if x.get("account") else ""
+            lines.append(f"{acct_tag}{x['ticker']} {x['strike']:.0f}P {x['expiry']} ~${x['est_premium']:.0f}")
 
     if new_ccs:
         lines.append("— New CC ideas —")
         for x in new_ccs[:10]:
-            lines.append(f"{x['ticker']} {x['strike']:.0f}C {x['expiry']} ~${x['credit_mid']*100:.0f}")
+            acct_tag = f"[{x['account']}] " if x.get("account") else ""
+            lines.append(f"{acct_tag}{x['ticker']} {x['strike']:.0f}C {x['expiry']} ~${x['credit_mid']*100:.0f}")
 
     if planned_stocks:
         lines.append("— Stock entries (planned) —")
@@ -189,11 +191,12 @@ def print_open_csps(today: dt.date) -> None:
             print("\n🧾 OPEN CSP POSITIONS")
             for r in open_csps[:10]:
                 tkr      = (r.get("ticker") or "").strip().upper()
+                acct     = (r.get("account") or "").strip().upper()
                 exp      = (r.get("expiry") or "").strip()
                 strike   = r.get("strike") or ""
                 prem     = r.get("premium") or r.get("est_premium") or ""
                 dte_open = r.get("dte_open") or ""
-                print(f"  {tkr:<6} {exp} {strike}P | prem {prem} | dte_open {dte_open}")
+                print(f"  [{acct}] {tkr:<6} {exp} {strike}P | prem {prem} | dte_open {dte_open}")
     except Exception as e:
         log.warning("print_open_csps failed: %s", e)
 
@@ -262,13 +265,14 @@ def print_final_exposure_summary(
     mv_stock: Dict[str, float],
     wheel_mv: float,
 ) -> None:
-    exposure      = compute_wheel_exposure(today)
-    week_remaining = compute_week_remaining(today)
-
-    print("\n💼 WHEEL EXPOSURE (INDIVIDUAL options)")
-    print(f"  Total exposure: ${exposure['total_exposure']:,.0f} / ${exposure['cap']:,.0f}")
-    print(f"  Weekly target:  ${exposure['weekly_target']:,.0f}")
-    print(f"  Weekly remaining: ${week_remaining:,.0f}")
+    print("\n💼 WHEEL EXPOSURE (all accounts)")
+    for acct in (INDIVIDUAL, IRA, ROTH):
+        exp = compute_wheel_exposure(today, acct)
+        rem = compute_week_remaining(today, acct)
+        print(f"  {acct:<10} "
+              f"${exp['total_exposure']:>8,.0f} / ${exp['cap']:>8,.0f}  "
+              f"| wk target ${exp['weekly_target']:>7,.0f}  "
+              f"| wk rem ${rem:>7,.0f}")
 
     # Retirement MV
     mv_ret = strat.retirement_market_value_by_account(ret_by_key)

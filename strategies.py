@@ -443,6 +443,7 @@ STOCK_TRADE_FIELDS = [
     "exit_date",
     "exit_price",
     "reason",
+    "close_type",
     "pnl_abs",
     "pnl_pct",
 ]
@@ -503,7 +504,16 @@ def append_stock_fill(row: dict) -> None:
         w.writerow({k: row.get(k, "") for k in STOCK_FILL_FIELDS})
 
 def rebuild_stock_monthly_from_trades() -> None:
-    """Rebuild one CSV per month from stock_trades.csv (realized P/L on closes)."""
+    """Rebuild per-account-group monthly CSVs from stock_trades.csv.
+
+    Produces two files per month:
+      stock_monthly/YYYY-MM-INDIVIDUAL.csv  — individual account swing trades
+      stock_monthly/YYYY-MM-IRA.csv         — IRA + ROTH trades (each row tagged)
+
+    Profit is recorded on exit_date so unrealized positions never appear here.
+    Called-away CC lots appear with close_type=CC_CALLED_AWAY on the call date.
+    """
+    from config import IRA_ACCOUNTS
     ensure_stock_files()
     if not os.path.isfile(STOCK_TRADES_FILE):
         return
@@ -514,50 +524,51 @@ def rebuild_stock_monthly_from_trades() -> None:
 
     os.makedirs(STOCK_MONTHLY_DIR, exist_ok=True)
 
-    by_month: Dict[str, List[dict]] = {}
+    out_fields = [
+        "date", "account", "ticker", "shares",
+        "entry_price", "exit_price", "close_type",
+        "pnl_abs", "pnl_pct",
+    ]
+
+    # Bucket by (month, file_group) where file_group is INDIVIDUAL or IRA
+    by_bucket: Dict[tuple, List[dict]] = {}
     for r in rows:
         d = (r.get("exit_date") or "").strip()
         if len(d) < 7:
             continue
         month = d[:7]
-        by_month.setdefault(month, []).append(r)
+        acct  = (r.get("account") or INDIVIDUAL).strip().upper()
+        group = "IRA" if acct in IRA_ACCOUNTS else "INDIVIDUAL"
+        by_bucket.setdefault((month, group), []).append(r)
 
-    out_fields = ["date","account","ticker","shares","entry_price","exit_price","reason","pnl_abs","pnl_pct"]
-
-    for month, mrows in sorted(by_month.items()):
+    for (month, group), mrows in sorted(by_bucket.items()):
         out_rows: List[dict] = []
         total = 0.0
-        for r in mrows:
+        for r in sorted(mrows, key=lambda x: x.get("exit_date") or ""):
             try:
                 pnl = float(r.get("pnl_abs") or 0.0)
             except Exception:
                 pnl = 0.0
             total += pnl
             out_rows.append({
-                "date": (r.get("exit_date") or ""),
-                "account": (r.get("account") or ""),
-                "ticker": (r.get("ticker") or ""),
-                "shares": (r.get("shares") or ""),
+                "date":        (r.get("exit_date") or ""),
+                "account":     (r.get("account") or ""),
+                "ticker":      (r.get("ticker") or ""),
+                "shares":      (r.get("shares") or ""),
                 "entry_price": (r.get("entry_price") or ""),
-                "exit_price": (r.get("exit_price") or ""),
-                "reason": (r.get("reason") or ""),
-                "pnl_abs": f"{pnl:.2f}",
-                "pnl_pct": (r.get("pnl_pct") or ""),
+                "exit_price":  (r.get("exit_price") or ""),
+                "close_type":  (r.get("close_type") or ""),
+                "pnl_abs":     f"{pnl:.2f}",
+                "pnl_pct":     (r.get("pnl_pct") or ""),
             })
 
         out_rows.append({
-            "date": "",
-            "account": "",
-            "ticker": "TOTAL",
-            "shares": "",
-            "entry_price": "",
-            "exit_price": "",
-            "reason": "",
-            "pnl_abs": f"{total:.2f}",
-            "pnl_pct": "",
+            "date": "", "account": "", "ticker": "TOTAL",
+            "shares": "", "entry_price": "", "exit_price": "",
+            "close_type": "", "pnl_abs": f"{total:.2f}", "pnl_pct": "",
         })
 
-        path = os.path.join(STOCK_MONTHLY_DIR, f"{month}.csv")
+        path = os.path.join(STOCK_MONTHLY_DIR, f"{month}-{group}.csv")
         with open(path, "w", newline="") as f:
             w = csv.DictWriter(f, fieldnames=out_fields)
             w.writeheader()
@@ -911,6 +922,7 @@ def update_and_close_stock_positions(today: dt.date, mkt: Dict[str, float | bool
             "exit_date": r.get("exit_date", ""),
             "exit_price": r.get("exit_price", ""),
             "reason": exit_reason,
+            "close_type": exit_reason,
             "pnl_abs": r.get("pnl_abs", ""),
             "pnl_pct": r.get("pnl_pct", ""),
         })
@@ -1331,6 +1343,7 @@ def add_csp_position_from_selected(today: str, week_id: str, idea: dict) -> Tupl
 
     rows.append({
         "id": pos_id,
+        "account": (idea.get("account") or INDIVIDUAL).strip().upper(),
         "open_date": today,
         "week_id": week_id,
         "ticker": tkr,
@@ -1707,6 +1720,8 @@ def plan_covered_calls(today: dt.date, assigned_rows: List[dict], open_cc_ticker
                 "contracts": int(contracts),
                 "credit_mid": float(mid),
                 "reason":    f"{cc_reason} | basis {net_cost_basis_per_share:.2f}",
+                # Inherit account from the lot that generated this CC idea.
+                "account":   (pos.get("account") or INDIVIDUAL).strip().upper(),
             })
         except Exception as e:
             log.warning("plan_covered_calls failed for %s: %s", ticker, e)
@@ -1736,6 +1751,7 @@ def add_cc_position_from_candidate(today: str, idea: dict) -> str:
 
     rows.append({
         "id": cc_id,
+        "account": (idea.get("account") or INDIVIDUAL).strip().upper(),
         "open_date": today,
         "ticker": idea["ticker"],
         "expiry": idea["expiry"],

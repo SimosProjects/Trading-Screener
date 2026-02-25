@@ -188,6 +188,8 @@ def plan_ccs_from_open_lots() -> List[dict]:
             # Fall back to raw cost_basis for lots created before Step 3, then to assigned_strike.
             # Divide by shares to get per-share figure for decide_cc_strike.
             "net_cost_basis_per_share": _net_basis_per_share(lot),
+            # Carry the lot's account through so plan_covered_calls can tag each idea.
+            "account": (lot.get("account") or "INDIVIDUAL").strip().upper(),
         })
 
     if not assigned_rows:
