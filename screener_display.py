@@ -22,6 +22,8 @@ from config import (
     CSP_RISK_OFF_MIN_OTM_PCT_DEFENSIVE,
     CSP_NORMAL_MIN_OTM_PCT,
     CSP_POSITIONS_FILE,
+    CC_POSITIONS_FILE,
+    CC_ROLL_SIGNAL_THRESHOLD,
     ENABLE_CSP,
 )
 from wheel import compute_wheel_exposure, compute_week_remaining
@@ -53,6 +55,7 @@ def build_discord_alert(
     new_ccs: List[dict],
     planned_stocks: List[dict],
     watch: List[dict],
+    csp_tp: List[str],
     csp_exp: List[str],
     csp_asn: List[str],
     cc_exp: List[str],
@@ -67,8 +70,9 @@ def build_discord_alert(
         f"QQQ {mkt['qqq_close']:.2f} | VIX {mkt['vix_close']:.2f}"
     )
 
-    if csp_exp or csp_asn or cc_exp or cc_call or stock_opens or stock_closes:
+    if csp_tp or csp_exp or csp_asn or cc_exp or cc_call or stock_opens or stock_closes:
         lines.append("— Maintenance —")
+        if csp_tp:       lines.append(f"CSP closed (TP): {', '.join(csp_tp[:8])}{'…' if len(csp_tp)>8 else ''}")
         if csp_exp:      lines.append(f"CSP expired: {', '.join(csp_exp[:8])}{'…' if len(csp_exp)>8 else ''}")
         if csp_asn:      lines.append(f"CSP assigned: {', '.join(csp_asn[:8])}{'…' if len(csp_asn)>8 else ''}")
         if cc_exp:       lines.append(f"CC expired: {', '.join(cc_exp[:8])}{'…' if len(cc_exp)>8 else ''}")
@@ -194,6 +198,59 @@ def print_open_csps(today: dt.date) -> None:
         log.warning("print_open_csps failed: %s", e)
 
 
+
+# ============================================================
+# Open CC roll-candidate signals
+# ============================================================
+
+def print_open_cc_roll_candidates(px: Dict[str, float]) -> None:
+    """
+    Flag open CCs where the stock has recovered close to the strike.
+
+    When current_price / strike >= CC_ROLL_SIGNAL_THRESHOLD the CC is at
+    risk of assignment before expiry on a continued rally.  This is purely
+    informational — no automated roll is executed.  The human decides whether
+    to buy-to-close and re-sell at a higher strike / later expiry.
+    """
+    try:
+        cc_rows = strat.load_csv_rows(CC_POSITIONS_FILE)
+        candidates = []
+        for r in cc_rows:
+            if (r.get("status") or "").upper() != "OPEN":
+                continue
+            tkr = (r.get("ticker") or "").strip().upper()
+            if not tkr:
+                continue
+            try:
+                strike = float(r.get("strike") or 0)
+                if strike <= 0:
+                    continue
+            except Exception:
+                continue
+
+            cur = px.get(tkr)
+            if cur is None or cur <= 0:
+                continue
+
+            # How close is the stock to being called away?
+            pct_to_strike = (strike - cur) / strike  # positive = OTM, negative = ITM
+            proximity = cur / strike  # >= threshold means "getting close"
+
+            if proximity >= float(CC_ROLL_SIGNAL_THRESHOLD):
+                exp = (r.get("expiry") or "").strip()
+                candidates.append((tkr, strike, cur, pct_to_strike * 100, exp))
+
+        if candidates:
+            print("\n⚠️  CC ROLL CANDIDATES (within {:.0f}% of strike — consider rolling up/out)".format(
+                (1.0 - float(CC_ROLL_SIGNAL_THRESHOLD)) * 100
+            ))
+            for tkr, strike, cur, pct_otm, exp in candidates:
+                flag = "🔴 ITM" if pct_otm < 0 else "🟡 near"
+                print(f"  {flag} {tkr:<6} {strike:.0f}C {exp} | Now {cur:.2f} ({pct_otm:+.1f}% OTM)")
+    except Exception as e:
+        log.warning("print_open_cc_roll_candidates failed: %s", e)
+
+
 # ============================================================
 # Final exposure summary
 # ============================================================
@@ -228,8 +285,8 @@ def print_final_exposure_summary(
     if ret_flagged:
         print(f"  ⚠️ Breakeven-only flagged: {', '.join(ret_flagged)}")
 
-    indiv_stock_mv = float(mv_stock.get(INDIVIDUAL, 0.0)) + float(wheel_mv)
-    print("\n📦 INDIVIDUAL STOCK CAP (non-wheel)")
+    indiv_stock_mv = float(mv_stock.get(INDIVIDUAL, 0.0))
+    print("\n📦 INDIVIDUAL STOCK CAP (non-wheel swing trades)")
     print(
         f"  MV ${indiv_stock_mv:,.0f} / ${float(INDIVIDUAL_STOCK_CAP):,.0f} | "
         f"Remaining ${max(float(INDIVIDUAL_STOCK_CAP)-indiv_stock_mv, 0.0):,.0f}"

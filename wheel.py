@@ -54,11 +54,13 @@ LOT_FIELDS = [
     "open_date",
     "shares",
     "assigned_strike",
-    "cost_basis",  # total cost basis dollars (strike*shares - premium)
+    "cost_basis",           # total cost basis dollars (strike*shares - csp_premium)
     "source_csp_id",
     "has_open_cc",
     "cc_id",
-    "status",  # OPEN / CLOSED
+    "status",               # OPEN / CLOSED
+    "cc_premium_collected", # running total of CC premiums closed on this lot (dollars)
+    "net_cost_basis",       # cost_basis - cc_premium_collected; what decide_cc_strike uses
 ]
 
 
@@ -285,6 +287,8 @@ def create_lots_from_new_assignments(today: dt.date) -> None:
                 "has_open_cc": "0",
                 "cc_id": "",
                 "status": "OPEN",
+                "cc_premium_collected": "0.00",
+                "net_cost_basis": f"{basis:.2f}",
             }
         )
 
@@ -469,22 +473,62 @@ def process_cc_expirations(today: dt.date) -> Dict[str, List[str]]:
         fieldnames = list(cc_rows[0].keys()) if cc_rows else []
         _write_rows(CC_POSITIONS_FILE, cc_rows, fieldnames)
 
-    # If called away, close the associated lot
-    if called:
+    # Update lots for any CC that closed this run.
+    # - EXPIRED_OTM  → reduce cost basis by the premium collected; keep lot OPEN
+    # - CALLED_AWAY  → close the lot entirely (shares sold at strike)
+    if expired or called:
         lots = _read_rows(WHEEL_LOTS_FILE)
         lot_changed = False
+
+        # Build lookup: cc_id → closed cc row (for premium)
+        closed_cc_by_id: Dict[str, dict] = {
+            (r.get("id") or ""): r
+            for r in cc_rows
+            if (r.get("status") or "").upper() in ("EXPIRED", "CALLED_AWAY")
+        }
         called_cc_ids = {
             (r.get("id") or "")
             for r in cc_rows
             if (r.get("status") or "").upper() == "CALLED_AWAY"
         }
+
         for lot in lots:
             if (lot.get("status") or "").upper() != "OPEN":
                 continue
-            if (lot.get("cc_id") or "") in called_cc_ids:
+            cc_id = (lot.get("cc_id") or "").strip()
+            if not cc_id or cc_id not in closed_cc_by_id:
+                continue
+
+            cc_row = closed_cc_by_id[cc_id]
+            prem = _safe_float(cc_row.get("premium"), 0.0)
+
+            if cc_id in called_cc_ids:
+                # Stock called away — close the lot, no basis update needed
                 lot["status"] = "CLOSED"
                 lot["has_open_cc"] = "0"
-                lot_changed = True
+            else:
+                # CC expired worthless — collect the premium, reduce basis, clear CC link
+                prev_collected = _safe_float(lot.get("cc_premium_collected"), 0.0)
+                new_collected   = prev_collected + prem
+                orig_basis      = _safe_float(lot.get("cost_basis"), 0.0)
+                new_net_basis   = max(orig_basis - new_collected, 0.0)
+
+                lot["cc_premium_collected"] = f"{new_collected:.2f}"
+                lot["net_cost_basis"]        = f"{new_net_basis:.2f}"
+                lot["has_open_cc"]           = "0"
+                lot["cc_id"]                 = ""
+
+                tkr_lot = (lot.get("ticker") or "").strip().upper()
+                sh_lot  = _safe_int(lot.get("shares"), 0)
+                net_per_share = new_net_basis / sh_lot if sh_lot > 0 else 0.0
+                log.info(
+                    "CC expired — lot %s basis reduced: collected $%.2f total, "
+                    "net_cost_basis $%.2f ($%.4f/sh)",
+                    lot.get("lot_id", tkr_lot), new_collected, new_net_basis, net_per_share,
+                )
+
+            lot_changed = True
+
         if lot_changed:
             _write_rows(WHEEL_LOTS_FILE, lots, LOT_FIELDS)
 
@@ -567,7 +611,9 @@ def compute_week_remaining(today: dt.date) -> float:
 def rebuild_monthly_from_events() -> None:
     """Rebuild one CSV per month from wheel_events.csv.
 
-    Focuses on premium credits (CSP_OPEN + CC_OPEN).
+    Tracks premium credits (CSP_OPEN, CC_OPEN) and buyback costs
+    (CSP_CLOSE_TP) so the monthly total reflects actual net premium earned.
+    CSP_CLOSE_TP premiums are stored as negative dollars (cash paid out).
     """
     ensure_wheel_files()
     rows = _read_rows(WHEEL_EVENTS_FILE)
@@ -595,7 +641,7 @@ def rebuild_monthly_from_events() -> None:
         total = 0.0
         for e in evs_sorted:
             et = (e.get("event_type") or "").upper()
-            if et not in ("CSP_OPEN", "CC_OPEN"):
+            if et not in ("CSP_OPEN", "CC_OPEN", "CSP_CLOSE_TP"):
                 continue
             prem = _safe_float(e.get("premium"), 0.0)
             total += prem

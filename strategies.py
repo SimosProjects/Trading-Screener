@@ -43,6 +43,7 @@ from config import (
     # CSP rules
     CSP_POSITIONS_COLUMNS, CC_POSITIONS_COLUMNS,
     CSP_TARGET_DTE_MIN, CSP_TARGET_DTE_MAX,
+    CSP_TAKE_PROFIT_PCT, CSP_TP_MAX_SPREAD_PCT,
     CSP_MAX_CASH_PER_TRADE,
     CSP_MIN_OI, CSP_MIN_VOLUME, CSP_MIN_BID, CSP_MIN_IV,
     CSP_STRIKE_MODE,
@@ -50,6 +51,13 @@ from config import (
     CSP_MIN_PREMIUM_CONSERVATIVE, CSP_MIN_PREMIUM_BALANCED, CSP_MIN_PREMIUM_AGGRESSIVE,
     CSP_MIN_YIELD_CONSERVATIVE, CSP_MIN_YIELD_BALANCED, CSP_MIN_YIELD_AGGRESSIVE,
     CSP_MAX_AGGRESSIVE_TOTAL, CSP_MAX_AGGRESSIVE_PER_WEEK,
+
+    # CC policy
+    CC_TARGET_DTE_MIN, CC_TARGET_DTE_MAX,
+    CC_ATR_MULT_NORMAL, CC_ATR_MULT_MILD, CC_ATR_MULT_DEEP, CC_ATR_MULT_SEVERE,
+    CC_UNDERWATER_MILD_PCT, CC_UNDERWATER_DEEP_PCT,
+    CC_STRIKE_FLOOR_BELOW_CURRENT_PCT,
+    CC_MIN_BID,
 )
 
 log = get_logger(__name__)
@@ -1346,6 +1354,122 @@ def add_csp_position_from_selected(today: str, week_id: str, idea: dict) -> Tupl
     return (pos_id, True)
 
 
+def process_csp_take_profits(today: dt.date) -> Dict[str, List[str]]:
+    """
+    Close OPEN CSPs that have decayed to <= 50% of original premium (configurable).
+
+    Fetches the current put bid/ask from the live option chain.  If the quote
+    is stale, inverted, or the spread is too wide relative to mid, we skip
+    rather than close blind — better to hold a position a day longer than to
+    record a fictional fill.
+
+    Returns {"closed": [list of summary strings]} for the Discord alert.
+    """
+    ensure_positions_files()
+    rows = load_csv_rows(CSP_POSITIONS_FILE)
+    if not rows:
+        return {"closed": []}
+
+    closed: List[str] = []
+    changed = False
+
+    for r in rows:
+        if (r.get("status") or "").upper() != "OPEN":
+            continue
+
+        # Skip if already past expiry — let process_csp_expirations handle it.
+        exp_str = (r.get("expiry") or "").strip()
+        try:
+            if exp_str and dt.date.fromisoformat(exp_str) <= today:
+                continue
+        except Exception:
+            continue
+
+        ticker    = (r.get("ticker") or "").strip().upper()
+        strike    = safe_float(r.get("strike"), 0.0)
+        contracts = safe_int(r.get("contracts"), 0)
+
+        try:
+            orig_premium = safe_float(r.get("premium"), 0.0)
+        except Exception:
+            orig_premium = 0.0
+
+        if orig_premium <= 0 or strike <= 0 or contracts < 1 or not ticker:
+            continue
+
+        # Target: current total value of the position must be <= take-profit threshold.
+        # orig_premium is total dollars; threshold is per-contract mid * 100 * contracts.
+        tp_threshold = orig_premium * float(CSP_TAKE_PROFIT_PCT)
+
+        try:
+            t = yf.Ticker(ticker)
+            chain = t.option_chain(exp_str)
+            puts = chain.puts
+            if puts is None or puts.empty:
+                log.info("CSP TP %s %s: no put chain available; skipping", ticker, exp_str)
+                continue
+
+            row = puts.loc[puts["strike"] == strike]
+            if row.empty:
+                log.info("CSP TP %s %s: strike %.2f not found in chain; skipping", ticker, exp_str, strike)
+                continue
+            row = row.iloc[0]
+
+            bid = safe_float(row.get("bid"), 0.0)
+            ask = safe_float(row.get("ask"), 0.0)
+
+            # Basic sanity: need a real two-sided market.
+            if bid <= 0 or ask <= 0 or ask < bid:
+                log.info("CSP TP %s %s: inverted or zero quote (bid=%.2f ask=%.2f); skipping",
+                         ticker, exp_str, bid, ask)
+                continue
+
+            mid = (bid + ask) / 2.0
+
+            # Spread filter: if the market is too wide the mid is meaningless.
+            spread_pct = (ask - bid) / mid
+            if spread_pct > float(CSP_TP_MAX_SPREAD_PCT):
+                log.info("CSP TP %s %s: spread %.0f%% too wide; skipping", ticker, exp_str, spread_pct * 100)
+                continue
+
+            current_value = mid * 100.0 * contracts
+
+        except Exception as e:
+            log.warning("CSP TP price fetch failed for %s %s: %s", ticker, exp_str, e)
+            continue
+
+        if current_value > tp_threshold:
+            continue  # not enough decay yet
+
+        # Close it.
+        profit = orig_premium - current_value
+        r["status"]     = "CLOSED_TP"
+        r["close_date"] = today.isoformat()
+        r["close_type"] = "CLOSED_TAKE_PROFIT"
+        r["notes"]      = (
+            f"TP at {float(CSP_TAKE_PROFIT_PCT)*100:.0f}%: "
+            f"orig ${orig_premium:.0f} → current ${current_value:.0f} | profit ${profit:.0f}"
+        )
+        changed = True
+        closed.append({
+            "summary":    f"{ticker} {exp_str} {strike:.0f}P (${profit:.0f} profit)",
+            "ticker":     ticker,
+            "expiry":     exp_str,
+            "strike":     strike,
+            "contracts":  contracts,
+            "ref_id":     (r.get("id") or ""),
+            "buyback":    float(current_value),   # dollars paid to close
+            "profit":     float(profit),
+        })
+        log.info("CSP TP closed: %s %s %.0fP — orig $%.0f current $%.0f profit $%.0f",
+                 ticker, exp_str, strike, orig_premium, current_value, profit)
+
+    if changed:
+        write_csv_rows(CSP_POSITIONS_FILE, rows, CSP_POSITIONS_COLUMNS)
+
+    return {"closed": closed}
+
+
 def process_csp_expirations(today: dt.date) -> Dict[str, List[str]]:
     ensure_positions_files()
     rows = load_csv_rows(CSP_POSITIONS_FILE)
@@ -1426,13 +1550,61 @@ def process_csp_expirations(today: dt.date) -> Dict[str, List[str]]:
 # CC planning from assigned CSPs (classic wheel)
 # ============================================================
 
-def decide_cc_strike(current_price: float, assigned_strike: float) -> Tuple[str, Optional[float]]:
-    pct_from = (current_price - assigned_strike) / assigned_strike if assigned_strike > 0 else 0.0
-    if abs(pct_from) <= 0.02:
-        return "SELL_CC", max(current_price, assigned_strike) * 1.02
-    if -0.08 <= pct_from < -0.02:
-        return "SELL_CC", assigned_strike
-    return "WAIT", None
+def decide_cc_strike(
+    current_price: float,
+    net_cost_basis_per_share: float,
+    atr: float,
+) -> Tuple[str, float, str]:
+    """
+    ATR-scaled CC strike policy.
+
+    Returns (decision, target_strike, reason).  Decision is always "SELL_CC".
+    Caller rounds to chain and applies the hard floor.
+
+    Strike = current_price + (atr_mult × ATR_14).  Using ATR instead of a
+    fixed % means a volatile stock gets proportionally more room to recover
+    than a stable one — a $1.50 ATR on a $40 stock gives different clearance
+    than a $0.50 ATR on the same price.
+
+    Multiplier tiers (higher = further OTM = more recovery room):
+      ≥  0% vs basis : NORMAL (1.0×) — at/above basis, standard income mode
+       0–10% down    : MILD   (1.5×) — give room for early recovery bounce
+      10–25% down    : DEEP   (2.0×) — protect a meaningful rally
+       > 25% down    : SEVERE (2.5×) — distress; never cap a recovery, collect what we can
+
+    If ATR is unavailable (zero), falls back to a 2% OTM target so we always
+    produce something rather than silently skipping.
+    """
+    if atr <= 0:
+        # ATR unavailable — use a conservative fixed OTM rather than skip.
+        target = current_price * 1.02
+        return "SELL_CC", target, "ATR unavailable; 2% OTM fallback"
+
+    if net_cost_basis_per_share <= 0:
+        target = current_price + CC_ATR_MULT_NORMAL * atr
+        return "SELL_CC", target, f"no basis data; {CC_ATR_MULT_NORMAL}×ATR OTM"
+
+    pct_vs_basis = (current_price - net_cost_basis_per_share) / net_cost_basis_per_share
+
+    if pct_vs_basis >= 0.0:
+        mult = CC_ATR_MULT_NORMAL
+        tier = "NORMAL"
+    elif pct_vs_basis >= -float(CC_UNDERWATER_MILD_PCT):
+        mult = CC_ATR_MULT_MILD
+        tier = "MILD"
+    elif pct_vs_basis >= -float(CC_UNDERWATER_DEEP_PCT):
+        mult = CC_ATR_MULT_DEEP
+        tier = "DEEP"
+    else:
+        mult = CC_ATR_MULT_SEVERE
+        tier = "SEVERE"
+
+    target = current_price + mult * atr
+    reason = (
+        f"{tier} ({pct_vs_basis*100:+.1f}% vs basis {net_cost_basis_per_share:.2f}); "
+        f"{mult}×ATR ({atr:.2f}) → target {target:.2f}"
+    )
+    return "SELL_CC", target, reason
 
 
 def _round_call_strike_to_chain(calls_df: pd.DataFrame, target_strike: float) -> float:
@@ -1461,11 +1633,12 @@ def plan_covered_calls(today: dt.date, assigned_rows: List[dict], open_cc_ticker
             continue
 
         try:
-            assigned_strike = float(pos.get("strike") or 0.0)
+            # net_cost_basis is the per-share effective cost after premiums collected.
+            # Until Step 3 tracks cumulative premiums, assigned_strike is the best proxy.
+            net_cost_basis_per_share = float(pos.get("net_cost_basis_per_share") or
+                                             pos.get("strike") or 0.0)
         except Exception:
-            assigned_strike = 0.0
-        if assigned_strike <= 0:
-            continue
+            net_cost_basis_per_share = 0.0
 
         try:
             df = add_indicators(download_ohlcv(ticker))
@@ -1473,38 +1646,67 @@ def plan_covered_calls(today: dt.date, assigned_rows: List[dict], open_cc_ticker
                 continue
             last = df.iloc[-1]
             current_price = float(last["Close"])
-        except Exception:
+            atr = float(last.get("ATR_14") or 0)
+        except Exception as e:
+            log.warning("plan_covered_calls: price fetch failed for %s: %s", ticker, e)
             continue
 
-        decision, target = decide_cc_strike(current_price, assigned_strike)
-        if decision != "SELL_CC" or not target:
-            continue
+        _decision, raw_target, cc_reason = decide_cc_strike(current_price, net_cost_basis_per_share, atr)
+
+        # Floor: never sell a CC whose target lands below current_price * (1 - floor%).
+        # Anchored to current price — not original basis — because when the stock is
+        # deeply underwater a basis-relative floor would be ITM and block every strike.
+        # This simply ensures we always sell something genuinely OTM.
+        if CC_STRIKE_FLOOR_BELOW_CURRENT_PCT > 0:
+            floor = current_price * (1.0 - float(CC_STRIKE_FLOOR_BELOW_CURRENT_PCT))
+            if raw_target < floor:
+                # ATR is very small relative to price (e.g., a slow defensive stock
+                # that gapped down hard). Skip rather than sell a near-ITM CC.
+                log.info(
+                    "CC %s: raw target %.2f below current-price floor %.2f; skipping",
+                    ticker, raw_target, floor,
+                )
+                continue
 
         try:
             t = yf.Ticker(ticker)
-            exp_str, _ = _pick_expiry_in_dte_range(t, 14, 30)
+            exp_str, _ = _pick_expiry_in_dte_range(t, CC_TARGET_DTE_MIN, CC_TARGET_DTE_MAX)
             if not exp_str:
+                log.info("CC %s: no expiry in %d–%d DTE window", ticker, CC_TARGET_DTE_MIN, CC_TARGET_DTE_MAX)
                 continue
             chain = t.option_chain(exp_str)
             calls = chain.calls.copy()
             if calls.empty:
                 continue
 
-            strike = _round_call_strike_to_chain(calls, target)
+            strike = _round_call_strike_to_chain(calls, raw_target)
+
+            # Re-apply floor after chain rounding — the nearest available strike
+            # could slip below the floor even when the raw target was above it.
+            if CC_STRIKE_FLOOR_BELOW_CURRENT_PCT > 0:
+                floor = current_price * (1.0 - float(CC_STRIKE_FLOOR_BELOW_CURRENT_PCT))
+                if strike < floor:
+                    log.info(
+                        "CC %s: rounded strike %.2f below floor %.2f; skipping",
+                        ticker, strike, floor,
+                    )
+                    continue
+
             row = calls.loc[calls["strike"] == strike].iloc[0]
             bid = float(row.get("bid", 0) or 0)
             ask = float(row.get("ask", 0) or 0)
-            if bid <= 0 or ask < bid:
+            if bid < CC_MIN_BID or ask < bid:
+                log.info("CC %s: strike %.0f bid %.2f below min or inverted; skipping", ticker, strike, bid)
                 continue
             mid = (bid + ask) / 2.0
 
             ideas.append({
-                "ticker": ticker,
-                "expiry": exp_str,
-                "strike": float(strike),
+                "ticker":    ticker,
+                "expiry":    exp_str,
+                "strike":    float(strike),
                 "contracts": int(contracts),
                 "credit_mid": float(mid),
-                "reason": f"Wheel CC vs assigned {assigned_strike:.0f}",
+                "reason":    f"{cc_reason} | basis {net_cost_basis_per_share:.2f}",
             })
         except Exception as e:
             log.warning("plan_covered_calls failed for %s: %s", ticker, e)

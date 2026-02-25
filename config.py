@@ -243,6 +243,16 @@ CC_POSITIONS_COLUMNS = [
     "notes",
 ]
 
+# ---- Take-profit / early close ----
+# Close a CSP when current mid-price <= original premium * this fraction.
+# 0.50 = close at 50% profit (the classic "half-profit" rule).
+CSP_TAKE_PROFIT_PCT = 0.50
+
+# Skip the take-profit close if the bid/ask spread is wider than this fraction
+# of mid.  Wide spreads mean the quote is stale or illiquid — better to hold
+# than close at an unknown price.  0.50 = spread must be <= 50% of mid.
+CSP_TP_MAX_SPREAD_PCT = 0.50
+
 # ---- DTE window ----
 CSP_TARGET_DTE_MIN = 25
 CSP_TARGET_DTE_MAX = 45
@@ -277,3 +287,54 @@ CSP_MIN_YIELD_AGGRESSIVE = 0.020
 # ---- Tier caps ----
 CSP_MAX_AGGRESSIVE_TOTAL = 4
 CSP_MAX_AGGRESSIVE_PER_WEEK = 2
+
+# ============================================================
+# Covered Call (CC) policy
+# ============================================================
+
+# DTE window for CC selection (tighter than CSP — want faster theta decay)
+CC_TARGET_DTE_MIN = 14
+CC_TARGET_DTE_MAX = 30
+
+# --- ATR-scaled strike selection ---
+# Strike target = current_price + (atr_mult × ATR_14).
+# Using ATR instead of a fixed % naturally scales to each stock's actual
+# daily range — a volatile stock gets more room to recover than a stable one.
+#
+# Multiplier tiers (based on how far current price is below net cost basis):
+#   At/above basis        → CC_ATR_MULT_NORMAL  (modest OTM, normal income)
+#   0–10% underwater      → CC_ATR_MULT_MILD    (more room, moderate premium)
+#   10–25% underwater     → CC_ATR_MULT_DEEP    (protect recovery potential)
+#   >25% underwater       → CC_ATR_MULT_SEVERE  (distress — never cap a big bounce)
+#
+# Example: stock at $40, ATR=$1.50
+#   NORMAL  (1.0×): target $41.50 — ~3.75% OTM
+#   MILD    (1.5×): target $42.25 — ~5.6% OTM
+#   DEEP    (2.0×): target $43.00 — ~7.5% OTM
+#   SEVERE  (2.5×): target $43.75 — ~9.4% OTM
+CC_ATR_MULT_NORMAL  = 1.0   # at/above basis
+CC_ATR_MULT_MILD    = 1.5   # 0–10% underwater
+CC_ATR_MULT_DEEP    = 2.0   # 10–25% underwater
+CC_ATR_MULT_SEVERE  = 2.5   # >25% underwater
+
+# Underwater tier thresholds (as positive fractions of basis)
+CC_UNDERWATER_MILD_PCT   = 0.10   # 0–10% below basis → MILD
+CC_UNDERWATER_DEEP_PCT   = 0.25   # 10–25% below basis → DEEP
+# anything worse than 25% → SEVERE
+
+# Hard floor: don't sell a CC whose (chain-rounded) strike is more than this %
+# below the *current price*.  Anchoring to current price rather than original
+# basis is intentional — when the stock is already underwater the basis-relative
+# floor blocks every sensible strike (e.g., stock at $40 vs $50 basis means
+# floor at $47.50, which is ITM — useless).  The goal here is simply to avoid
+# selling a CC so close to current price that it provides no real OTM cushion.
+# 2% means: don't sell a strike below $39.20 when the stock is at $40.
+CC_STRIKE_FLOOR_BELOW_CURRENT_PCT = 0.02  # always at least 2% OTM from current price
+
+# Minimum bid to bother with a CC (too thin a market = bad fill risk).
+CC_MIN_BID = 0.05
+
+# Roll signal threshold: flag an open CC as a roll candidate when
+# current_price / cc_strike >= this value (i.e., within ~3% of being called away).
+# Informational only — no automated roll execution.
+CC_ROLL_SIGNAL_THRESHOLD = 0.97

@@ -125,6 +125,41 @@ def build_csp_candidates(mkt: Dict, mode: str) -> List[dict]:
 # CC ideas from open lots
 # ============================================================
 
+def _net_basis_per_share(lot: dict) -> str:
+    """
+    Return the effective per-share cost basis for a lot as a string.
+
+    Priority:
+      1. net_cost_basis  — already reduced by accumulated CC premiums (Step 3+)
+      2. cost_basis      — raw assignment basis (pre-Step 3 lots)
+      3. assigned_strike — last resort if neither dollar figure is present
+    """
+    shares = max(int(float(lot.get("shares") or 100)), 1)
+
+    net = lot.get("net_cost_basis") or ""
+    if net and net not in ("", "0", "0.0", "0.00"):
+        try:
+            return f"{float(net) / shares:.4f}"
+        except Exception:
+            pass
+
+    raw = lot.get("cost_basis") or ""
+    if raw and raw not in ("", "0", "0.0", "0.00"):
+        try:
+            return f"{float(raw) / shares:.4f}"
+        except Exception:
+            pass
+
+    strike = lot.get("assigned_strike") or ""
+    if strike:
+        try:
+            return f"{float(strike):.4f}"
+        except Exception:
+            pass
+
+    return ""
+
+
 def plan_ccs_from_open_lots() -> List[dict]:
     """
     Generate CC candidates only for OPEN lots with no active CC.
@@ -146,9 +181,13 @@ def plan_ccs_from_open_lots() -> List[dict]:
         if tkr in open_cc_tickers:
             continue
         assigned_rows.append({
-            "ticker":           tkr,
-            "shares_if_assigned": lot.get("shares") or "100",
-            "strike":           lot.get("assigned_strike") or "",
+            "ticker":                  tkr,
+            "shares_if_assigned":      lot.get("shares") or "100",
+            "strike":                  lot.get("assigned_strike") or "",
+            # Prefer net_cost_basis (cost_basis reduced by all CC premiums collected so far).
+            # Fall back to raw cost_basis for lots created before Step 3, then to assigned_strike.
+            # Divide by shares to get per-share figure for decide_cc_strike.
+            "net_cost_basis_per_share": _net_basis_per_share(lot),
         })
 
     if not assigned_rows:

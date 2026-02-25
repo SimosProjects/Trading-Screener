@@ -37,6 +37,7 @@ from screener_display import (
     print_market_context,
     print_open_holdings,
     print_open_csps,
+    print_open_cc_roll_candidates,
     print_final_exposure_summary,
     build_discord_alert,
     send_discord,
@@ -119,10 +120,29 @@ def run_screener() -> None:
     stock_closed = closes.get("stops", []) + closes.get("targets", [])
 
     # ── 6. Wheel maintenance ──────────────────────────────────────
-    csp_out = strat.process_csp_expirations(today)
-    cc_out  = process_cc_expirations(today)
+    csp_tp_out = strat.process_csp_take_profits(today)
+    csp_out    = strat.process_csp_expirations(today)
+    cc_out     = process_cc_expirations(today)
     create_lots_from_new_assignments(today)
     link_new_ccs_to_lots(today)
+
+    if csp_tp_out.get("closed"):
+        print("\n✅ CSP TAKE-PROFITS CLOSED")
+        for c in csp_tp_out["closed"]:
+            print(f"  {c['summary']}")
+            record_event(
+                date=today.isoformat(),
+                ticker=c["ticker"],
+                event_type="CSP_CLOSE_TP",
+                ref_id=c["ref_id"],
+                expiry=c["expiry"],
+                strike=float(c["strike"]),
+                contracts=int(c["contracts"]),
+                shares=int(c["contracts"]) * 100,
+                premium=-float(c["buyback"]),   # negative = cash paid out to close
+                wheel_value=0.0,
+                notes=f"CSP take-profit close, profit ${c['profit']:.0f}",
+            )
 
     # ── 7. Stock scan + execution ─────────────────────────────────
     entries, watch = scan_stock_entries_and_watchlist()
@@ -230,7 +250,7 @@ def run_screener() -> None:
         print("\n📞 NEW CC IDEAS (from lots) (paper execution)")
         for o in new_cc_orders[:15]:
             credit_est = float(o.get("credit_mid", 0.0)) * 100.0
-            print(f"  {o['ticker']:<6} {float(o['strike']):.0f}C {o['expiry']} | est credit ${credit_est:.0f}")
+            print(f"  {o['ticker']:<6} {float(o['strike']):.0f}C {o['expiry']} | est credit ${credit_est:.0f} | {o.get('reason','')}")
 
         for o in new_cc_orders:
             strat.add_cc_position_from_candidate(today.isoformat(), o)
@@ -238,6 +258,10 @@ def run_screener() -> None:
         link_new_ccs_to_lots(today)
     else:
         print("\n📞 CC: No calls triggered today.")
+
+    # Surface any open CCs where the stock has recovered close to the strike.
+    # px was built for holdings display (step 4) and covers all lot tickers.
+    print_open_cc_roll_candidates(px)
 
     # ── 10. Backfill + monthly rebuild ───────────────────────────
     if should_backfill_events():
@@ -260,6 +284,7 @@ def run_screener() -> None:
         new_ccs=new_cc_orders,
         planned_stocks=planned_stocks,
         watch=watch,
+        csp_tp=[c["summary"] for c in csp_tp_out.get("closed", [])],
         csp_exp=csp_out.get("expired", []),
         csp_asn=csp_out.get("assigned", []),
         cc_exp=cc_out.get("expired", []),
