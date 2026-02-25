@@ -1,32 +1,57 @@
-# screener.py
-import datetime as dt
-from typing import Dict, List, Tuple
+"""screener.py
 
+Daily screener orchestrator.
+
+Sequence:
+  1. Warm data cache (one batch download)
+  2. Market context + regime flags
+  3. File / position maintenance (expirations, lots, links)
+  4. Print open holdings
+  5. Close stock positions at stop/target
+  6. Scan for new stock entries → plan + execute
+  7. Scan for new CSP candidates → plan + execute
+  8. Plan CC ideas from open lots → execute
+  9. Backfill wheel events if needed
+ 10. Rebuild monthly reports
+ 11. Print final exposure summary
+ 12. Send Discord alert
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+from typing import List
+
+from utils import get_logger
 from config import (
-    WEBHOOK_URL,
-    STOCKS,
-    CSP_STOCKS,
     ENABLE_CSP,
     INDIVIDUAL, IRA, ROTH,
-    ACCOUNT_SIZES,
-    INDIVIDUAL_STOCK_CAP,
+    STOCKS, CSP_STOCKS,
     CSP_LEDGER_FILE,
-    CSP_POSITIONS_FILE,
-    CSP_ATR_MULTS,
-    CSP_DEFENSIVE_STOCKS,
-    CSP_RISK_OFF_VIX,
-    CSP_RISK_OFF_MIN_OTM_PCT_DEFENSIVE,
-    CSP_RISK_OFF_MIN_OTM_PCT_RISKY,
-    CSP_NORMAL_MIN_OTM_PCT,
-    CSP_STRIKE_BASE_NORMAL,
-    CSP_STRIKE_BASE_RISK_OFF,
 )
 
-# Prevent duplicate retirement stock entries (same ticker in IRA and ROTH)
-PREVENT_DUPLICATE_RETIREMENT_TICKERS = True
-
-
 import strategies as strat
+from data_cache import DataCache
+from market import fetch_market_context, allow_swing_trades, allow_retirement_tactical, csp_mode
+from screener_display import (
+    print_market_context,
+    print_open_holdings,
+    print_open_csps,
+    print_final_exposure_summary,
+    build_discord_alert,
+    send_discord,
+)
+from screener_positions import (
+    build_holdings_and_mv,
+    compute_acct_mv,
+    collect_tickers_for_price_fetch,
+)
+from screener_stocks import (
+    scan_stock_entries_and_watchlist,
+    plan_and_execute_stocks,
+    print_watchlist,
+)
+from screener_options import build_csp_candidates, plan_ccs_from_open_lots
 from wheel import (
     ensure_wheel_files,
     compute_wheel_exposure,
@@ -36,785 +61,169 @@ from wheel import (
     link_new_ccs_to_lots,
     process_cc_expirations,
     rebuild_monthly_from_events,
-    get_open_lots,
     should_backfill_events,
     backfill_open_events_from_positions,
 )
 
-# ============================================================
-# Behavior toggles (local; no config changes needed)
-# ============================================================
+log = get_logger(__name__)
 
-# If False: prevents opening the same ticker in multiple accounts (IRA/ROTH/INDIVIDUAL)
-# If True: allows MS in IRA and also MS in ROTH, etc.
-ALLOW_DUPLICATE_TICKERS_ACROSS_ACCOUNTS = True  # allows same ticker in INDIVIDUAL vs retirement
-
-
-
-# ============================================================
-# Discord (alerts only; avoid intimate account details)
-# ============================================================
-
-def send_discord(msg: str) -> None:
-    if not WEBHOOK_URL or not WEBHOOK_URL.strip():
-        print("Discord webhook not set (WEBHOOK_URL). Skipping Discord.")
-        return
-
-    url = WEBHOOK_URL.strip()
-    if not url.startswith("http"):
-        print("Discord webhook invalid (WEBHOOK_URL). Skipping Discord.")
-        return
-
-    try:
-        import requests
-        requests.post(url, json={"content": msg[:1900]}, timeout=10)
-    except Exception as e:
-        print(f"Discord error: {e}")
-
-
-# ============================================================
-# Market filter + watchlist / entries
-# ============================================================
-
-def allow_swing_trades(mkt: Dict) -> bool:
-    """Strict gate for INDIVIDUAL swing trades."""
-    return bool(
-        mkt.get("spy_above_200")
-        and mkt.get("spy_above_50")
-        and mkt.get("spy_above_21")
-        and mkt.get("qqq_above_50")
-        and mkt.get("vix_below_25")
-    )
-
-def allow_retirement_tactical(mkt: Dict) -> bool:
-    """Softer gate for IRA/ROTH tactical stock trades."""
-    return bool(
-        mkt.get("spy_above_200")
-        and mkt.get("vix_below_25")
-    )
-
-def csp_mode(mkt: Dict) -> str:
-    """Return CSP mode based on market regime.
-    - NORMAL: broader CSP universe + moderate cushion
-    - RISK_OFF: defensive-only + farther OTM + slower MA base
-    """
-    try:
-        vix = float(mkt.get("vix_close") or 99.0)
-    except Exception:
-        vix = 99.0
-
-    spy_above_200 = bool(mkt.get("spy_above_200"))
-    if (not spy_above_200) or (vix > float(CSP_RISK_OFF_VIX)):
-        return "RISK_OFF"
-    return "NORMAL"
-
-def scan_stock_entries_and_watchlist() -> Tuple[List[dict], List[dict]]:
-    """
-    Scans STOCKS for:
-      - entries: pullback/breakout signals
-      - watchlist: technically healthy, close to signal
-    """
-    entries: List[dict] = []
-    watch: List[dict] = []
-
-    for tkr in STOCKS:
-        try:
-            df = strat.add_indicators(strat.download_ohlcv(tkr))
-            last = df.iloc[-1]
-
-            if not strat.is_eligible(last):
-                continue
-
-            pb = strat.pullback_signal(last)
-            bo = strat.breakout_signal(last)
-
-            if pb or bo:
-                signal = "PULLBACK" if pb else "BREAKOUT"
-                entries.append({
-                    "ticker": tkr,
-                    "signal": signal,
-                    "close": float(last["Close"]),
-                    "rsi2": float(last["RSI_2"]),
-                    "_last": last,  # keep row for planning
-                })
-                continue
-
-            # Watchlist heuristics (cheap & stable)
-            close = float(last["Close"])
-            ema21 = float(last["EMA_21"])
-            rsi2 = float(last["RSI_2"])
-            high20 = float(last["HIGH_20"])
-
-            near_ema = abs(close - ema21) / max(ema21, 1e-9) <= 0.012  # within ~1.2%
-            near_breakout = (high20 > 0) and (close / high20 >= 0.985)  # within ~1.5% of 20d high
-            oversold = rsi2 <= 10
-
-            if near_ema or near_breakout or oversold:
-                watch.append({
-                    "ticker": tkr,
-                    "close": close,
-                    "rsi2": rsi2,
-                    "note": "near EMA21" if near_ema else ("near 20D high" if near_breakout else "RSI2 oversold"),
-                })
-        except Exception:
-            continue
-
-    # Sort then de-duplicate by ticker (preserves first occurrence after sort)
-    entries = sorted(entries, key=lambda x: (x["signal"], x["rsi2"]))
-    watch = sorted(watch, key=lambda x: (x["note"], x["rsi2"]))
-
-    def _dedupe(rows: List[dict]) -> List[dict]:
-        seen = set()
-        out: List[dict] = []
-        for r in rows:
-            t = (r.get("ticker") or "").strip().upper()
-            if not t or t in seen:
-                continue
-            seen.add(t)
-            out.append(r)
-        return out
-
-    entries = _dedupe(entries)
-    watch = _dedupe(watch)
-    return entries, watch
-
-
-# ============================================================
-# CSP + CC planning (signals from strategies; exposure from wheel)
-# ============================================================
-
-def build_csp_candidates(mkt: Dict, mode: str) -> List[dict]:
-    candidates: List[dict] = []
-
-    defensive_set = set(CSP_DEFENSIVE_STOCKS)
-
-    if mode == "RISK_OFF":
-        print(
-            f"\n🛡️  CSP MODE: RISK_OFF | VIX {float(mkt.get('vix_close') or 0):.2f} > {float(CSP_RISK_OFF_VIX):.1f}"
-            f" | Universe: DEFENSIVE ONLY ({len(defensive_set)} tickers)"
-            f" | Strike base: {CSP_STRIKE_BASE_RISK_OFF} | Min OTM: {float(CSP_RISK_OFF_MIN_OTM_PCT_DEFENSIVE)*100:.0f}%"
-        )
-    else:
-        print(
-            f"\n🟦 CSP MODE: NORMAL | VIX {float(mkt.get('vix_close') or 0):.2f} <= {float(CSP_RISK_OFF_VIX):.1f}"
-            f" | Universe: STANDARD ({len(CSP_STOCKS)} tickers)"
-            f" | Strike base: {CSP_STRIKE_BASE_NORMAL} | Min OTM: {float(CSP_NORMAL_MIN_OTM_PCT)*100:.0f}%"
-        )
-
-    for tkr in CSP_STOCKS:
-        try:
-            tkr_u = (tkr or "").strip().upper()
-            if not tkr_u:
-                continue
-
-            defensive = tkr_u in defensive_set
-
-            # In risk-off regime, only allow defensive names (keep risk contained).
-            if mode == "RISK_OFF" and not defensive:
-                continue
-
-            df = strat.add_indicators(strat.download_ohlcv(tkr_u))
-            if df is None or df.empty:
-                continue
-            last = df.iloc[-1]
-
-            # Eligibility: structural (NORMAL) vs restrained defensive (RISK_OFF)
-            if mode == "NORMAL":
-                if not strat.is_csp_eligible(last, allow_below_200=False):
-                    continue
-                min_otm = float(CSP_NORMAL_MIN_OTM_PCT)
-                base_ma = str(CSP_STRIKE_BASE_NORMAL)
-            else:
-                if not strat.is_csp_eligible(last, allow_below_200=True):
-                    continue
-                min_otm = float(CSP_RISK_OFF_MIN_OTM_PCT_DEFENSIVE if defensive else CSP_RISK_OFF_MIN_OTM_PCT_RISKY)
-                base_ma = str(CSP_STRIKE_BASE_RISK_OFF)
-
-            best = None
-            best_score = -1e9
-
-            # Try multiple ATR distances; now biased to cushion + yield.
-            for atr_mult in CSP_ATR_MULTS:
-                c = strat.evaluate_csp_candidate(
-                    tkr_u, df, atr_mult=float(atr_mult),
-                    risk_off=(mode == "RISK_OFF"),
-                    min_otm_pct=min_otm,
-                    base_ma=base_ma,
-                )
-                if not c:
-                    continue
-
-                close = float(last.get("Close", 0) or 0)
-                strike = float(c.get("strike", 0) or 0)
-                cushion = (close - strike) / close if close > 0 else 0.0
-
-                # Score: prefer cushion first in RISK_OFF, then yield, then premium.
-                score = 0.0
-                if mode == "RISK_OFF":
-                    score += cushion * 100.0
-                    score += float(c.get("yield_pct", 0.0)) * 50.0
-                else:
-                    score += float(c.get("yield_pct", 0.0)) * 100.0
-                    score += cushion * 20.0
-                score += float(c.get("est_premium", 0.0)) / 250.0
-
-                if score > best_score:
-                    best = c
-                    best_score = score
-
-            if best:
-                best["mode"] = mode
-                best["defensive"] = bool(defensive)
-                candidates.append(best)
-
-        except Exception:
-            continue
-
-    return candidates
-
-
-def plan_ccs_from_open_lots() -> List[dict]:
-    """
-    CC ideas ONLY come from OPEN lots with no attached CC.
-    Uses strategy helper 'decide_cc_strike' and option chain selection from strategies.
-    """
-    ideas: List[dict] = []
-    lots = get_open_lots()
-    if not lots:
-        return ideas
-
-    open_cc_tickers = strat.load_open_cc_tickers()
-
-    assigned_rows = []
-    for lot in lots:
-        if (lot.get("has_open_cc") or "").strip().lower() in ("1", "true"):
-            continue
-        tkr = (lot.get("ticker") or "").strip().upper()
-        if tkr in open_cc_tickers:
-            continue
-        assigned_rows.append({
-            "ticker": tkr,
-            "shares_if_assigned": lot.get("shares") or "100",
-            "strike": lot.get("assigned_strike") or "",
-        })
-
-    if not assigned_rows:
-        return ideas
-
-    try:
-        ideas = strat.plan_covered_calls(dt.date.today(), assigned_rows, open_cc_tickers)
-    except Exception:
-        ideas = []
-    return ideas
-
-
-# ============================================================
-# Formatting
-# ============================================================
-
-def print_market_context(mkt: Dict, trading_on: bool, retire_on: bool) -> None:
-    print("\n==============================")
-    print(f"📅 RUN DATE: {dt.date.today().isoformat()}")
-    print("==============================\n")
-
-    print("📊 MARKET CONTEXT")
-    print("SPY:")
-    print(f"  Close: {mkt['spy_close']:.2f}")
-    print(f"  Above 200 SMA: {mkt['spy_above_200']}")
-    print(f"  Above 50 SMA:  {mkt['spy_above_50']}")
-    print(f"  Above 21 EMA:  {mkt['spy_above_21']}\n")
-
-    print("QQQ:")
-    print(f"  Close: {mkt['qqq_close']:.2f}")
-    print(f"  Above 50 SMA: {mkt['qqq_above_50']}\n")
-
-    print("VIX:")
-    print(f"  Close: {mkt['vix_close']:.2f}")
-    print(f"  < 18 (low): {mkt['vix_below_18']}")
-    print(f"  < 25 (ok):  {mkt['vix_below_25']}\n")
-
-    print(("🟢 INDIVIDUAL Trading ON" if trading_on else "🔴 INDIVIDUAL Trading OFF") +
-          (" | 🟢 Retirement tactical ON" if retire_on else " | 🔴 Retirement tactical OFF"))
-
-
-def build_discord_alert(
-    mkt: Dict,
-    trading_on: bool,
-    new_csps: List[dict],
-    new_ccs: List[dict],
-    planned_stocks: List[dict],
-    watch: List[dict],
-    csp_exp: List[str],
-    csp_asn: List[str],
-    cc_exp: List[str],
-    cc_call: List[str],
-    stock_opens: List[str],
-    stock_closes: List[str],
-) -> str:
-    """
-    Subscriber-safe:
-    - include market conditions, planned entries, watchlist, and maintenance outcomes
-    - exclude account sizes / caps / exposures
-    """
-    lines: List[str] = []
-    lines.append(f"📅 {dt.date.today().isoformat()} Screener")
-    lines.append(
-        f"Market: {'ON' if trading_on else 'OFF'} | SPY {mkt['spy_close']:.2f} | "
-        f"QQQ {mkt['qqq_close']:.2f} | VIX {mkt['vix_close']:.2f}"
-    )
-
-    if csp_exp or csp_asn or cc_exp or cc_call or stock_opens or stock_closes:
-        lines.append("— Maintenance —")
-        if csp_exp:  lines.append(f"CSP expired: {', '.join(csp_exp[:8])}{'…' if len(csp_exp)>8 else ''}")
-        if csp_asn:  lines.append(f"CSP assigned: {', '.join(csp_asn[:8])}{'…' if len(csp_asn)>8 else ''}")
-        if cc_exp:   lines.append(f"CC expired: {', '.join(cc_exp[:8])}{'…' if len(cc_exp)>8 else ''}")
-        if cc_call:  lines.append(f"Called away: {', '.join(cc_call[:8])}{'…' if len(cc_call)>8 else ''}")
-        if stock_closes: lines.append(f"Stocks closed: {', '.join(stock_closes[:10])}{'…' if len(stock_closes)>10 else ''}")
-        if stock_opens:  lines.append(f"Stocks opened: {', '.join(stock_opens[:10])}{'…' if len(stock_opens)>10 else ''}")
-
-    if new_csps:
-        lines.append("— New CSP ideas —")
-        for x in new_csps[:10]:
-            lines.append(f"{x['ticker']} {x['strike']:.0f}P {x['expiry']} ~${x['est_premium']:.0f}")
-
-    if new_ccs:
-        lines.append("— New CC ideas —")
-        for x in new_ccs[:10]:
-            lines.append(f"{x['ticker']} {x['strike']:.0f}C {x['expiry']} ~${x['credit_mid']*100:.0f}")
-
-    if planned_stocks:
-        lines.append("— Stock entries (planned) —")
-        for p in planned_stocks[:10]:
-            lines.append(f"{p['ticker']} {p['signal']} {p['account']} @ {p['entry_price']:.2f}")
-
-    if watch and not planned_stocks:
-        lines.append("— Watchlist —")
-        for w in watch[:12]:
-            lines.append(f"{w['ticker']} ({w['note']}) @ {w['close']:.2f}")
-
-    return "\n".join(lines)
-
-
-def print_final_exposure_summary(today: dt.date, ret_by_key: dict, ret_flagged: list) -> None:
-    exposure = compute_wheel_exposure(today)
-    week_remaining = compute_week_remaining(today)
-
-    print("\n💼 WHEEL EXPOSURE (INDIVIDUAL options)")
-    print(f"  Total exposure: ${exposure['total_exposure']:,.0f} / ${exposure['cap']:,.0f}")
-    print(f"  Weekly target:  ${exposure['weekly_target']:,.0f}")
-    print(f"  Weekly remaining: ${week_remaining:,.0f}")
-
-    stock_pos_rows = strat.load_stock_positions()
-    open_stock = [r for r in stock_pos_rows if (r.get("status") or "").upper() == "OPEN"]
-    tickers = sorted({(r.get("ticker") or "").strip().upper() for r in open_stock if (r.get("ticker") or "").strip()})
-
-    prices: Dict[str, float] = {}
-    if tickers:
-        try:
-            import yfinance as yf
-            for tkr in tickers:
-                try:
-                    df = yf.download(tkr, period="5d", interval="1d", auto_adjust=False, progress=False)
-                    if df is None or df.empty:
-                        continue
-                    close_val = df["Close"].iloc[-1]
-                    if hasattr(close_val, "iloc"):
-                        close_val = close_val.iloc[0]
-                    prices[tkr] = float(close_val)
-                except Exception:
-                    continue
-        except Exception:
-            prices = {}
-
-    mv_ret_only = strat.retirement_market_value_by_account(ret_by_key)
-    mv_stock = strat.stock_market_value_by_account(stock_pos_rows, prices)
-
-    print("\n🏦 RETIREMENT EXPOSURE (stock market value)")
-    for acct in (IRA, ROTH):
-        mv = float(mv_ret_only.get(acct, 0.0)) + float(mv_stock.get(acct, 0.0))
-        cap = float(ACCOUNT_SIZES.get(acct, 0))
-        remaining = max(cap - mv, 0.0)
-        print(f"  {acct:<5} MV ${mv:,.0f} / ${cap:,.0f} | Remaining ${remaining:,.0f}")
-
-    if ret_flagged:
-        print(f"  ⚠️ Breakeven-only flagged: {', '.join(ret_flagged)}")
-
-    indiv_stock_mv = float(mv_stock.get(INDIVIDUAL, 0.0))
-
-    print("\n📦 INDIVIDUAL STOCK CAP (non-wheel)")
-    print(
-        f"  MV ${indiv_stock_mv:,.0f} / ${float(INDIVIDUAL_STOCK_CAP):,.0f} | "
-        f"Remaining ${max(float(INDIVIDUAL_STOCK_CAP)-indiv_stock_mv, 0.0):,.0f}"
-    )
-
-
-# ============================================================
-# MAIN
-# ============================================================
 
 def run_screener() -> None:
     today = dt.date.today()
 
-    # --- Market context (always) ---
-    mkt = strat.market_context(today)
+    # ── 1. Warm data cache ────────────────────────────────────────
+    # SPY/QQQ/VIX plus every equity ticker the screener touches.
+    # Option chains are still fetched per-ticker (yfinance limitation).
+    all_equity_tickers = list({
+        "SPY", "QQQ", "^VIX",
+        *STOCKS,
+        *CSP_STOCKS,
+    })
+    cache = DataCache(all_equity_tickers)
+    cache.warm()
+    strat.set_data_cache(cache)
+
+    # ── 2. Market context + regime ────────────────────────────────
+    mkt        = fetch_market_context(cache)
     trading_on = allow_swing_trades(mkt)
-    retire_on = allow_retirement_tactical(mkt)
+    retire_on  = allow_retirement_tactical(mkt)
     csp_regime = csp_mode(mkt)
+
     print_market_context(mkt, trading_on, retire_on)
     if ENABLE_CSP:
-        # Printed once per run (build_csp_candidates prints regime details).
         print(f"\n🧾 CSP engine: ENABLED | Regime: {csp_regime}")
     else:
         print("\n🧾 CSP engine: DISABLED")
 
-    # --- Ensure files + maintenance ALWAYS ---
+    # ── 3. Ensure files + maintenance ─────────────────────────────
     ensure_wheel_files()
     strat.ensure_positions_files()
     strat.ensure_stock_files()
     strat.ensure_retirement_file()
 
-    # Retirement marks (MV + breakeven-only flags)
     ret_by_key, ret_flagged = strat.update_retirement_marks()
 
-    # ============================================================
-    # Print OPEN equity holdings (stocks only) across all accounts
-    # Excludes CSP/CC option positions; includes assigned Wheel lots
-    # ============================================================
+    # ── 4. Build + print open holdings ───────────────────────────
+    holding_tickers = collect_tickers_for_price_fetch(ret_by_key)
+    px = strat.last_close_prices(holding_tickers)
 
-    stock_rows = strat.load_stock_positions()
-    open_swing = [r for r in stock_rows if (r.get("status") or "").upper() == "OPEN"]
+    holdings, wheel_mv, mv_stock = build_holdings_and_mv(px)
+    acct_mv = compute_acct_mv(ret_by_key, mv_stock, wheel_mv)
 
-    ret_rows = strat.load_retirement_positions()
-    open_lots = get_open_lots()
+    print_open_holdings(holdings)
+    print_open_csps(today)
 
-    tickers: List[str] = []
-    tickers += [(r.get("ticker") or "") for r in open_swing]
-    tickers += [(r.get("ticker") or "") for r in ret_rows]
-    tickers += [(r.get("ticker") or "") for r in open_lots]
-    tickers = [t.strip().upper() for t in tickers if t and str(t).strip()]
-
-    px = strat.last_close_prices(tickers)
-
-    wheel_mv = 0.0
-    for lot in open_lots:
-        try:
-            tkr = (lot.get("ticker") or "").strip().upper()
-            sh = int(float(lot.get("shares") or 0))
-            cur = float(px.get(tkr, 0.0) or 0.0)
-            if sh > 0 and cur > 0:
-                wheel_mv += cur * sh
-        except Exception:
-            continue
-
-    mv_ret = strat.retirement_market_value_by_account(ret_by_key)
-    mv_stock = strat.stock_market_value_by_account(stock_rows, px)
-    indiv_stock_mv = float(mv_stock.get(INDIVIDUAL, 0.0)) + float(wheel_mv)
-
-    acct_mv = {
-        INDIVIDUAL: float(indiv_stock_mv),
-        IRA: float(mv_ret.get(IRA, 0.0)) + float(mv_stock.get(IRA, 0.0)),
-        ROTH: float(mv_ret.get(ROTH, 0.0)) + float(mv_stock.get(ROTH, 0.0)),
-    }
-
-    def _f(x, default=0.0) -> float:
-        try:
-            return float(x)
-        except Exception:
-            return float(default)
-
-    def _i(x, default=0) -> int:
-        try:
-            return int(float(x))
-        except Exception:
-            return int(default)
-
-    holdings: List[dict] = []
-
-    for r in open_swing:
-        acct = (r.get("account") or "").strip().upper()
-        tkr = (r.get("ticker") or "").strip().upper()
-        sh  = _i(r.get("shares"), 0)
-        entry = _f(r.get("entry_price"), 0.0)
-        cur = _f(px.get(tkr), _f(r.get("current_price"), 0.0))
-        pnl = (cur - entry) * sh if (entry > 0 and sh > 0 and cur > 0) else 0.0
-        pnl_pct = ((cur - entry) / entry) if (entry > 0 and cur > 0) else 0.0
-        holdings.append({"account": acct, "ticker": tkr, "shares": sh, "entry": entry, "cur": cur, "pnl": pnl, "pnl_pct": pnl_pct, "source": "SWING"})
-
-    for r in ret_rows:
-        acct = (r.get("account") or "").strip().upper()
-        tkr = (r.get("ticker") or "").strip().upper()
-        sh  = _i(r.get("shares"), 0)
-        entry = _f(r.get("entry_price"), 0.0)
-        cur = _f(px.get(tkr), _f(r.get("current_price"), 0.0))
-        pnl = (cur - entry) * sh if (entry > 0 and sh > 0 and cur > 0) else 0.0
-        pnl_pct = ((cur - entry) / entry) if (entry > 0 and cur > 0) else 0.0
-        holdings.append({"account": acct, "ticker": tkr, "shares": sh, "entry": entry, "cur": cur, "pnl": pnl, "pnl_pct": pnl_pct, "source": "RETIRE"})
-
-    for r in open_lots:
-        acct = INDIVIDUAL
-        tkr = (r.get("ticker") or "").strip().upper()
-        sh  = _i(r.get("shares"), 0)
-        cost_basis = _f(r.get("cost_basis"), 0.0)
-        entry = (cost_basis / sh) if (sh > 0 and cost_basis > 0) else 0.0
-        cur = _f(px.get(tkr), 0.0)
-        pnl = (cur * sh - cost_basis) if (cur > 0 and sh > 0 and cost_basis > 0) else 0.0
-        pnl_pct = ((cur * sh - cost_basis) / cost_basis) if (cost_basis > 0 and cur > 0) else 0.0
-        holdings.append({"account": acct, "ticker": tkr, "shares": sh, "entry": entry, "cur": cur, "pnl": pnl, "pnl_pct": pnl_pct, "source": "WHEEL"})
-
-    if holdings:
-        print("\n📌 OPEN STOCK HOLDINGS (all accounts) — Unrealized P/L")
-        print("    (Excludes CSP/CC options; includes assigned Wheel lots)\n")
-
-        holdings.sort(key=lambda x: (x["account"], x["ticker"]))
-        by_acct: Dict[str, List[dict]] = {}
-        for h in holdings:
-            by_acct.setdefault(h["account"], []).append(h)
-
-        for acct, rows in by_acct.items():
-            acct_pnl = sum(r["pnl"] for r in rows)
-            acct_mv_print = sum((r["cur"] * r["shares"]) for r in rows if r["cur"] > 0)
-            print(f"  {acct}  |  MV ${acct_mv_print:,.0f}  |  P/L ${acct_pnl:,.0f}")
-            for r in rows:
-                print(
-                    f"    {r['ticker']:<6} "
-                    f"{r['shares']:>5} sh  "
-                    f"Entry {r['entry']:>8.2f}  "
-                    f"Now {r['cur']:>8.2f}  "
-                    f"P/L {r['pnl']:>10.0f}  "
-                    f"({r['pnl_pct']*100:>6.1f}%)  "
-                    f"[{r['source']}]"
-                )
-            print("")
-    else:
-        print("\n📌 OPEN STOCK HOLDINGS: none\n")
-
-    # --- Open CSP positions (paper or live) ---
-    try:
-        csp_rows = strat.load_csv_rows(CSP_POSITIONS_FILE)
-        open_csps = []
-        for r in csp_rows:
-            if (r.get("status") or "").upper() != "OPEN":
-                continue
-            exp = (r.get("expiry") or "").strip()
-            try:
-                if exp and dt.date.fromisoformat(exp) < today:
-                    continue
-            except Exception:
-                pass
-            open_csps.append(r)
-
-        if open_csps:
-            print("\n🧾 OPEN CSP POSITIONS")
-            for r in open_csps[:10]:
-                tkr = (r.get("ticker") or "").strip().upper()
-                exp = (r.get("expiry") or "").strip()
-                strike = r.get("strike") or ""
-                prem = r.get("premium") or r.get("est_premium") or ""
-                dte_open = r.get("dte_open") or ""
-                print(f"  {tkr:<6} {exp} {strike}P | prem {prem} | dte_open {dte_open}")
-    except Exception:
-        pass
-
-    # Close any stock swing positions first (stop/target hits, paper)
-    closes = strat.update_and_close_stock_positions(today, mkt)
+    # ── 5. Close stock positions at stop / target ─────────────────
+    closes       = strat.update_and_close_stock_positions(today, mkt)
     strat.rebuild_stock_monthly_from_trades()
     stock_closed = closes.get("stops", []) + closes.get("targets", [])
 
-    # Wheel maintenance (always)
+    # ── 6. Wheel maintenance ──────────────────────────────────────
     csp_out = strat.process_csp_expirations(today)
-    cc_out = process_cc_expirations(today)
-
+    cc_out  = process_cc_expirations(today)
     create_lots_from_new_assignments(today)
     link_new_ccs_to_lots(today)
 
-    # --- Stock scan (always) ---
+    # ── 7. Stock scan + execution ─────────────────────────────────
     entries, watch = scan_stock_entries_and_watchlist()
 
-    # --- Plan+execute ONLY; printed output = "entries" (no duplicate signal list, no adds) ---
-    stock_opened: List[str] = []
-    planned_stocks: List[dict] = []
-
     if entries:
-        open_rows = [r for r in stock_rows if (r.get("status") or "").upper() == "OPEN"]
-        open_by_acct = {INDIVIDUAL: set(), IRA: set(), ROTH: set()}
-        for r in open_rows:
-            acct = (r.get("account") or "").strip().upper()
-            tkr = (r.get("ticker") or "").strip().upper()
-            if acct in open_by_acct and tkr:
-                open_by_acct[acct].add(tkr)
-
-        open_any = set().union(*open_by_acct.values())
-        open_retirement = set().union(open_by_acct.get(IRA,set()), open_by_acct.get(ROTH,set()))
-
-        print("\n📈 STOCK ENTRIES (planned)")
-        planned = 0
-        for e in entries:
-            if planned >= 3:
-                break
-
-            tkr = e["ticker"]
-            sig = e["signal"]
-            last = e["_last"]
-
-            acct_order: List[str] = []
-            if trading_on:
-                acct_order.append(INDIVIDUAL)
-            if retire_on:
-                acct_order.extend([IRA, ROTH])
-
-            picked_plan = None
-            picked_acct = None
-
-            for acct in acct_order:
-                be_only = (f"{acct}:{tkr}" in ret_by_key and (ret_by_key[f"{acct}:{tkr}"].get("flag_breakeven_only") == "1"))
-
-                existing_set = open_by_acct.get(acct, set())
-                # Prevent same ticker being opened in BOTH IRA and ROTH
-                if PREVENT_DUPLICATE_RETIREMENT_TICKERS and acct in (IRA, ROTH):
-                    existing_set = open_retirement
-                elif not ALLOW_DUPLICATE_TICKERS_ACROSS_ACCOUNTS:
-                    existing_set = open_any
-
-                plan = strat.plan_stock_trade(
-                    account=acct,
-                    ticker=tkr,
-                    signal=sig,
-                    last=last,
-                    mkt=mkt,
-                    existing_open_tickers=existing_set,
-                    acct_current_mv=float(acct_mv.get(acct, 0.0)),
-                    retirement_breakeven_only=be_only,
-                )
-                if not plan:
-                    continue
-
-                picked_plan = plan
-                picked_acct = acct
-                break
-
-            if not picked_plan or not picked_acct:
-                continue
-
-            _ = strat.execute_stock_plan(today, picked_plan)
-            stock_opened.append(f"{picked_acct}:{tkr}")
-            open_by_acct[picked_acct].add(tkr)
-            open_any.add(tkr)
-            if picked_acct in (IRA, ROTH):
-                open_retirement.add(tkr)
-            acct_mv[picked_acct] = float(acct_mv.get(picked_acct, 0.0)) + float(picked_plan["entry_price"]) * int(picked_plan["shares"])
-
-            risk = (picked_plan["entry_price"] - picked_plan["stop_price"]) * int(picked_plan["shares"])
-            print(
-                f"  {picked_acct:<5} {tkr:<6} {sig:<9} "
-                f"Entry {picked_plan['entry_price']:.2f} | Shares {picked_plan['shares']:<5} "
-                f"Stop {picked_plan['stop_price']:.2f} | Target {picked_plan['target_price']:.2f} | Risk ${risk:,.0f}"
-            )
-
-            planned_stocks.append({
-                "ticker": tkr,
-                "signal": sig,
-                "account": picked_acct,
-                "entry_price": float(picked_plan["entry_price"]),
-            })
-
-            planned += 1
-
-        if planned == 0 and watch:
-            print("\n📋 WATCHLIST")
-            for w in watch[:20]:
-                print(f"  {w['ticker']:<6} {w['note']:<13} Close {w['close']:.2f} | RSI2 {w['rsi2']:.1f}")
+        stock_opened, planned_stocks = plan_and_execute_stocks(
+            today, entries, mkt, trading_on, retire_on, acct_mv, ret_by_key
+        )
+        if not stock_opened:
+            print_watchlist(watch)
     else:
-        print("\n📋 WATCHLIST")
-        for w in watch[:20]:
-            print(f"  {w['ticker']:<6} {w['note']:<13} Close {w['close']:.2f} | RSI2 {w['rsi2']:.1f}")
+        stock_opened, planned_stocks = [], []
+        print_watchlist(watch)
 
-    # --- Wheel exposure ---
-    exposure = compute_wheel_exposure(today)
-    week_remaining = compute_week_remaining(today)
-
-    # --- CSP planning ---
+    # ── 8. CSP planning + execution ───────────────────────────────
     new_csp_orders: List[dict] = []
-    if ENABLE_CSP and csp_regime in ("NORMAL", "RISK_OFF") and week_remaining > 0:
-        candidates = build_csp_candidates(mkt, csp_regime)
-        # Block opening a new CSP on a ticker that already has ANY OPEN CSP.
-        open_csp_tickers = strat.load_open_csp_tickers(today)
-        if open_csp_tickers:
-            candidates = [c for c in candidates if (c.get('ticker') or '').strip().upper() not in open_csp_tickers]
+    if ENABLE_CSP and csp_regime in ("NORMAL", "RISK_OFF"):
+        exposure       = compute_wheel_exposure(today)
+        week_remaining = compute_week_remaining(today)
 
-        # Block opening a new CSP on a ticker that already has ANY OPEN CC (wheel call strategy).
-        open_cc_tickers = strat.load_open_cc_tickers()
-        if open_cc_tickers:
+        if week_remaining > 0:
+            candidates = build_csp_candidates(mkt, csp_regime)
+
+            # Block new CSP on any ticker already carrying an open CSP or CC.
+            open_csp_tickers = strat.load_open_csp_tickers(today)
+            open_cc_tickers  = strat.load_open_cc_tickers()
             candidates = [
                 c for c in candidates
-                if (c.get("ticker") or "").strip().upper() not in open_cc_tickers
+                if (c.get("ticker") or "").strip().upper() not in open_csp_tickers
+                and (c.get("ticker") or "").strip().upper() not in open_cc_tickers
             ]
 
-        total_remaining = max(float(exposure["cap"]) - float(exposure["total_exposure"]), 0.0)
+            total_remaining = max(float(exposure["cap"]) - float(exposure["total_exposure"]), 0.0)
+            plan = strat.plan_weekly_csp_orders(
+                candidates,
+                today=today,
+                vix_close=float(mkt["vix_close"]),
+                total_remaining_cap=total_remaining,
+                week_remaining_cap=float(week_remaining),
+                aggressive_total=int(exposure.get("aggressive_total", 0)),
+                aggressive_week=int(exposure.get("aggressive_week", 0)),
+            )
 
-        plan = strat.plan_weekly_csp_orders(
-            candidates,
-            today=today,
-            vix_close=float(mkt["vix_close"]),
-            total_remaining_cap=total_remaining,
-            week_remaining_cap=float(week_remaining),
-            aggressive_total=int(exposure.get("aggressive_total", 0)),
-            aggressive_week=int(exposure.get("aggressive_week", 0)),
-        )
+            orders = plan.get("selected", [])
+            if orders:
+                new_csp_orders = orders
+                print("\n🧾 NEW CSP IDEAS (paper execution)")
+                for o in orders:
+                    print(
+                        f"  {o['ticker']:<6} {o['strike']:.0f}P {o['expiry']} | "
+                        f"est prem ${o['est_premium']:.0f} | cash ${o['cash_reserved']:,.0f} | {o.get('tier','')}"
+                    )
 
-        orders = plan.get("selected", [])
-        if orders:
-            new_csp_orders = orders
-            print("\n🧾 NEW CSP IDEAS (paper execution)")
-            for o in orders:
-                print(
-                    f"  {o['ticker']:<6} {o['strike']:.0f}P {o['expiry']} | "
-                    f"est prem ${o['est_premium']:.0f} | cash ${o['cash_reserved']:,.0f} | {o.get('tier','')}"
-                )
+                for o in orders:
+                    csp_id, created = strat.add_csp_position_from_selected(
+                        today.isoformat(), exposure["week_id"], o
+                    )
+                    if not created:
+                        continue
 
-            for o in orders:
-                csp_id, created = strat.add_csp_position_from_selected(today.isoformat(), exposure["week_id"], o)
-                if not created:
-                    continue
+                    try:
+                        ledger_rows = strat.load_csv_rows(CSP_LEDGER_FILE)
+                        if not strat.csp_already_logged(
+                            ledger_rows, exposure["week_id"],
+                            o["ticker"], o["expiry"], float(o["strike"])
+                        ):
+                            strat.append_csp_ledger_row({
+                                "date":          today.isoformat(),
+                                "week_id":       exposure["week_id"],
+                                "ticker":        o["ticker"],
+                                "expiry":        o["expiry"],
+                                "strike":        f"{float(o['strike']):.2f}",
+                                "contracts":     int(o.get("contracts", 1)),
+                                "premium":       float(o.get("est_premium", 0.0)),
+                                "cash_reserved": float(o.get("cash_reserved", 0.0)),
+                                "tier":          o.get("tier", ""),
+                            })
+                    except Exception as e:
+                        log.warning("CSP ledger append failed for %s: %s", o.get("ticker"), e)
 
-
-                try:
-                    ledger_rows = strat.load_csv_rows(CSP_LEDGER_FILE)
-                    if not strat.csp_already_logged(
-                        ledger_rows, exposure["week_id"], o["ticker"], o["expiry"], float(o["strike"])
-                    ):
-                        strat.append_csp_ledger_row({
-                            "date": today.isoformat(),
-                            "week_id": exposure["week_id"],
-                            "ticker": o["ticker"],
-                            "expiry": o["expiry"],
-                            "strike": f"{float(o['strike']):.2f}",
-                            "contracts": int(o.get("contracts", 1)),
-                            "premium": float(o.get("est_premium", 0.0)),
-                            "cash_reserved": float(o.get("cash_reserved", 0.0)),
-                            "tier": o.get("tier", ""),
-                        })
-                except Exception:
-                    pass
-
-                record_event(
-                    date=today.isoformat(),
-                    ticker=o["ticker"],
-                    event_type="CSP_OPEN",
-                    ref_id=csp_id,
-                    expiry=o["expiry"],
-                    strike=float(o["strike"]),
-                    contracts=int(o.get("contracts", 1)),
-                    shares=int(o.get("contracts", 1)) * 100,
-                    premium=float(o.get("premium") or o.get("est_premium") or 0.0),
-                    wheel_value=float(o.get("cash_reserved", 0.0)),
-                    notes="CSP opened (planned by screener)",
-                )
+                    record_event(
+                        date=today.isoformat(),
+                        ticker=o["ticker"],
+                        event_type="CSP_OPEN",
+                        ref_id=csp_id,
+                        expiry=o["expiry"],
+                        strike=float(o["strike"]),
+                        contracts=int(o.get("contracts", 1)),
+                        shares=int(o.get("contracts", 1)) * 100,
+                        premium=float(o.get("premium") or o.get("est_premium") or 0.0),
+                        wheel_value=float(o.get("cash_reserved", 0.0)),
+                        notes="CSP opened (planned by screener)",
+                    )
+            else:
+                print("\n🧾 CSP: No new entries today.")
         else:
-            print("\n🧾 CSP: No new entries today.")
+            print("\n🧾 CSP scanning skipped (weekly cap reached).")
     else:
-        print("\n🧾 CSP scanning skipped (market filter or allocation).")
+        print("\n🧾 CSP scanning skipped (market filter or ENABLE_CSP=False).")
 
-    # --- CC planning (ALWAYS runs; inventory management) ---
+    # ── 9. CC planning + execution ────────────────────────────────
     new_cc_orders: List[dict] = plan_ccs_from_open_lots()
 
     if new_cc_orders:
@@ -830,17 +239,20 @@ def run_screener() -> None:
     else:
         print("\n📞 CC: No calls triggered today.")
 
-    # Backfill ONLY if missing events
+    # ── 10. Backfill + monthly rebuild ───────────────────────────
     if should_backfill_events():
         backfill_open_events_from_positions(today)
 
     rebuild_monthly_from_events()
 
-    # --- FINAL: refresh marks AFTER all paper execution + print final exposure ---
+    # ── 11. Final exposure + refresh marks ───────────────────────
     ret_by_key, ret_flagged = strat.update_retirement_marks()
-    print_final_exposure_summary(today, ret_by_key, ret_flagged)
+    _, wheel_mv_final, mv_stock_final = build_holdings_and_mv(
+        strat.last_close_prices(collect_tickers_for_price_fetch(ret_by_key))
+    )
+    print_final_exposure_summary(today, ret_by_key, ret_flagged, mv_stock_final, wheel_mv_final)
 
-    # --- Discord (alerts only) ---
+    # ── 12. Discord alert ────────────────────────────────────────
     alert = build_discord_alert(
         mkt=mkt,
         trading_on=trading_on,

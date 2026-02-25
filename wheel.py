@@ -16,6 +16,10 @@ import datetime as dt
 import os
 from typing import Dict, List, Optional
 
+import pandas as pd
+import yfinance as yf
+
+from utils import get_logger, iso_week_id, safe_float, safe_int, atomic_write
 from config import (
     WHEEL_EVENTS_FILE,
     WHEEL_LOTS_FILE,
@@ -25,6 +29,8 @@ from config import (
     CSP_POSITIONS_FILE,
     CC_POSITIONS_FILE,
 )
+
+log = get_logger(__name__)
 
 EVENT_FIELDS = [
     "event_id",
@@ -61,8 +67,8 @@ LOT_FIELDS = [
 # ----------------------------
 
 def _iso_week_id(d: dt.date) -> str:
-    y, w, _ = d.isocalendar()
-    return f"{y}-W{w:02d}"
+    # Thin alias — canonical implementation lives in utils.iso_week_id.
+    return iso_week_id(d)
 
 
 def _ensure_trailing_newline(path: str) -> None:
@@ -119,9 +125,8 @@ def _read_rows(path: str) -> List[dict]:
 
 
 def _write_rows(path: str, rows: List[dict], fieldnames: List[str]) -> None:
-    """Write rows with stable newlines for consistent CSV formatting across platforms."""
-    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
-    with open(path, "w", newline="") as f:
+    """Atomic write: new content is staged in a .tmp file then renamed into place."""
+    def _write(f):
         w = csv.DictWriter(
             f,
             fieldnames=fieldnames,
@@ -131,6 +136,7 @@ def _write_rows(path: str, rows: List[dict], fieldnames: List[str]) -> None:
         w.writeheader()
         for r in rows:
             w.writerow({k: r.get(k, "") for k in fieldnames})
+    atomic_write(path, _write)
 
 
 def ensure_wheel_files() -> None:
@@ -160,27 +166,11 @@ def ensure_wheel_files() -> None:
 
 
 def _safe_float(v: object, default: float = 0.0) -> float:
-    try:
-        if v is None:
-            return default
-        s = str(v).strip()
-        if s == "" or s.upper() == "NAN":
-            return default
-        return float(s)
-    except Exception:
-        return default
+    return safe_float(v, default)
 
 
 def _safe_int(v: object, default: int = 0) -> int:
-    try:
-        if v is None:
-            return default
-        s = str(v).strip()
-        if s == "" or s.upper() == "NAN":
-            return default
-        return int(float(s))
-    except Exception:
-        return default
+    return safe_int(v, default)
 
 
 # ----------------------------
@@ -226,8 +216,9 @@ def record_event(**kwargs) -> None:
         existing = _read_rows(WHEEL_EVENTS_FILE)
         if any((r.get("event_id") or "") == row["event_id"] for r in existing):
             return
-    except Exception:
-        pass
+    except Exception as e:
+        # Non-fatal but worth knowing — if this fails we may write a duplicate event.
+        log.warning("wheel event idempotency check failed (event_id=%s): %s", row["event_id"], e)
 
     # Critical: avoid "glued rows" if file lacks trailing newline
     _ensure_trailing_newline(WHEEL_EVENTS_FILE)
@@ -391,9 +382,6 @@ def process_cc_expirations(today: dt.date) -> Dict[str, List[str]]:
     expired: List[str] = []
     called: List[str] = []
 
-    import yfinance as yf
-    import pandas as pd
-
     changed = False
     for r in cc_rows:
         if (r.get("status") or "").upper() != "OPEN":
@@ -413,22 +401,28 @@ def process_cc_expirations(today: dt.date) -> Dict[str, List[str]]:
 
         underlying_close: Optional[float] = None
         try:
+            # Same fix as CSP path: filter to exact expiry date rather than using
+            # iloc[-1], which can return Monday's data for a Friday-expiry contract.
             start = (exp - dt.timedelta(days=7)).isoformat()
-            end = (exp + dt.timedelta(days=1)).isoformat()
-            df = yf.download(
-                tkr,
-                start=start,
-                end=end,
-                interval="1d",
-                auto_adjust=False,
-                progress=False,
-            )
+            end   = (exp + dt.timedelta(days=2)).isoformat()
+            df = yf.download(tkr, start=start, end=end, interval="1d",
+                             auto_adjust=False, progress=False)
             df.dropna(inplace=True)
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
             if not df.empty:
-                underlying_close = float(df["Close"].iloc[-1])
-        except Exception:
+                df.index = pd.to_datetime(df.index)
+                exp_ts = pd.Timestamp(exp)
+                exact = df[df.index.normalize() == exp_ts]
+                if not exact.empty:
+                    underlying_close = float(exact["Close"].iloc[-1])
+                else:
+                    # Holiday fallback: use nearest prior close.
+                    prior = df[df.index.normalize() < exp_ts]
+                    if not prior.empty:
+                        underlying_close = float(prior["Close"].iloc[-1])
+        except Exception as e:
+            log.warning("CC expiry price fetch failed for %s exp %s: %s", tkr, exp_str, e)
             underlying_close = None
 
         r["close_date"] = exp.isoformat()

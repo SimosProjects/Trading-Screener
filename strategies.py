@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import csv
 import datetime as dt
+import math
 import os
 from typing import Dict, List, Optional, Tuple
 
@@ -10,6 +11,7 @@ import pandas as pd
 import yfinance as yf
 import ta
 
+from utils import get_logger, iso_week_id, safe_float, safe_int, atomic_write
 from config import (
     # market data
     DATA_PERIOD, DATA_INTERVAL,
@@ -50,6 +52,8 @@ from config import (
     CSP_MAX_AGGRESSIVE_TOTAL, CSP_MAX_AGGRESSIVE_PER_WEEK,
 )
 
+log = get_logger(__name__)
+
 # Derived: max underlying price allowed for CSPs (e.g., $6,500 cap => $65/share for 1 contract)
 CSP_MAX_SHARE_PRICE = float(CSP_MAX_CASH_PER_TRADE) / 100.0
 
@@ -58,8 +62,27 @@ CSP_MAX_SHARE_PRICE = float(CSP_MAX_CASH_PER_TRADE) / 100.0
 # Data / indicators
 # ============================================================
 
+# Module-level cache reference.  Set by the screener orchestrator before
+# the run starts via set_data_cache().  When None, every call falls back
+# to a direct yfinance download (safe but slow — same as before).
+_cache = None
+
+
+def set_data_cache(cache) -> None:
+    """Inject the pre-warmed DataCache for this run."""
+    global _cache
+    _cache = cache
+
+
 def download_ohlcv(ticker: str, period: str = DATA_PERIOD, interval: str = DATA_INTERVAL) -> pd.DataFrame:
-    df = yf.download(ticker, period=period, interval=interval, auto_adjust=False, progress=False)
+    # Use the session cache when available to avoid redundant network calls.
+    if _cache is not None and _cache.has(ticker):
+        return _cache.ohlcv(ticker)
+    try:
+        df = yf.download(ticker, period=period, interval=interval, auto_adjust=False, progress=False)
+    except Exception as e:
+        log.warning("download_ohlcv failed for %s: %s", ticker, e)
+        return pd.DataFrame()
     if df is None or df.empty:
         return pd.DataFrame()
     df.dropna(inplace=True)
@@ -90,8 +113,10 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["ADX_14"] = ta.trend.adx(high=high, low=low, close=close, window=14)
 
     df["VOL_SMA_10"] = volume.rolling(window=10).mean()
-    df["HIGH_20"] = close.rolling(window=20).max()
-    df["LOW_20"] = close.rolling(window=20).min()
+    # shift(1): compare today's close against the PRIOR 20-day high so the breakout
+    # condition (close > HIGH_20) can actually be true on the signal bar.
+    df["HIGH_20"] = close.shift(1).rolling(window=20).max()
+    df["LOW_20"]  = close.shift(1).rolling(window=20).min()
 
     return df
 
@@ -286,11 +311,12 @@ def load_retirement_positions() -> List[dict]:
 
 def write_retirement_positions(rows: List[dict]) -> None:
     ensure_retirement_file()
-    with open(RETIREMENT_POSITIONS_FILE, "w", newline="") as f:
+    def _write(f):
         w = csv.DictWriter(f, fieldnames=RETIREMENT_FIELDS)
         w.writeheader()
         for r in rows:
             w.writerow({k: r.get(k, "") for k in RETIREMENT_FIELDS})
+    atomic_write(RETIREMENT_POSITIONS_FILE, _write)
 
 
 def retirement_flag_breakeven_only(entry_price: float, current_price: float) -> bool:
@@ -317,7 +343,8 @@ def update_retirement_marks() -> Tuple[Dict[str, dict], List[str]]:
                 df.columns = df.columns.get_level_values(0)
             if not df.empty:
                 last_close[tkr] = float(df["Close"].iloc[-1])
-        except Exception:
+        except Exception as e:
+            log.warning("retirement mark price fetch failed for %s: %s", tkr, e)
             continue
 
     flagged = set()
@@ -447,11 +474,12 @@ def load_stock_positions() -> List[dict]:
 
 def write_stock_positions(rows: List[dict]) -> None:
     ensure_stock_files()
-    with open(STOCK_POSITIONS_FILE, "w", newline="") as f:
+    def _write(f):
         w = csv.DictWriter(f, fieldnames=STOCK_POS_FIELDS)
         w.writeheader()
         for r in rows:
             w.writerow({k: r.get(k, "") for k in STOCK_POS_FIELDS})
+    atomic_write(STOCK_POSITIONS_FILE, _write)
 
 
 def append_stock_trade(row: dict) -> None:
@@ -727,10 +755,24 @@ def last_close_prices(tickers: List[str]) -> Dict[str, float]:
     """
     Fetch last available daily Close for each ticker.
     Returns { "AAPL": 195.12, ... }
+
+    Uses the session cache when warmed; falls back to a yfinance batch call only
+    for tickers the cache doesn't have.  Cache and fallback results are merged so
+    no prices are lost when some tickers are missing from the cache.
     """
     tickers = sorted({(t or "").strip().upper() for t in tickers if (t or "").strip()})
     if not tickers:
         return {}
+
+    prices: Dict[str, float] = {}
+
+    if _cache is not None:
+        prices = _cache.last_closes(tickers)
+        missing = [t for t in tickers if t not in prices]
+        if not missing:
+            return prices
+        # Only fetch what the cache missed; merge results below.
+        tickers = missing
 
     try:
         df = yf.download(
@@ -741,10 +783,9 @@ def last_close_prices(tickers: List[str]) -> Dict[str, float]:
             progress=False,
             group_by="column",
         )
-    except Exception:
-        return {}
-
-    prices: Dict[str, float] = {}
+    except Exception as e:
+        log.warning("last_close_prices batch fetch failed: %s", e)
+        return prices  # return whatever the cache had rather than empty dict
 
     # Multi-ticker download => columns like ('Close','AAPL')
     if isinstance(df.columns, pd.MultiIndex):
@@ -791,7 +832,8 @@ def update_and_close_stock_positions(today: dt.date, mkt: Dict[str, float | bool
                 df.columns = df.columns.get_level_values(0)
             if not df.empty:
                 prices[tkr] = float(df["Close"].iloc[-1])
-        except Exception:
+        except Exception as e:
+            log.warning("stock position price fetch failed for %s: %s", tkr, e)
             continue
 
     stops: List[str] = []
@@ -891,8 +933,8 @@ def update_and_close_stock_positions(today: dt.date, mkt: Dict[str, float | bool
 # ============================================================
 
 def _iso_week_id(d: dt.date) -> str:
-    y, w, _ = d.isocalendar()
-    return f"{y}-W{w:02d}"
+    # Thin alias — canonical implementation lives in utils.iso_week_id.
+    return iso_week_id(d)
 
 
 def ensure_positions_files() -> None:
@@ -914,11 +956,12 @@ def load_csv_rows(path: str) -> List[dict]:
 
 
 def write_csv_rows(path: str, rows: List[dict], fieldnames: List[str]) -> None:
-    with open(path, "w", newline="") as f:
+    def _write(f):
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
         for r in rows:
             w.writerow(r)
+    atomic_write(path, _write)
 
 
 
@@ -954,7 +997,12 @@ def append_csp_ledger_row(row: dict) -> None:
 def csp_already_logged(ledger_rows: List[dict], week_id: str, ticker: str, expiry: str, strike: float) -> bool:
     for r in ledger_rows:
         try:
-            if r["week_id"] == week_id and r["ticker"] == ticker and r["expiry"] == expiry and float(r["strike"]) == float(strike):
+            if (r["week_id"] == week_id
+                    and r["ticker"] == ticker
+                    and r["expiry"] == expiry
+                    # Tolerance of half a cent handles float->string->float round-trips
+                    # (e.g. 50.0 stored as "50.0" parsed back as 50.000000001).
+                    and abs(float(r["strike"]) - float(strike)) < 0.005):
                 return True
         except Exception:
             continue
@@ -1062,9 +1110,11 @@ def evaluate_csp_candidate(
 
         bid = float(row.get("bid", 0) or 0)
         ask = float(row.get("ask", 0) or 0)
-        oi = int(row.get("openInterest", 0) or 0)
-        vol = int(row.get("volume", 0) or 0)
-        iv = float(row.get("impliedVolatility", 0) or 0)
+        _oi  = float(row.get("openInterest", 0) or 0)
+        _vol = float(row.get("volume", 0) or 0)
+        oi  = int(_oi)  if math.isfinite(_oi)  else 0
+        vol = int(_vol) if math.isfinite(_vol) else 0
+        iv  = float(row.get("impliedVolatility", 0) or 0)
 
         if bid < CSP_MIN_BID or ask <= 0 or ask < bid:
             return None
@@ -1100,7 +1150,8 @@ def evaluate_csp_candidate(
             "atr_mult": float(atr_mult),
             "reason": f"Strike≈{base_ma}-{atr_mult:.2f}*ATR, minOTM={min_otm_pct:.0%} (raw {raw_strike:.2f})",
         }
-    except Exception:
+    except Exception as e:
+        log.warning("evaluate_csp_candidate failed for %s: %s", ticker, e)
         return None
 
 
@@ -1323,18 +1374,33 @@ def process_csp_expirations(today: dt.date) -> Dict[str, List[str]]:
 
         underlying_close = None
         try:
+            # Fetch a window around expiry; we then filter to the exact expiry date.
+            # Using iloc[-1] on a wider range is wrong — the window end (+1 day) can
+            # include the next trading session (e.g. Monday after a Friday expiry).
             start = (exp - dt.timedelta(days=7)).isoformat()
-            end = (exp + dt.timedelta(days=1)).isoformat()
+            end   = (exp + dt.timedelta(days=2)).isoformat()
             df = yf.download(ticker, start=start, end=end, interval="1d", auto_adjust=False, progress=False)
             df.dropna(inplace=True)
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
             if not df.empty:
-                underlying_close = float(df["Close"].iloc[-1])
-        except Exception:
+                # Prefer the exact expiry date; fall back to the nearest prior close
+                # (handles holidays where the expiry date itself has no trading data).
+                df.index = pd.to_datetime(df.index)
+                exp_ts = pd.Timestamp(exp)
+                exact = df[df.index.normalize() == exp_ts]
+                if not exact.empty:
+                    underlying_close = float(exact["Close"].iloc[-1])
+                else:
+                    prior = df[df.index.normalize() < exp_ts]
+                    if not prior.empty:
+                        underlying_close = float(prior["Close"].iloc[-1])
+        except Exception as e:
+            log.warning("CSP expiry price fetch failed for %s exp %s: %s", ticker, exp_str, e)
             underlying_close = None
 
         if underlying_close is None:
+            log.warning("CSP expiry: could not determine close for %s %s — skipping", ticker, exp_str)
             continue
 
         r["underlying_close_at_expiry"] = f"{underlying_close:.2f}"
@@ -1440,7 +1506,8 @@ def plan_covered_calls(today: dt.date, assigned_rows: List[dict], open_cc_ticker
                 "credit_mid": float(mid),
                 "reason": f"Wheel CC vs assigned {assigned_strike:.0f}",
             })
-        except Exception:
+        except Exception as e:
+            log.warning("plan_covered_calls failed for %s: %s", ticker, e)
             continue
 
     return ideas

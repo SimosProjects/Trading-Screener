@@ -35,14 +35,15 @@ Thumbs.db
 *.swp
 
 # -----------------------
-# Jupyter (if you use it)
+# Jupyter
 # -----------------------
 .ipynb_checkpoints/
 
 # -----------------------
-# Data outputs (your request)
+# Data outputs
 # -----------------------
 *.csv
+Plan/
 
 # Optional: also ignore other common data artifacts
 *.parquet
