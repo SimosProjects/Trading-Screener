@@ -164,24 +164,32 @@ def plan_ccs_from_open_lots() -> List[dict]:
     """
     Generate CC candidates only for OPEN lots with no active CC.
 
-    Does not open a CC on any ticker that already has one in cc_positions.csv.
+    Each lot is checked independently — two lots for the same ticker (two
+    separate CSP assignment cycles) are both eligible and each gets its own
+    CC idea, keyed by lot_id rather than ticker so the linking step can attach
+    the right CC to the right lot.
     """
     ideas: List[dict] = []
     lots = get_open_lots()
     if not lots:
         return ideas
 
-    open_cc_tickers = strat.load_open_cc_tickers()
+    open_cc_lot_ids = strat.load_open_cc_lot_ids()
 
     assigned_rows = []
     for lot in lots:
         if (lot.get("has_open_cc") or "").strip().lower() in ("1", "true"):
             continue
+        lot_id = (lot.get("lot_id") or "").strip()
+        # Skip this lot if it already has an open CC recorded against it.
+        if lot_id and lot_id in open_cc_lot_ids:
+            continue
         tkr = (lot.get("ticker") or "").strip().upper()
-        if tkr in open_cc_tickers:
+        if not tkr:
             continue
         assigned_rows.append({
             "ticker":                  tkr,
+            "lot_id":                  lot_id,           # carries through to CC record
             "shares_if_assigned":      lot.get("shares") or "100",
             "strike":                  lot.get("assigned_strike") or "",
             # Prefer net_cost_basis (cost_basis reduced by all CC premiums collected so far).
@@ -196,7 +204,7 @@ def plan_ccs_from_open_lots() -> List[dict]:
         return ideas
 
     try:
-        ideas = strat.plan_covered_calls(dt.date.today(), assigned_rows, open_cc_tickers)
+        ideas = strat.plan_covered_calls(dt.date.today(), assigned_rows, open_cc_lot_ids)
     except Exception as e:
         log.warning("plan_covered_calls failed: %s", e)
         ideas = []

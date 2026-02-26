@@ -281,6 +281,7 @@ CC_POSITIONS_COLUMNS = [
     "status",
     "close_date",
     "close_type",
+    "source_lot_id",   # lot_id of the wheel lot this CC was written against
     "notes",
 ]
 
@@ -379,3 +380,24 @@ CC_MIN_BID = 0.05
 # current_price / cc_strike >= this value (i.e., within ~3% of being called away).
 # Informational only — no automated roll execution.
 CC_ROLL_SIGNAL_THRESHOLD = 0.97
+# ============================================================
+# Slippage & fill model  (paper trading realism)
+# ============================================================
+# Applied at every paper "execution" so P&L reflects realistic fills,
+# not the optimistic mid-price / prior-close assumption.
+#
+# --- Stock entries ---
+# Signal detected on yesterday's close; model next-morning fill as
+# close + STOCK_SLIPPAGE_PER_SHARE.  Exits are not slipped.
+STOCK_SLIPPAGE_PER_SHARE = 0.08      # ~$0.08/share ≈ 0.1-0.2% on a $50 stock
+
+# --- Options sells (CSP open, CC open) ---
+# fill_price = bid + (mid - bid) * OPT_SELL_FILL_PCT
+OPT_SELL_FILL_PCT = 0.70             # 70% of way from bid to mid
+
+# --- Options buys (CSP take-profit close) ---
+# fill_price = ask - (ask - mid) * OPT_BUY_FILL_PCT
+OPT_BUY_FILL_PCT = 0.70              # 70% of way from ask to mid
+
+# --- Commissions ---
+OPT_COMMISSION_PER_CONTRACT = 0.65   # $0.65/contract (typical retail)

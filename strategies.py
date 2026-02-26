@@ -59,6 +59,12 @@ from config import (
     CC_UNDERWATER_MILD_PCT, CC_UNDERWATER_DEEP_PCT,
     CC_STRIKE_FLOOR_BELOW_CURRENT_PCT,
     CC_MIN_BID,
+
+    # slippage / fill model
+    STOCK_SLIPPAGE_PER_SHARE,
+    OPT_SELL_FILL_PCT,
+    OPT_BUY_FILL_PCT,
+    OPT_COMMISSION_PER_CONTRACT,
 )
 
 log = get_logger(__name__)
@@ -1743,13 +1749,17 @@ def _round_call_strike_to_chain(calls_df: pd.DataFrame, target_strike: float) ->
     return above[0]
 
 
-def plan_covered_calls(today: dt.date, assigned_rows: List[dict], open_cc_tickers: set) -> List[dict]:
+def plan_covered_calls(today: dt.date, assigned_rows: List[dict], open_cc_lot_ids: set) -> List[dict]:
     ideas: List[dict] = []
     for pos in assigned_rows:
         ticker = (pos.get("ticker") or "").strip().upper()
         if not ticker:
             continue
-        if ticker in open_cc_tickers:
+
+        # Per-lot guard: skip if this specific lot already has an open CC.
+        # Falls back to ticker-level check for legacy rows without lot_id.
+        lot_id = (pos.get("lot_id") or "").strip()
+        if lot_id and lot_id in open_cc_lot_ids:
             continue
 
         try:
@@ -1829,16 +1839,21 @@ def plan_covered_calls(today: dt.date, assigned_rows: List[dict], open_cc_ticker
                 log.info("CC %s: strike %.0f bid %.2f below min or inverted; skipping", ticker, strike, bid)
                 continue
             mid = (bid + ask) / 2.0
+            # Retail call sells fill between bid and mid, not at mid.
+            fill_credit  = bid + (mid - bid) * OPT_SELL_FILL_PCT
+            commission   = OPT_COMMISSION_PER_CONTRACT * contracts
+            net_credit   = fill_credit - (commission / 100.0)  # per-share net
 
             ideas.append({
-                "ticker":    ticker,
-                "expiry":    exp_str,
-                "strike":    float(strike),
-                "contracts": int(contracts),
-                "credit_mid": float(mid),
-                "reason":    f"{cc_reason} | basis {net_cost_basis_per_share:.2f}",
-                # Inherit account from the lot that generated this CC idea.
-                "account":   (pos.get("account") or INDIVIDUAL).strip().upper(),
+                "ticker":        ticker,
+                "expiry":        exp_str,
+                "strike":        float(strike),
+                "contracts":     int(contracts),
+                "credit_mid":    float(net_credit),   # net per-share after fill model + commission
+                "reason":        f"{cc_reason} | basis {net_cost_basis_per_share:.2f}",
+                # Inherit account and lot_id from the lot that generated this CC idea.
+                "account":       (pos.get("account") or INDIVIDUAL).strip().upper(),
+                "source_lot_id": lot_id,              # links CC back to exact lot
             })
         except Exception as e:
             log.warning("plan_covered_calls failed for %s: %s", ticker, e)
@@ -1848,11 +1863,29 @@ def plan_covered_calls(today: dt.date, assigned_rows: List[dict], open_cc_ticker
 
 
 def load_open_cc_tickers() -> set:
+    """Return the set of tickers that already have an open CC.
+    Kept for backward-compat; prefer load_open_cc_lot_ids for new code."""
     ensure_positions_files()
     rows = load_csv_rows(CC_POSITIONS_FILE)
     return {(r.get("ticker") or "").strip().upper()
             for r in rows
             if (r.get("status") or "").upper() == "OPEN"}
+
+
+def load_open_cc_lot_ids() -> set:
+    """Return the set of source_lot_ids that already have an open CC.
+
+    This is the per-lot guard used by plan_ccs_from_open_lots so that two
+    lots for the same ticker (two separate CSP assignment cycles) are handled
+    independently.  Legacy CC rows without a source_lot_id are excluded from
+    this set — they are handled by the ticker-level fallback in link_new_ccs_to_lots.
+    """
+    ensure_positions_files()
+    rows = load_csv_rows(CC_POSITIONS_FILE)
+    return {(r.get("source_lot_id") or "").strip()
+            for r in rows
+            if (r.get("status") or "").upper() == "OPEN"
+            and (r.get("source_lot_id") or "").strip()}
 
 
 def make_cc_position_id(ticker: str, expiry: str, strike: float, open_date: str) -> str:
@@ -1878,6 +1911,7 @@ def add_cc_position_from_candidate(today: str, idea: dict) -> str:
         "status": "OPEN",
         "close_date": "",
         "close_type": "",
+        "source_lot_id": (idea.get("source_lot_id") or "").strip(),
         "notes": idea.get("reason", ""),
     })
     write_csv_rows(CC_POSITIONS_FILE, rows, CC_POSITIONS_COLUMNS)

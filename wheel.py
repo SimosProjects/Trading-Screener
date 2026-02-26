@@ -357,7 +357,15 @@ def create_lots_from_new_assignments(today: dt.date) -> None:
 
 
 def link_new_ccs_to_lots(today: dt.date) -> None:
-    """Attach OPEN CCs in cc_positions.csv to OPEN lots of the same ticker if not already linked."""
+    """Attach OPEN CCs in cc_positions.csv to their OPEN lots.
+
+    Matching priority:
+      1. source_lot_id (exact lot match) — used for all new CCs that carry
+         the lot_id from plan_ccs_from_open_lots.
+      2. ticker-only fallback — for legacy CC rows written before source_lot_id
+         was introduced.  Only applied when exactly one unlinked lot exists for
+         that ticker to avoid ambiguous assignments.
+    """
     ensure_wheel_files()
     lots = _read_rows(WHEEL_LOTS_FILE)
     if not lots:
@@ -366,26 +374,51 @@ def link_new_ccs_to_lots(today: dt.date) -> None:
     cc_rows = _read_rows(CC_POSITIONS_FILE)
     open_ccs = [r for r in cc_rows if (r.get("status") or "").upper() == "OPEN"]
 
-    cc_by_ticker: Dict[str, dict] = {}
+    # Build lookup: source_lot_id → cc row (exact match)
+    cc_by_lot_id: Dict[str, dict] = {}
     for r in open_ccs:
+        lid = (r.get("source_lot_id") or "").strip()
+        if lid:
+            cc_by_lot_id[lid] = r
+
+    # Build fallback: ticker → [cc rows without a source_lot_id]
+    legacy_ccs_by_ticker: Dict[str, List[dict]] = {}
+    for r in open_ccs:
+        if (r.get("source_lot_id") or "").strip():
+            continue  # already handled by exact-match path
         t = (r.get("ticker") or "").strip().upper()
         if t:
-            cc_by_ticker[t] = r
+            legacy_ccs_by_ticker.setdefault(t, []).append(r)
 
     changed = False
     for lot in lots:
         if (lot.get("status") or "").upper() != "OPEN":
             continue
+        if (lot.get("has_open_cc") or "").strip() in ("1", "true", "TRUE"):
+            continue
 
+        lot_id = (lot.get("lot_id") or "").strip()
         t = (lot.get("ticker") or "").strip().upper()
         if not t:
             continue
 
-        if (lot.get("has_open_cc") or "").strip() in ("1", "true", "TRUE"):
-            continue
+        # Path 1: exact lot match via source_lot_id
+        cc = cc_by_lot_id.get(lot_id) if lot_id else None
 
-        cc = cc_by_ticker.get(t)
-        if not cc:
+        # Path 2: legacy ticker fallback — only safe when there's exactly one
+        # unmatched CC for this ticker (avoids linking the wrong CC to the wrong lot)
+        if cc is None:
+            candidates = legacy_ccs_by_ticker.get(t, [])
+            if len(candidates) == 1:
+                cc = candidates[0]
+            elif len(candidates) > 1:
+                log.warning(
+                    "link_new_ccs_to_lots: %d legacy CCs for ticker %s with no lot_id; "
+                    "cannot safely link — add source_lot_id to CC records to resolve",
+                    len(candidates), t,
+                )
+
+        if cc is None:
             continue
 
         cc_id = (cc.get("id") or "").strip()
@@ -397,7 +430,7 @@ def link_new_ccs_to_lots(today: dt.date) -> None:
         changed = True
 
         # Premium correctness:
-        # In this project, cc_positions.csv stores TOTAL premium dollars as "premium".
+        # cc_positions.csv stores TOTAL premium dollars as "premium".
         # Do NOT recompute as credit_mid * 100 * contracts unless premium is missing.
         prem = 0.0
         if cc.get("premium") not in (None, "", "NaN", "nan"):
@@ -417,7 +450,7 @@ def link_new_ccs_to_lots(today: dt.date) -> None:
             shares=_safe_int(cc.get("contracts"), 0) * 100,
             premium=prem,
             wheel_value=0.0,
-            notes=f"Linked CC {cc_id} to lot {lot.get('lot_id', '')}",
+            notes=f"Linked CC {cc_id} to lot {lot_id or t}",
         )
 
     if changed:
