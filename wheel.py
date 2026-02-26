@@ -73,10 +73,6 @@ LOT_FIELDS = [
 # Helpers
 # ----------------------------
 
-def _iso_week_id(d: dt.date) -> str:
-    # Thin alias — canonical implementation lives in utils.iso_week_id.
-    return iso_week_id(d)
-
 
 def _ensure_trailing_newline(path: str) -> None:
     """Ensure an existing file ends with a newline so subsequent appends can't glue rows together."""
@@ -120,12 +116,14 @@ def _read_rows(path: str) -> List[dict]:
                 if len(parts) != len(header):
                     continue
                 rows.append({header[i]: parts[i] for i in range(len(header))})
-    except Exception:
+    except Exception as e:
+        log.warning("_read_rows: primary CSV read failed for %s, trying DictReader fallback: %s", path, e)
         # Fall back to DictReader if something odd happened; still might fail if file is corrupted
         try:
             with open(path, "r", newline="") as f:
                 return list(csv.DictReader(f))
-        except Exception:
+        except Exception as e2:
+            log.error("_read_rows: DictReader fallback also failed for %s: %s", path, e2)
             return []
 
     return rows
@@ -210,7 +208,9 @@ def record_event(**kwargs) -> None:
     date_str = (kwargs.get("date") or "").strip() or dt.date.today().isoformat()
     try:
         d = dt.date.fromisoformat(date_str)
-    except Exception:
+    except Exception as e:
+        log.warning("record_event: bad date %r for %s/%s, using today: %s",
+                    date_str, kwargs.get("ticker", "?"), kwargs.get("event_type", "?"), e)
         d = dt.date.today()
 
     ticker_norm = (kwargs.get("ticker") or "").strip().upper()
@@ -226,7 +226,7 @@ def record_event(**kwargs) -> None:
     )
     row["account"] = (kwargs.get("account") or INDIVIDUAL).strip().upper()
     row["date"] = date_str
-    row["week_id"] = (kwargs.get("week_id") or "").strip() or _iso_week_id(d)
+    row["week_id"] = (kwargs.get("week_id") or "").strip() or iso_week_id(d)
     row["ticker"] = ticker_norm
     row["event_type"] = event_type_norm
     row["ref_id"] = ref_norm
@@ -425,7 +425,9 @@ def process_cc_expirations(today: dt.date) -> Dict[str, List[str]]:
         exp_str = (r.get("expiry") or "").strip()
         try:
             exp = dt.date.fromisoformat(exp_str)
-        except Exception:
+        except Exception as e:
+            log.warning("process_cc_expirations: bad expiry %r for %s: %s",
+                        exp_str, r.get("ticker", "?"), e)
             continue
 
         if exp > today:
@@ -624,7 +626,7 @@ def compute_wheel_exposure(
     total = 0.0
     aggressive_total = 0
     aggressive_week = 0
-    week_id = _iso_week_id(today)
+    week_id = iso_week_id(today)
 
     # CSP collateral — only positions belonging to this account
     csp_rows = _read_rows(CSP_POSITIONS_FILE)
@@ -639,7 +641,9 @@ def compute_wheel_exposure(
             exp = dt.date.fromisoformat((r.get("expiry") or "").strip())
             if exp < today:
                 continue
-        except Exception:
+        except Exception as e:
+            log.debug("compute_wheel_exposure: bad expiry for %s %s: %s",
+                      acct, r.get("ticker", "?"), e)
             pass
 
         total += _safe_float(r.get("cash_reserved"), 0.0)

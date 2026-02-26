@@ -116,8 +116,14 @@ def run_screener() -> None:
 
     # ── 5. Close stock positions at stop / target ─────────────────
     closes       = strat.update_and_close_stock_positions(today, mkt)
+    ret_stops    = strat.close_retirement_stops(today)
     strat.rebuild_stock_monthly_from_trades()
     stock_closed = closes.get("stops", []) + closes.get("targets", [])
+
+    if ret_stops.get("stopped"):
+        print("\n🛑 RETIREMENT STOPS TRIGGERED")
+        for s in ret_stops["stopped"]:
+            print(f"  {s}")
 
     # ── 6. Wheel maintenance ──────────────────────────────────────
     csp_tp_out = strat.process_csp_take_profits(today)
@@ -340,6 +346,7 @@ def run_screener() -> None:
         cc_call=cc_out.get("called_away", []),
         stock_opens=stock_opened,
         stock_closes=stock_closed,
+        ret_stopped=ret_stops.get("stopped", []),
     )
     send_discord(alert)
 

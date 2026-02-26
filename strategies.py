@@ -29,6 +29,7 @@ from config import (
     INDIVIDUAL_STOCK_CAP,
     RETIREMENT_MAX_EQUITY_UTIL_PCT,
     RETIREMENT_BREAKEVEN_ONLY_DD_PCT,
+    RETIREMENT_STOP_LOSS_PCT,
 
     # stock rules
     STOCK_REQUIRE_NEXTDAY_VALIDATION,
@@ -197,7 +198,8 @@ def is_eligible(stock_row: pd.Series) -> bool:
         sma50 = float(stock_row["SMA_50"])
         ema21 = float(stock_row["EMA_21"])
         adx = float(stock_row["ADX_14"])
-    except Exception:
+    except Exception as e:
+        log.debug("is_eligible: indicator field missing or non-numeric: %s", e)
         return False
     return bool(close > sma50 and ema21 > sma50 and adx > 20)
 
@@ -218,7 +220,8 @@ def is_csp_eligible(stock_row: pd.Series, *, allow_below_200: bool = False) -> b
         sma50 = float(stock_row.get("SMA_50", 0) or 0)
         sma200 = float(stock_row.get("SMA_200", 0) or 0)
         adx = float(stock_row.get("ADX_14", 0) or 0)
-    except Exception:
+    except Exception as e:
+        log.debug("is_csp_eligible: indicator field missing or non-numeric: %s", e)
         return False
 
     if sma50 <= 0:
@@ -247,7 +250,8 @@ def pullback_signal(stock_row: pd.Series) -> bool:
         rsi2 = float(stock_row["RSI_2"])
         ema21 = float(stock_row["EMA_21"])
         close = float(stock_row["Close"])
-    except Exception:
+    except Exception as e:
+        log.debug("pullback_signal: indicator field missing or non-numeric: %s", e)
         return False
     rsi_ok = rsi2 < 5
     near_ema = abs(close - ema21) / max(ema21, 1e-9) < 0.005
@@ -261,7 +265,8 @@ def breakout_signal(stock_row: pd.Series) -> bool:
         high20 = float(stock_row["HIGH_20"])
         vol = float(stock_row["Volume"])
         vol_sma = float(stock_row["VOL_SMA_10"])
-    except Exception:
+    except Exception as e:
+        log.debug("breakout_signal: indicator field missing or non-numeric: %s", e)
         return False
     return bool(close > high20 and vol > 1.5 * vol_sma)
 
@@ -278,12 +283,9 @@ def nextday_valid_for_entry(signal: str, last: pd.Series) -> bool:
         high20 = float(last["HIGH_20"])
         vol = float(last["Volume"])
         vol_sma = float(last.get("VOL_SMA_10", 0) or 0)
-    except Exception:
+    except Exception as e:
+        log.debug("nextday_valid_for_entry: indicator field missing or non-numeric: %s", e)
         return False
-
-    if signal == "PULLBACK":
-        # Don't chase if it already bounced far above EMA21 into the close
-        return bool(abs(close - ema21) / max(ema21, 1e-9) <= 0.010)
 
     # BREAKOUT: avoid blow-off; require real vol
     if atr > 0 and close > high20 + atr:
@@ -366,7 +368,8 @@ def update_retirement_marks() -> Tuple[Dict[str, dict], List[str]]:
 
         try:
             entry = float(r.get("entry_price") or 0.0)
-        except Exception:
+        except Exception as e:
+            log.warning("update_retirement_marks: bad entry_price for %s: %s", tkr, e)
             entry = 0.0
 
         px = last_close.get(tkr)
@@ -389,6 +392,104 @@ def update_retirement_marks() -> Tuple[Dict[str, dict], List[str]]:
     return by_key, sorted(flagged)
 
 
+def close_retirement_stops(today: dt.date) -> Dict[str, List[str]]:
+    """Close retirement positions that have hit the hard stop loss.
+
+    Runs daily after update_retirement_marks() so current_price is fresh.
+    A position is stopped out when:
+        current_price <= entry_price * (1 - RETIREMENT_STOP_LOSS_PCT)
+
+    Closed positions are written to stock_trades.csv (close_type=STOP) and
+    removed from retirement_positions.csv.  Monthly rebuild is left to the
+    caller (screener.py already calls rebuild_stock_monthly_from_trades).
+
+    Returns {"stopped": ["AAPL @152.00 (-21.3%)", ...]}
+    """
+    if not RETIREMENT_STOP_LOSS_PCT or float(RETIREMENT_STOP_LOSS_PCT) <= 0:
+        return {"stopped": []}
+
+    rows = load_retirement_positions()
+    if not rows:
+        return {"stopped": []}
+
+    stopped: List[str] = []
+    surviving: List[dict] = []
+    changed = False
+
+    for r in rows:
+        acct = (r.get("account") or "").strip().upper()
+        tkr  = (r.get("ticker") or "").strip().upper()
+
+        if acct not in (IRA, ROTH):
+            # Stop logic only applies to retirement accounts.
+            surviving.append(r)
+            continue
+
+        try:
+            entry = float(r.get("entry_price") or 0.0)
+            cur   = float(r.get("current_price") or 0.0)
+            sh    = int(float(r.get("shares") or 0))
+        except Exception as e:
+            log.warning("close_retirement_stops: bad numeric field for %s %s: %s", acct, tkr, e)
+            surviving.append(r)
+            continue
+
+        if entry <= 0 or cur <= 0 or sh <= 0:
+            surviving.append(r)
+            continue
+
+        stop_level = entry * (1.0 - float(RETIREMENT_STOP_LOSS_PCT))
+        if cur > stop_level:
+            # Not stopped — keep position.
+            surviving.append(r)
+            continue
+
+        # Position has breached the hard stop — close it.
+        pnl_abs = (cur - entry) * sh
+        pnl_pct = (cur - entry) / entry
+
+        log.warning(
+            "Retirement stop triggered: %s %s %d sh — entry %.2f, now %.2f "
+            "(%.1f%%), stop %.2f",
+            acct, tkr, sh, entry, cur, pnl_pct * 100, stop_level,
+        )
+
+        entry_date = (r.get("entry_date") or "")
+
+        append_stock_trade({
+            "id":          f"{acct}-{tkr}-{today.isoformat()}-STOP",
+            "account":     acct,
+            "ticker":      tkr,
+            "entry_date":  entry_date,
+            "entry_price": f"{entry:.2f}",
+            "shares":      str(sh),
+            "exit_date":   today.isoformat(),
+            "exit_price":  f"{cur:.2f}",
+            "reason":      "STOP",
+            "close_type":  "STOP",
+            "pnl_abs":     f"{pnl_abs:.2f}",
+            "pnl_pct":     f"{pnl_pct*100:.2f}",
+        })
+
+        append_stock_fill({
+            "date":    today.isoformat(),
+            "account": acct,
+            "ticker":  tkr,
+            "action":  "CLOSE",
+            "price":   f"{cur:.2f}",
+            "shares":  str(sh),
+            "reason":  f"RETIREMENT_STOP ({float(RETIREMENT_STOP_LOSS_PCT)*100:.0f}%)",
+        })
+
+        stopped.append(f"{tkr} @{cur:.2f} ({pnl_pct*100:+.1f}%)")
+        changed = True
+
+    if changed:
+        write_retirement_positions(surviving)
+
+    return {"stopped": stopped}
+
+
 def retirement_market_value_by_account(ret_by_key: Dict[str, dict]) -> Dict[str, float]:
     mv = {INDIVIDUAL: 0.0, IRA: 0.0, ROTH: 0.0}
     for _, r in ret_by_key.items():
@@ -399,14 +500,12 @@ def retirement_market_value_by_account(ret_by_key: Dict[str, dict]) -> Dict[str,
             sh = float(r.get("shares") or 0.0)
             px = float(r.get("current_price") or 0.0)
             mv[acct] += sh * px
-        except Exception:
+        except Exception as e:
+            log.warning("retirement_market_value_by_account: bad numeric field for %s/%s: %s",
+                        acct, r.get("ticker", "?"), e)
             continue
     return mv
 
-
-# ============================================================
-# Stock swing / tactical positions (paper execution)
-# ============================================================
 
 STOCK_POS_FIELDS = [
     "id",
@@ -547,7 +646,9 @@ def rebuild_stock_monthly_from_trades() -> None:
         for r in sorted(mrows, key=lambda x: x.get("exit_date") or ""):
             try:
                 pnl = float(r.get("pnl_abs") or 0.0)
-            except Exception:
+            except Exception as e:
+                log.warning("rebuild_stock_monthly: bad pnl_abs for %s %s: %s",
+                            r.get("account", "?"), r.get("ticker", "?"), e)
                 pnl = 0.0
             total += pnl
             out_rows.append({
@@ -595,7 +696,8 @@ def stock_market_value_by_account(stock_positions: List[dict], prices: Dict[str,
         try:
             sh = float(r.get("shares") or 0.0)
             mv[acct] += sh * px
-        except Exception:
+        except Exception as e:
+            log.warning("stock_market_value_by_account: bad shares field for %s/%s: %s", acct, tkr, e)
             continue
     return mv
 
@@ -639,7 +741,8 @@ def plan_stock_trade(
         ema21 = float(last["EMA_21"])
         atr = float(last.get("ATR_14", 0) or 0)
         high20 = float(last["HIGH_20"])
-    except Exception:
+    except Exception as e:
+        log.warning("plan_stock_trade: indicator field missing for %s: %s", ticker, e)
         return None
 
     if close <= 0:
@@ -815,7 +918,8 @@ def last_close_prices(tickers: List[str]) -> Dict[str, float]:
                 for k, v in last.items():
                     try:
                         prices[str(k).upper()] = float(v)
-                    except Exception:
+                    except Exception as e:
+                        log.debug("last_close_prices: could not parse price for %s: %s", k, e)
                         pass
         return prices
 
@@ -824,8 +928,9 @@ def last_close_prices(tickers: List[str]) -> Dict[str, float]:
         try:
             v = float(df["Close"].dropna().iloc[-1])
             prices[tickers[0]] = v
-        except Exception:
-            pass
+        except Exception as e:
+            log.warning("last_close_prices: could not parse single-ticker close for %s: %s",
+                        tickers[0] if tickers else "?", e)
 
     return prices
 
@@ -873,7 +978,9 @@ def update_and_close_stock_positions(today: dt.date, mkt: Dict[str, float | bool
             stop = float(r.get("stop_price") or 0.0)
             target = float(r.get("target_price") or 0.0)
             sh = int(float(r.get("shares") or 0))
-        except Exception:
+        except Exception as e:
+            log.warning("update_and_close_stock_positions: bad numeric field for %s %s: %s",
+                        r.get("account", "?"), tkr, e)
             continue
 
         if sh <= 0 or entry <= 0:
@@ -883,7 +990,8 @@ def update_and_close_stock_positions(today: dt.date, mkt: Dict[str, float | bool
         if STOCK_USE_BREAKEVEN_TRAIL:
             try:
                 risk_ps = float(r.get("risk_per_share") or 0.0)
-            except Exception:
+            except Exception as e:
+                log.debug("update_and_close_stock_positions: bad risk_per_share for %s: %s", tkr, e)
                 risk_ps = 0.0
             if risk_ps > 0 and (px - entry) >= (STOCK_BREAKEVEN_AFTER_R * risk_ps):
                 new_stop = max(stop, entry)
@@ -952,9 +1060,6 @@ def update_and_close_stock_positions(today: dt.date, mkt: Dict[str, float | bool
 # CSP planning / bookkeeping (paper)
 # ============================================================
 
-def _iso_week_id(d: dt.date) -> str:
-    # Thin alias — canonical implementation lives in utils.iso_week_id.
-    return iso_week_id(d)
 
 
 def ensure_positions_files() -> None:
@@ -997,13 +1102,17 @@ def append_csp_ledger_row(row: dict) -> None:
     # normalize
     try:
         contracts = int(float(row.get("contracts") or 0)) or 1
-    except Exception:
+    except Exception as e:
+        log.warning("append_csp_ledger_row: bad contracts value for %s: %s",
+                    row.get("ticker", "?"), e)
         contracts = 1
     if "premium" not in row or row.get("premium") in ("", None):
         try:
             credit_mid = float(row.get("credit_mid") or 0.0)
             row["premium"] = f"{credit_mid * 100.0 * contracts:.2f}"
-        except Exception:
+        except Exception as e:
+            log.warning("append_csp_ledger_row: could not compute premium for %s: %s",
+                        row.get("ticker", "?"), e)
             row["premium"] = ""
 
     with open(CSP_LEDGER_FILE, mode="a", newline="") as f:
@@ -1024,7 +1133,8 @@ def csp_already_logged(ledger_rows: List[dict], week_id: str, ticker: str, expir
                     # (e.g. 50.0 stored as "50.0" parsed back as 50.000000001).
                     and abs(float(r["strike"]) - float(strike)) < 0.005):
                 return True
-        except Exception:
+        except Exception as e:
+            log.debug("csp_already_logged: bad row data (week=%s ticker=%s): %s", week_id, ticker, e)
             continue
     return False
 
@@ -1037,9 +1147,9 @@ def _pick_expiry_in_dte_range(ticker_obj: yf.Ticker, dte_min: int, dte_max: int)
             exp_date = dt.date.fromisoformat(exp_str)
             dte = (exp_date - today).days
             expiries.append((exp_str, dte))
-        except Exception:
+        except Exception as e:
+            log.debug("_pick_expiry_in_dte_range: bad expiry string %r: %s", exp_str, e)
             continue
-    expiries.sort(key=lambda x: x[1])
     for exp_str, dte in expiries:
         if dte_min <= dte <= dte_max:
             return exp_str, dte
@@ -1104,7 +1214,8 @@ def evaluate_csp_candidate(
     stock_last = df.iloc[-1]
     try:
         close_px = float(stock_last.get("Close", 0) or 0)
-    except Exception:
+    except Exception as e:
+        log.debug("evaluate_csp_candidate: bad Close price for %s: %s", ticker, e)
         close_px = 0.0
     if close_px > CSP_MAX_SHARE_PRICE:
         return None
@@ -1224,7 +1335,7 @@ def plan_weekly_csp_orders(
     aggressive_total: int,
     aggressive_week: int,
 ) -> Dict[str, object]:
-    week_id = _iso_week_id(today)
+    week_id = iso_week_id(today)
     reg = csp_regime(vix_close)
     allowed = allowed_tiers_for_regime(reg)
 
@@ -1307,8 +1418,8 @@ def load_open_csp_tickers(today: Optional[dt.date] = None) -> set:
             try:
                 if exp_str and dt.date.fromisoformat(exp_str) < today:
                     continue
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("load_open_csp_tickers: bad expiry %r for %s: %s", exp_str, tkr, e)
         out.add(tkr)
     return out
 
@@ -1395,7 +1506,9 @@ def process_csp_take_profits(today: dt.date) -> Dict[str, List[str]]:
         try:
             if exp_str and dt.date.fromisoformat(exp_str) <= today:
                 continue
-        except Exception:
+        except Exception as e:
+            log.warning("process_csp_take_profits: bad expiry %r for %s: %s",
+                        exp_str, r.get("ticker", "?"), e)
             continue
 
         ticker    = (r.get("ticker") or "").strip().upper()
@@ -1404,7 +1517,9 @@ def process_csp_take_profits(today: dt.date) -> Dict[str, List[str]]:
 
         try:
             orig_premium = safe_float(r.get("premium"), 0.0)
-        except Exception:
+        except Exception as e:
+            log.warning("process_csp_take_profits: bad premium field for %s %s: %s",
+                        r.get("ticker", "?"), exp_str, e)
             orig_premium = 0.0
 
         if orig_premium <= 0 or strike <= 0 or contracts < 1 or not ticker:
@@ -1498,7 +1613,9 @@ def process_csp_expirations(today: dt.date) -> Dict[str, List[str]]:
         exp_str = (r.get("expiry") or "").strip()
         try:
             exp = dt.date.fromisoformat(exp_str)
-        except Exception:
+        except Exception as e:
+            log.warning("process_csp_expirations: bad expiry %r for %s: %s",
+                        exp_str, r.get("ticker", "?"), e)
             continue
 
         if exp > today:
@@ -1639,7 +1756,8 @@ def plan_covered_calls(today: dt.date, assigned_rows: List[dict], open_cc_ticker
 
         try:
             shares = int(float(pos.get("shares_if_assigned") or 0))
-        except Exception:
+        except Exception as e:
+            log.warning("plan_covered_calls: bad shares_if_assigned for %s: %s", ticker, e)
             shares = 0
         contracts = shares // 100
         if contracts < 1:
@@ -1650,7 +1768,8 @@ def plan_covered_calls(today: dt.date, assigned_rows: List[dict], open_cc_ticker
             # Until Step 3 tracks cumulative premiums, assigned_strike is the best proxy.
             net_cost_basis_per_share = float(pos.get("net_cost_basis_per_share") or
                                              pos.get("strike") or 0.0)
-        except Exception:
+        except Exception as e:
+            log.warning("plan_covered_calls: bad net_cost_basis_per_share for %s: %s", ticker, e)
             net_cost_basis_per_share = 0.0
 
         try:

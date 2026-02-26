@@ -62,6 +62,7 @@ def build_discord_alert(
     cc_call: List[str],
     stock_opens: List[str],
     stock_closes: List[str],
+    ret_stopped: List[str] = [],
 ) -> str:
     lines: List[str] = []
     lines.append(f"📅 {dt.date.today().isoformat()} Screener")
@@ -70,8 +71,9 @@ def build_discord_alert(
         f"QQQ {mkt['qqq_close']:.2f} | VIX {mkt['vix_close']:.2f}"
     )
 
-    if csp_tp or csp_exp or csp_asn or cc_exp or cc_call or stock_opens or stock_closes:
+    if csp_tp or csp_exp or csp_asn or cc_exp or cc_call or stock_opens or stock_closes or ret_stopped:
         lines.append("— Maintenance —")
+        if ret_stopped:  lines.append(f"🛑 Retirement stops: {', '.join(ret_stopped[:8])}{'…' if len(ret_stopped)>8 else ''}")
         if csp_tp:       lines.append(f"CSP closed (TP): {', '.join(csp_tp[:8])}{'…' if len(csp_tp)>8 else ''}")
         if csp_exp:      lines.append(f"CSP expired: {', '.join(csp_exp[:8])}{'…' if len(csp_exp)>8 else ''}")
         if csp_asn:      lines.append(f"CSP assigned: {', '.join(csp_asn[:8])}{'…' if len(csp_asn)>8 else ''}")
@@ -249,7 +251,8 @@ def print_open_cc_roll_candidates(px: Dict[str, float]) -> None:
             ))
             for tkr, strike, cur, pct_otm, exp in candidates:
                 flag = "🔴 ITM" if pct_otm < 0 else "🟡 near"
-                print(f"  {flag} {tkr:<6} {strike:.0f}C {exp} | Now {cur:.2f} ({pct_otm:+.1f}% OTM)")
+                direction = "ITM" if pct_otm < 0 else "OTM"
+                print(f"  {flag} {tkr:<6} {strike:.0f}C {exp} | Now {cur:.2f} ({abs(pct_otm):.1f}% {direction})")
     except Exception as e:
         log.warning("print_open_cc_roll_candidates failed: %s", e)
 

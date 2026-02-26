@@ -5,11 +5,14 @@ Project configuration.
 """
 
 from __future__ import annotations
+import os
 from typing import Dict, List
 
 # ---- Discord Webhook ---- #
-# Keep OUT of git
-WEBHOOK_URL = ""
+# Read from environment so the URL is never committed to version control.
+# If the env var is not set, Discord alerting is silently skipped (same
+# behaviour as the previous hardcoded empty string).
+WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 
 # ---- Files ---- #
 # Stock swing / tactical tracking
@@ -92,6 +95,11 @@ RETIREMENT_MAX_EQUITY_UTIL_PCT = 0.98  # cash buffer
 
 # If a retirement holding is down >= 10%, only allow selling at breakeven (entry)
 RETIREMENT_BREAKEVEN_ONLY_DD_PCT = 0.10
+
+# Hard stop-loss for retirement positions: close if down >= this % from entry.
+# Set to 0.0 to disable.  Default 20% — wide enough to avoid noise but caps
+# the maximum loss on any single retirement holding.
+RETIREMENT_STOP_LOSS_PCT = 0.15
 
 # ============================================================
 # Stock swing trade rules (paper execution)
