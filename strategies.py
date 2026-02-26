@@ -347,12 +347,9 @@ def update_retirement_marks() -> Tuple[Dict[str, dict], List[str]]:
 
     for tkr in tickers:
         try:
-            df = yf.download(tkr, period="7d", interval="1d", auto_adjust=False, progress=False)
-            df.dropna(inplace=True)
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
-            if not df.empty:
-                last_close[tkr] = float(df["Close"].iloc[-1])
+            df = download_ohlcv(tkr, period="7d", interval="1d")
+            if not df.empty and "Close" in df.columns:
+                last_close[tkr] = float(df["Close"].dropna().iloc[-1])
         except Exception as e:
             log.warning("retirement mark price fetch failed for %s: %s", tkr, e)
             continue
@@ -946,19 +943,7 @@ def update_and_close_stock_positions(today: dt.date, mkt: Dict[str, float | bool
         return {"stops": [], "targets": []}
 
     tickers = sorted({(r.get("ticker") or "").strip().upper() for r in open_rows if (r.get("ticker") or "").strip()})
-    prices: Dict[str, float] = {}
-
-    for tkr in tickers:
-        try:
-            df = yf.download(tkr, period="7d", interval="1d", auto_adjust=False, progress=False)
-            df.dropna(inplace=True)
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
-            if not df.empty:
-                prices[tkr] = float(df["Close"].iloc[-1])
-        except Exception as e:
-            log.warning("stock position price fetch failed for %s: %s", tkr, e)
-            continue
+    prices: Dict[str, float] = last_close_prices(tickers)
 
     stops: List[str] = []
     targets: List[str] = []
@@ -1628,27 +1613,40 @@ def process_csp_expirations(today: dt.date) -> Dict[str, List[str]]:
 
         underlying_close = None
         try:
-            # Fetch a window around expiry; we then filter to the exact expiry date.
-            # Using iloc[-1] on a wider range is wrong — the window end (+1 day) can
-            # include the next trading session (e.g. Monday after a Friday expiry).
-            start = (exp - dt.timedelta(days=7)).isoformat()
-            end   = (exp + dt.timedelta(days=2)).isoformat()
-            df = yf.download(ticker, start=start, end=end, interval="1d", auto_adjust=False, progress=False)
-            df.dropna(inplace=True)
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
-            if not df.empty:
-                # Prefer the exact expiry date; fall back to the nearest prior close
-                # (handles holidays where the expiry date itself has no trading data).
-                df.index = pd.to_datetime(df.index)
+            # Try the session cache first (covers ~1 year of daily data).
+            # Fall back to a targeted network fetch only when the expiry date
+            # predates the cache window (e.g. a long-dated CSP opened months ago).
+            cached_df = download_ohlcv(ticker)  # cache-aware, returns copy
+            if not cached_df.empty:
+                cached_df.index = pd.to_datetime(cached_df.index)
                 exp_ts = pd.Timestamp(exp)
-                exact = df[df.index.normalize() == exp_ts]
+                exact = cached_df[cached_df.index.normalize() == exp_ts]
                 if not exact.empty:
                     underlying_close = float(exact["Close"].iloc[-1])
                 else:
-                    prior = df[df.index.normalize() < exp_ts]
-                    if not prior.empty:
+                    prior = cached_df[cached_df.index.normalize() < exp_ts]
+                    if not prior.empty and prior.index[-1].date() >= (exp - dt.timedelta(days=5)):
+                        # Cache has data close enough to expiry — use it.
                         underlying_close = float(prior["Close"].iloc[-1])
+
+            if underlying_close is None:
+                # Cache miss or expiry too old — targeted fetch around expiry date.
+                start = (exp - dt.timedelta(days=7)).isoformat()
+                end   = (exp + dt.timedelta(days=2)).isoformat()
+                df = yf.download(ticker, start=start, end=end, interval="1d", auto_adjust=False, progress=False)
+                df.dropna(inplace=True)
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = df.columns.get_level_values(0)
+                if not df.empty:
+                    df.index = pd.to_datetime(df.index)
+                    exp_ts = pd.Timestamp(exp)
+                    exact = df[df.index.normalize() == exp_ts]
+                    if not exact.empty:
+                        underlying_close = float(exact["Close"].iloc[-1])
+                    else:
+                        prior = df[df.index.normalize() < exp_ts]
+                        if not prior.empty:
+                            underlying_close = float(prior["Close"].iloc[-1])
         except Exception as e:
             log.warning("CSP expiry price fetch failed for %s exp %s: %s", ticker, exp_str, e)
             underlying_close = None

@@ -177,7 +177,7 @@ CSP_STOCKS: List[str] = list(dict.fromkeys(
         # =========================
         # Core ETFs (wheel stabilizers)
         # =========================
-        "SPLG","SPY","QQQ","TQQQ",
+        "SPLG","SPY","QQQ",
         "SCHD","JEPI",
         "XLU","XLF","XLE","XLV",
         "SMH",

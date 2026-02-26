@@ -35,6 +35,23 @@ from config import (
 
 log = get_logger(__name__)
 
+# Module-level cache reference — injected by screener.py at startup via
+# set_data_cache().  Falls back to direct yf.download when None.
+_cache = None
+
+
+def set_data_cache(cache) -> None:
+    """Inject the pre-warmed DataCache for this run."""
+    global _cache
+    _cache = cache
+
+
+def _cached_ohlcv(ticker: str) -> "pd.DataFrame":
+    """Return cached OHLCV if available, else empty DataFrame."""
+    if _cache is not None and _cache.has(ticker):
+        return _cache.ohlcv(ticker)
+    return pd.DataFrame()
+
 EVENT_FIELDS = [
     "event_id",
     "account",
@@ -438,26 +455,41 @@ def process_cc_expirations(today: dt.date) -> Dict[str, List[str]]:
 
         underlying_close: Optional[float] = None
         try:
-            # Same fix as CSP path: filter to exact expiry date rather than using
-            # iloc[-1], which can return Monday's data for a Friday-expiry contract.
-            start = (exp - dt.timedelta(days=7)).isoformat()
-            end   = (exp + dt.timedelta(days=2)).isoformat()
-            df = yf.download(tkr, start=start, end=end, interval="1d",
-                             auto_adjust=False, progress=False)
-            df.dropna(inplace=True)
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
-            if not df.empty:
-                df.index = pd.to_datetime(df.index)
+            # Try the session cache first (covers ~1 year of daily data).
+            # Fall back to a targeted network fetch only when the expiry date
+            # predates the cache window.
+            cached_df = _cached_ohlcv(tkr)
+            if not cached_df.empty:
+                cached_df.index = pd.to_datetime(cached_df.index)
                 exp_ts = pd.Timestamp(exp)
-                exact = df[df.index.normalize() == exp_ts]
+                exact = cached_df[cached_df.index.normalize() == exp_ts]
                 if not exact.empty:
                     underlying_close = float(exact["Close"].iloc[-1])
                 else:
-                    # Holiday fallback: use nearest prior close.
-                    prior = df[df.index.normalize() < exp_ts]
-                    if not prior.empty:
+                    prior = cached_df[cached_df.index.normalize() < exp_ts]
+                    if not prior.empty and prior.index[-1].date() >= (exp - dt.timedelta(days=5)):
                         underlying_close = float(prior["Close"].iloc[-1])
+
+            if underlying_close is None:
+                # Cache miss — targeted fetch around expiry date.
+                start = (exp - dt.timedelta(days=7)).isoformat()
+                end   = (exp + dt.timedelta(days=2)).isoformat()
+                df = yf.download(tkr, start=start, end=end, interval="1d",
+                                 auto_adjust=False, progress=False)
+                df.dropna(inplace=True)
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = df.columns.get_level_values(0)
+                if not df.empty:
+                    df.index = pd.to_datetime(df.index)
+                    exp_ts = pd.Timestamp(exp)
+                    exact = df[df.index.normalize() == exp_ts]
+                    if not exact.empty:
+                        underlying_close = float(exact["Close"].iloc[-1])
+                    else:
+                        # Holiday fallback: use nearest prior close.
+                        prior = df[df.index.normalize() < exp_ts]
+                        if not prior.empty:
+                            underlying_close = float(prior["Close"].iloc[-1])
         except Exception as e:
             log.warning("CC expiry price fetch failed for %s exp %s: %s", tkr, exp_str, e)
             underlying_close = None

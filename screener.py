@@ -31,6 +31,7 @@ from config import (
 )
 
 import strategies as strat
+import wheel as _wheel_mod
 from data_cache import DataCache
 from market import fetch_market_context, allow_swing_trades, allow_retirement_tactical, csp_mode
 from screener_display import (
@@ -73,16 +74,30 @@ def run_screener() -> None:
     today = dt.date.today()
 
     # ── 1. Warm data cache ────────────────────────────────────────
-    # SPY/QQQ/VIX plus every equity ticker the screener touches.
+    # SPY/QQQ/VIX plus every equity ticker the screener touches —
+    # including open retirement positions and wheel lots.
     # Option chains are still fetched per-ticker (yfinance limitation).
+    ret_tickers = [
+        (r.get("ticker") or "").strip().upper()
+        for r in strat.load_retirement_positions()
+        if (r.get("ticker") or "").strip()
+    ]
+    lot_tickers = [
+        (r.get("ticker") or "").strip().upper()
+        for r in _wheel_mod.get_open_lots()
+        if (r.get("ticker") or "").strip()
+    ]
     all_equity_tickers = list({
         "SPY", "QQQ", "^VIX",
         *STOCKS,
         *CSP_STOCKS,
+        *ret_tickers,
+        *lot_tickers,
     })
     cache = DataCache(all_equity_tickers)
     cache.warm()
     strat.set_data_cache(cache)
+    _wheel_mod.set_data_cache(cache)
 
     # ── 2. Market context + regime ────────────────────────────────
     mkt        = fetch_market_context(cache)
