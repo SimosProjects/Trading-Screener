@@ -27,14 +27,18 @@ from config import (
     INDIVIDUAL, IRA, ROTH,
     ACCOUNT_SIZES,
     INDIVIDUAL_STOCK_CAP,
+    RETIREMENT_STOCK_CAPS,
     RETIREMENT_MAX_EQUITY_UTIL_PCT,
     RETIREMENT_BREAKEVEN_ONLY_DD_PCT,
     RETIREMENT_STOP_LOSS_PCT,
+    RETIREMENT_POSITION_SIZE_PCT,
+    RETIREMENT_MAX_STOCK_POSITIONS,
+    RETIREMENT_STOCKS,
 
     # stock rules
     STOCK_REQUIRE_NEXTDAY_VALIDATION,
-    STOCK_RISK_PCT_INDIVIDUAL, STOCK_RISK_PCT_RETIREMENT,
-    STOCK_MAX_POSITION_PCT_INDIVIDUAL, STOCK_MAX_POSITION_PCT_RETIREMENT,
+    STOCK_RISK_PCT_INDIVIDUAL,
+    STOCK_MAX_POSITION_PCT_INDIVIDUAL,
     STOCK_TARGET_R_MULTIPLE,
     STOCK_BREAKEVEN_AFTER_R,
     STOCK_USE_BREAKEVEN_TRAIL,
@@ -723,20 +727,6 @@ def stock_market_value_by_account(stock_positions: List[dict], prices: Dict[str,
     return mv
 
 
-def _risk_pct_for_account(account: str) -> float:
-    return float(STOCK_RISK_PCT_INDIVIDUAL if account == INDIVIDUAL else STOCK_RISK_PCT_RETIREMENT)
-
-
-def _max_pos_pct_for_account(account: str) -> float:
-    return float(STOCK_MAX_POSITION_PCT_INDIVIDUAL if account == INDIVIDUAL else STOCK_MAX_POSITION_PCT_RETIREMENT)
-
-
-def _account_cap(account: str) -> float:
-    if account == INDIVIDUAL:
-        # INDIVIDUAL stock trading uses the non-wheel slice only
-        return float(INDIVIDUAL_STOCK_CAP)
-    return float(ACCOUNT_SIZES.get(account, 0))
-
 def plan_stock_trade(
     *,
     account: str,
@@ -748,19 +738,23 @@ def plan_stock_trade(
     acct_current_mv: float,
     retirement_breakeven_only: bool,
 ) -> Optional[dict]:
-    """Build a paper trade plan (entry/stop/target/shares)."""
+    """Build a paper trade plan (entry/stop/target/shares).
 
+    INDIVIDUAL: swing trade — ATR stops, 2R target, risk-based sizing.
+    IRA/ROTH:   buy-and-hold — pullback only, flat $10K sizing, wide
+                catastrophic stop only, no take-profit target.
+    """
     account = account.upper().strip()
-    ticker = ticker.upper().strip()
-    signal = signal.upper().strip()
+    ticker  = ticker.upper().strip()
+    signal  = signal.upper().strip()
 
     if not ticker or ticker in existing_open_tickers:
         return None
 
     try:
-        close = float(last["Close"])
-        ema21 = float(last["EMA_21"])
-        atr = float(last.get("ATR_14", 0) or 0)
+        close  = float(last["Close"])
+        ema21  = float(last["EMA_21"])
+        atr    = float(last.get("ATR_14", 0) or 0)
         high20 = float(last["HIGH_20"])
     except Exception as e:
         log.warning("plan_stock_trade: indicator field missing for %s: %s", ticker, e)
@@ -770,69 +764,103 @@ def plan_stock_trade(
         return None
     if signal not in ("PULLBACK", "BREAKOUT"):
         return None
-    if not nextday_valid_for_entry(signal, last):
-        return None
 
-    # Retirement guardrail
-    if account in (IRA, ROTH) and retirement_breakeven_only:
+    # ── Retirement buy-and-hold path ────────────────────────────────────────
+    if account in (IRA, ROTH):
+        # Only quality names and only on pullbacks — no breakout chasing.
+        if signal != "PULLBACK":
+            return None
+        if ticker not in RETIREMENT_STOCKS:
+            return None
+        if retirement_breakeven_only:
+            return None
+
+        # Flat position sizing: 50% of the retirement stock slice (~$10K).
+        slice_cap = float(RETIREMENT_STOCK_CAPS.get(account, 0))
+        if slice_cap <= 0:
+            return None
+
+        pos_value = slice_cap * float(RETIREMENT_POSITION_SIZE_PCT)
+        shares = int(pos_value / close)
+        if shares < 1:
+            return None
+
+        # Remaining capacity check — don't exceed the slice.
+        remaining = max(slice_cap - float(acct_current_mv or 0.0), 0.0)
+        if remaining < pos_value * 0.5:
+            # Less than half a position worth of room — skip.
+            return None
+
+        shares = min(shares, int(remaining / close))
+        if shares < 1:
+            return None
+
+        # Wide catastrophic stop only — designed to survive normal corrections.
+        stop   = close * (1.0 - float(RETIREMENT_STOP_LOSS_PCT))
+        # No price target: hold indefinitely until stop or manual exit.
+        target = 0.0
+
+        return {
+            "account":          account,
+            "ticker":           ticker,
+            "signal":           signal,
+            "entry_price":      float(close),
+            "stop_price":       float(stop),
+            "target_price":     float(target),
+            "shares":           int(shares),
+            "risk_per_share":   float(close - stop),
+            "r_multiple_target": 0.0,
+            "notes": (
+                f"RETIRE BUY-HOLD | pos_value=${pos_value:,.0f} "
+                f"stop={RETIREMENT_STOP_LOSS_PCT*100:.0f}% below entry"
+            ),
+        }
+
+    # ── INDIVIDUAL swing trade path ──────────────────────────────────────────
+    if not nextday_valid_for_entry(signal, last):
         return None
 
     # --- Stop / target logic ---
     if signal == "PULLBACK":
-        stop = ema21 - (STOCK_STOP_ATR_PULLBACK * atr) if atr > 0 else ema21 * 0.97
-        risk_ps = max(close - stop, 0.01)
+        stop     = ema21 - (STOCK_STOP_ATR_PULLBACK * atr) if atr > 0 else ema21 * 0.97
+        risk_ps  = max(close - stop, 0.01)
         target_r = close + STOCK_TARGET_R_MULTIPLE * risk_ps
-        target = max(high20, target_r)
+        target   = max(high20, target_r)
     else:
         breakout_level = high20
-        stop = breakout_level - (STOCK_STOP_ATR_BREAKOUT * atr) if atr > 0 else breakout_level * 0.96
+        stop    = breakout_level - (STOCK_STOP_ATR_BREAKOUT * atr) if atr > 0 else breakout_level * 0.96
         risk_ps = max(close - stop, 0.01)
-        target = close + STOCK_TARGET_R_MULTIPLE * risk_ps
+        target  = close + STOCK_TARGET_R_MULTIPLE * risk_ps
 
     # --- Account sizing ---
-    acct_size = _account_cap(account)
+    acct_size = float(INDIVIDUAL_STOCK_CAP)
     if acct_size <= 0:
         return None
 
-    # Retirement keeps a utilization buffer
-    util_cap = acct_size * (
-        RETIREMENT_MAX_EQUITY_UTIL_PCT if account in (IRA, ROTH) else 1.0
-    )
+    max_pos_value = acct_size * float(STOCK_MAX_POSITION_PCT_INDIVIDUAL)
+    risk_cap      = acct_size * float(STOCK_RISK_PCT_INDIVIDUAL)
 
-    # --- Hard caps ---
-    max_pos_value = util_cap * _max_pos_pct_for_account(account)
-    risk_cap = util_cap * _risk_pct_for_account(account)
-
-    # --- 1) Risk-based sizing ---
-    risk_shares = int(risk_cap / risk_ps)
-    if risk_shares < 1:
-        return None
-
-    # --- 2) Position value cap ---
+    risk_shares      = int(risk_cap / risk_ps)
     value_cap_shares = int(max_pos_value / close)
-    if value_cap_shares < 1:
-        return None
-
-    # --- 3) Remaining account capacity ---
-    remaining_value = max(util_cap - float(acct_current_mv or 0.0), 0.0)
+    remaining_value  = max(acct_size - float(acct_current_mv or 0.0), 0.0)
     remaining_shares = int(remaining_value / close)
-    if remaining_shares < 1:
+
+    if risk_shares < 1 or value_cap_shares < 1 or remaining_shares < 1:
         return None
 
-    # --- Final shares = most restrictive ---
     shares = min(risk_shares, value_cap_shares, remaining_shares)
     if shares < 1:
         return None
 
     return {
-        "account": account,
-        "ticker": ticker,
-        "signal": signal,
-        "entry_price": float(close),
-        "stop_price": float(stop),
-        "target_price": float(target),
-        "shares": int(shares),
-        "risk_per_share": float(risk_ps),
+        "account":          account,
+        "ticker":           ticker,
+        "signal":           signal,
+        "entry_price":      float(close),
+        "stop_price":       float(stop),
+        "target_price":     float(target),
+        "shares":           int(shares),
+        "risk_per_share":   float(risk_ps),
         "r_multiple_target": float(STOCK_TARGET_R_MULTIPLE),
         "notes": (
             f"{signal} plan | "
@@ -843,52 +871,83 @@ def plan_stock_trade(
 
 
 def execute_stock_plan(today: dt.date, plan: dict) -> str:
-    """Paper 'execution': record OPEN stock position immediately (filled at close)."""
+    """Paper 'execution': record OPEN stock position immediately (filled at close).
+
+    Routing:
+      IRA/ROTH  → retirement_positions.csv  (buy-and-hold; managed by
+                   close_retirement_stops / update_retirement_marks)
+      INDIVIDUAL → stock_positions.csv       (swing trades; managed by
+                   update_and_close_stock_positions)
+    """
+    account    = (plan.get("account") or "").strip().upper()
+    entry_date = today.isoformat()
+
+    # ── Retirement buy-and-hold path ────────────────────────────────────────
+    if account in (IRA, ROTH):
+        ticker = (plan.get("ticker") or "").strip().upper()
+        rows   = load_retirement_positions()
+
+        # Idempotent: same account + ticker + entry_date = already recorded
+        if any(
+            (r.get("account") or "").strip().upper() == account
+            and (r.get("ticker") or "").strip().upper() == ticker
+            and (r.get("entry_date") or "") == entry_date
+            for r in rows
+        ):
+            return f"{account}-{ticker}-{entry_date}"
+
+        entry_px = float(plan["entry_price"])
+        shares   = int(plan["shares"])
+
+        rows.append({
+            "account":             account,
+            "ticker":              ticker,
+            "shares":              str(shares),
+            "entry_price":         f"{entry_px:.2f}",
+            "entry_date":          entry_date,
+            "current_price":       f"{entry_px:.2f}",
+            "pct_change":          "0.00",
+            "breakeven_target":    "",
+            "flag_breakeven_only": "0",
+            "notes":               plan.get("notes", "BUY-HOLD"),
+        })
+        write_retirement_positions(rows)
+        log.info(
+            "execute_stock_plan: %s %s %d sh @ %.2f → retirement_positions",
+            account, ticker, shares, entry_px,
+        )
+        return f"{account}-{ticker}-{entry_date}"
+
+    # ── INDIVIDUAL swing trade path ──────────────────────────────────────────
     ensure_stock_files()
     rows = load_stock_positions()
 
-    entry_date = today.isoformat()
+    pos_id = _stock_position_id(account, plan["ticker"], entry_date)
 
-    # If we already opened this ticker TODAY in IRA or ROTH, don't open it again
-    if plan.get("account") in (IRA, ROTH):
-        tkr = (plan.get("ticker") or "").strip().upper()
-        for r in rows:
-            if (r.get("status") or "").upper() != "OPEN":
-                continue
-            if (r.get("entry_date") or "") != entry_date:
-                continue
-            if (r.get("account") or "") not in (IRA, ROTH):
-                continue
-            if (r.get("ticker") or "").strip().upper() == tkr:
-                return (r.get("id") or "")
-
-
-    pos_id = _stock_position_id(plan["account"], plan["ticker"], entry_date)
-
-    # idempotent
+    # Idempotent
     if any((r.get("id") or "") == pos_id for r in rows):
         return pos_id
 
     rows.append({
-        "id": pos_id,
-        "account": plan["account"],
-        "ticker": plan["ticker"],
-        "signal": plan["signal"],
-        "plan_date": entry_date,
-        "entry_date": entry_date,
-        "entry_price": f"{float(plan['entry_price']):.2f}",
-        "shares": str(int(plan["shares"])),
-        "stop_price": f"{float(plan['stop_price']):.2f}",
-        "target_price": f"{float(plan['target_price']):.2f}",
-        "risk_per_share": f"{float(plan['risk_per_share']):.4f}",
-        "r_multiple_target": f"{float(plan['r_multiple_target']):.2f}",
-        "status": "OPEN",
-        "exit_date": "",
-        "exit_price": "",
-        "exit_reason": "",
-        "pnl_abs": "",
-        "pnl_pct": "",
-        "notes": plan.get("notes", ""),
+        "id":               pos_id,
+        "account":          account,
+        "ticker":           plan["ticker"],
+        "signal":           plan["signal"],
+        "plan_date":        entry_date,
+        "entry_date":       entry_date,
+        "entry_price":      f"{float(plan['entry_price']):.2f}",
+        "shares":           str(int(plan["shares"])),
+        "stop_price":       f"{float(plan['stop_price']):.2f}",
+        "target_price":     f"{float(plan['target_price']):.2f}",
+        "risk_per_share":   f"{float(plan['risk_per_share']):.4f}",
+        "r_multiple_target":f"{float(plan['r_multiple_target']):.2f}",
+        "status":           "OPEN",
+        "exit_date":        "",
+        "exit_price":       "",
+        "exit_reason":      "",
+        "pnl_abs":          "",
+        "pnl_pct":          "",
+        "notes":            plan.get("notes", ""),
     })
 
     write_stock_positions(rows)

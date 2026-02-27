@@ -104,25 +104,62 @@ RETIREMENT_MAX_EQUITY_UTIL_PCT = 0.98  # cash buffer
 # If a retirement holding is down >= 10%, only allow selling at breakeven (entry)
 RETIREMENT_BREAKEVEN_ONLY_DD_PCT = 0.10
 
-# Hard stop-loss for retirement positions: close if down >= this % from entry.
-# Set to 0.0 to disable.  Default 20% — wide enough to avoid noise but caps
-# the maximum loss on any single retirement holding.
-RETIREMENT_STOP_LOSS_PCT = 0.15
+# Hard stop-loss for retirement buy-and-hold positions.
+# Wide by design — these are quality compounders meant to be held through
+# normal corrections (20–25% drawdowns are routine for great businesses).
+# Only fires on genuine catastrophic blowups, not ordinary volatility.
+# Set to 0.0 to disable entirely.
+RETIREMENT_STOP_LOSS_PCT = 0.35
+
+# ---- Retirement buy-and-hold stock strategy ----
+# Retirement accounts run a different strategy from INDIVIDUAL swing trades:
+#   - Quality Tier A names only (long-term compounders)
+#   - Pullback entries only — no breakout chasing
+#   - Flat position sizing (50% of $20K slice = ~$10K per name)
+#   - Max 2 simultaneous positions per retirement account
+#   - No take-profit target — let winners run indefinitely
+#   - Exit only on catastrophic stop or manual decision
+#
+# Position size = RETIREMENT_STOCK_CAPS[acct] * RETIREMENT_POSITION_SIZE_PCT
+RETIREMENT_POSITION_SIZE_PCT = 0.50   # 50% of the stock slice per position (~$10K)
+RETIREMENT_MAX_STOCK_POSITIONS = 2    # max simultaneous holds per retirement account
+
+# Tier A quality names eligible for retirement buy-and-hold.
+# Deliberately narrow — these are businesses you'd want to own for years.
+# Avoid high-beta, cyclicals, and speculative names regardless of signal quality.
+RETIREMENT_STOCKS: List[str] = [
+    # Mega-cap tech / software (durable moats, compounding earnings)
+    "AAPL", "MSFT", "GOOGL", "AMZN", "META",
+    "NVDA", "AVGO", "ORCL", "ADBE", "INTU",
+
+    # Payments (toll-booth businesses, recession-resistant)
+    "V", "MA",
+
+    # Healthcare (pricing power, aging demographics)
+    "LLY", "ABBV", "UNH", "VRTX",
+
+    # Consumer staples / quality retail (pricing power, predictable cash flows)
+    "WMT", "COST", "KO", "PEP", "HD",
+
+    # High-quality financials
+    "JPM", "GS",
+
+    # Best-in-class franchises
+    "MCD", "SBUX",
+]
 
 # ============================================================
-# Stock swing trade rules (paper execution)
+# Stock swing trade rules -- INDIVIDUAL account only
 # ============================================================
 
-# “Run after close” means entries are detected using EOD data.
+# Run after close: entries detected using EOD data, filled next open.
 STOCK_REQUIRE_NEXTDAY_VALIDATION = True
 
-# --- Stock sizing caps (swing stocks) ---
-STOCK_MAX_POSITION_PCT_INDIVIDUAL = 0.15   # 15% of account per stock
-STOCK_MAX_POSITION_PCT_RETIREMENT = 0.15 
+# Position sizing: max % of INDIVIDUAL_STOCK_CAP per position
+STOCK_MAX_POSITION_PCT_INDIVIDUAL = 0.15   # 15% of $20K slice = ~$3K max
 
-# Risk / sizing
-STOCK_RISK_PCT_INDIVIDUAL = 0.050   # 5.0% of INDIVIDUAL_STOCK_CAP per trade
-STOCK_RISK_PCT_RETIREMENT = 0.050   # 5.0% of account per trade
+# Risk per trade: % of INDIVIDUAL_STOCK_CAP at risk on the stop
+STOCK_RISK_PCT_INDIVIDUAL = 0.050          # 5% of $20K slice = ~$1K risk cap
 
 # Targets / exits
 STOCK_TARGET_R_MULTIPLE = 2.0           # take-profit at ~2R

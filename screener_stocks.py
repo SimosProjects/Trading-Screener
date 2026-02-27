@@ -16,6 +16,9 @@ from utils import get_logger
 from config import (
     STOCKS,
     INDIVIDUAL, IRA, ROTH,
+    RETIREMENT_STOCKS,
+    RETIREMENT_MAX_STOCK_POSITIONS,
+    RETIREMENT_STOP_LOSS_PCT,
 )
 
 log = get_logger(__name__)
@@ -117,15 +120,13 @@ def plan_and_execute_stocks(
     ret_by_key: dict,
 ) -> Tuple[List[str], List[dict]]:
     """
-    For each signal, attempt to plan a trade in INDIVIDUAL then IRA/ROTH.
+    Plan and execute stock trades across all accounts.
 
-    Returns:
-        stock_opened   — list of "ACCT:TICKER" strings for post-run reporting
-        planned_stocks — list of dicts for Discord alert / display
+    INDIVIDUAL: swing trades — up to 3 per run, any signal, full STOCKS universe.
+    IRA/ROTH:   buy-and-hold — up to RETIREMENT_MAX_STOCK_POSITIONS open at once,
+                pullback only, RETIREMENT_STOCKS universe, separate per-account counter.
 
-    Modifies acct_mv in-place as positions are opened so each subsequent
-    trade sees the updated utilization.  The dict comes from the caller
-    (screener) and is intentionally mutated here.
+    Modifies acct_mv in-place so each subsequent trade sees updated utilisation.
     """
     if not entries:
         return [], []
@@ -143,24 +144,38 @@ def plan_and_execute_stocks(
     open_any        = set().union(*open_by_acct.values())
     open_retirement = set().union(open_by_acct.get(IRA, set()), open_by_acct.get(ROTH, set()))
 
+    # Count existing open positions per retirement account for the per-account cap.
+    ret_open_count: Dict[str, int] = {
+        IRA:  len(open_by_acct.get(IRA,  set())),
+        ROTH: len(open_by_acct.get(ROTH, set())),
+    }
+
     print("\n📈 STOCK ENTRIES (planned)")
-    planned        = 0
-    stock_opened:  List[str]  = []
+    indiv_planned  = 0          # INDIVIDUAL cap: 3 new trades per run
+    stock_opened:   List[str]  = []
     planned_stocks: List[dict] = []
 
-    for e in entries:
-        if planned >= 3:
-            break
+    retirement_set = set(RETIREMENT_STOCKS)
 
+    for e in entries:
         tkr  = e["ticker"]
         sig  = e["signal"]
         last = e["_last"]
 
+        # Build the ordered list of accounts to try for this entry.
         acct_order: List[str] = []
-        if trading_on:
+        if trading_on and indiv_planned < 3:
             acct_order.append(INDIVIDUAL)
         if retire_on:
-            acct_order.extend([IRA, ROTH])
+            # Only add retirement accounts that have room and where this ticker
+            # is in the eligible universe.
+            if tkr in retirement_set:
+                for acct in (IRA, ROTH):
+                    if ret_open_count.get(acct, 0) < RETIREMENT_MAX_STOCK_POSITIONS:
+                        acct_order.append(acct)
+
+        if not acct_order:
+            continue
 
         picked_plan = None
         picked_acct = None
@@ -171,11 +186,14 @@ def plan_and_execute_stocks(
                 and ret_by_key[f"{acct}:{tkr}"].get("flag_breakeven_only") == "1"
             )
 
-            existing_set = open_by_acct.get(acct, set())
-            if PREVENT_DUPLICATE_RETIREMENT_TICKERS and acct in (IRA, ROTH):
-                existing_set = open_retirement
-            elif not ALLOW_DUPLICATE_TICKERS_ACROSS_ACCOUNTS:
-                existing_set = open_any
+            # Dedup logic per account type.
+            if acct == INDIVIDUAL:
+                existing_set = open_by_acct.get(INDIVIDUAL, set())
+                if not ALLOW_DUPLICATE_TICKERS_ACROSS_ACCOUNTS:
+                    existing_set = open_any
+            else:
+                # Retirement: block same ticker across both IRA and ROTH.
+                existing_set = open_retirement if PREVENT_DUPLICATE_RETIREMENT_TICKERS else open_by_acct.get(acct, set())
 
             plan = strat.plan_stock_trade(
                 account=acct,
@@ -202,19 +220,30 @@ def plan_and_execute_stocks(
         open_any.add(tkr)
         if picked_acct in (IRA, ROTH):
             open_retirement.add(tkr)
+            ret_open_count[picked_acct] = ret_open_count.get(picked_acct, 0) + 1
+        else:
+            indiv_planned += 1
 
-        # Update in-memory utilization so the next candidate sees current exposure.
         acct_mv[picked_acct] = (
             float(acct_mv.get(picked_acct, 0.0))
             + float(picked_plan["entry_price"]) * int(picked_plan["shares"])
         )
 
-        risk = (picked_plan["entry_price"] - picked_plan["stop_price"]) * int(picked_plan["shares"])
-        print(
-            f"  {picked_acct:<5} {tkr:<6} {sig:<9} "
-            f"Entry {picked_plan['entry_price']:.2f} | Shares {picked_plan['shares']:<5} "
-            f"Stop {picked_plan['stop_price']:.2f} | Target {picked_plan['target_price']:.2f} | Risk ${risk:,.0f}"
-        )
+        # Display differs by strategy type.
+        if picked_acct in (IRA, ROTH):
+            print(
+                f"  {picked_acct:<10} {tkr:<6} BUY-HOLD   "
+                f"Entry {picked_plan['entry_price']:.2f} | "
+                f"Shares {picked_plan['shares']:<4} | "
+                f"Stop {picked_plan['stop_price']:.2f} ({int(RETIREMENT_STOP_LOSS_PCT*100)}% below)"
+            )
+        else:
+            risk = (picked_plan["entry_price"] - picked_plan["stop_price"]) * int(picked_plan["shares"])
+            print(
+                f"  {picked_acct:<10} {tkr:<6} {sig:<9} "
+                f"Entry {picked_plan['entry_price']:.2f} | Shares {picked_plan['shares']:<5} "
+                f"Stop {picked_plan['stop_price']:.2f} | Target {picked_plan['target_price']:.2f} | Risk ${risk:,.0f}"
+            )
 
         planned_stocks.append({
             "ticker":      tkr,
@@ -222,7 +251,6 @@ def plan_and_execute_stocks(
             "account":     picked_acct,
             "entry_price": float(picked_plan["entry_price"]),
         })
-        planned += 1
 
     return stock_opened, planned_stocks
 
