@@ -16,6 +16,7 @@ from utils import get_logger
 from config import (
     INDIVIDUAL, IRA, ROTH,
     INDIVIDUAL_STOCK_CAP,
+    RETIREMENT_STOCK_CAPS,
     WEBHOOK_URL,
     CSP_RISK_OFF_VIX,
     CSP_STRIKE_BASE_NORMAL, CSP_STRIKE_BASE_RISK_OFF,
@@ -63,6 +64,7 @@ def build_discord_alert(
     stock_opens: List[str],
     stock_closes: List[str],
     ret_stopped: List[str] = [],
+    early_asn: List[str] = [],
 ) -> str:
     lines: List[str] = []
     lines.append(f"📅 {dt.date.today().isoformat()} Screener")
@@ -71,9 +73,10 @@ def build_discord_alert(
         f"QQQ {mkt['qqq_close']:.2f} | VIX {mkt['vix_close']:.2f}"
     )
 
-    if csp_tp or csp_exp or csp_asn or cc_exp or cc_call or stock_opens or stock_closes or ret_stopped:
+    if csp_tp or csp_exp or csp_asn or cc_exp or cc_call or stock_opens or stock_closes or ret_stopped or early_asn:
         lines.append("— Maintenance —")
         if ret_stopped:  lines.append(f"🛑 Retirement stops: {', '.join(ret_stopped[:8])}{'…' if len(ret_stopped)>8 else ''}")
+        if early_asn:    lines.append(f"⚠️ Early assigned: {', '.join(early_asn[:8])}{'…' if len(early_asn)>8 else ''}")
         if csp_tp:       lines.append(f"CSP closed (TP): {', '.join(csp_tp[:8])}{'…' if len(csp_tp)>8 else ''}")
         if csp_exp:      lines.append(f"CSP expired: {', '.join(csp_exp[:8])}{'…' if len(csp_exp)>8 else ''}")
         if csp_asn:      lines.append(f"CSP assigned: {', '.join(csp_asn[:8])}{'…' if len(csp_asn)>8 else ''}")
@@ -203,10 +206,61 @@ def print_open_csps(today: dt.date) -> None:
         log.warning("print_open_csps failed: %s", e)
 
 
+# ============================================================
+# Open CC positions summary
+# ============================================================
 
-# ============================================================
-# Open CC roll-candidate signals
-# ============================================================
+def print_open_ccs(today: dt.date, px: Dict[str, float]) -> None:
+    """Print a summary table of all open covered calls with live ITM/OTM status."""
+    try:
+        cc_rows = strat.load_csv_rows(CC_POSITIONS_FILE)
+        open_ccs = [
+            r for r in cc_rows
+            if (r.get("status") or "").upper() == "OPEN"
+        ]
+        if not open_ccs:
+            return
+
+        print("\n📞 OPEN CC POSITIONS")
+        for r in open_ccs:
+            tkr      = (r.get("ticker")   or "").strip().upper()
+            acct     = (r.get("account")  or "").strip().upper()
+            exp      = (r.get("expiry")   or "").strip()
+            strike   = r.get("strike")    or ""
+            prem     = r.get("premium")   or ""
+            contracts = r.get("contracts") or ""
+
+            # Days to expiry
+            dte_str = ""
+            try:
+                if exp:
+                    dte = (dt.date.fromisoformat(exp) - today).days
+                    dte_str = f"{dte}d"
+            except Exception:
+                pass
+
+            # ITM / OTM status vs current price
+            status_str = ""
+            cur = px.get(tkr)
+            try:
+                if cur and cur > 0 and strike:
+                    s = float(strike)
+                    if s > 0:
+                        pct = (cur - s) / s * 100.0
+                        if cur >= s:
+                            status_str = f"🔴 ITM {pct:+.1f}%"
+                        else:
+                            status_str = f"🟢 OTM {pct:+.1f}%"
+            except Exception:
+                pass
+
+            print(
+                f"  [{acct}] {tkr:<6} {exp} {strike}C "
+                f"| prem ${prem} | {contracts}x "
+                f"| {dte_str} {status_str}"
+            )
+    except Exception as e:
+        log.warning("print_open_ccs failed: %s", e)
 
 def print_open_cc_roll_candidates(px: Dict[str, float]) -> None:
     """
@@ -293,8 +347,15 @@ def print_final_exposure_summary(
         print(f"  ⚠️ Breakeven-only flagged: {', '.join(ret_flagged)}")
 
     indiv_stock_mv = float(mv_stock.get(INDIVIDUAL, 0.0))
-    print("\n📦 INDIVIDUAL STOCK CAP (non-wheel swing trades)")
+    print("\n📦 STOCK CAPS (non-wheel positions)")
     print(
-        f"  MV ${indiv_stock_mv:,.0f} / ${float(INDIVIDUAL_STOCK_CAP):,.0f} | "
-        f"Remaining ${max(float(INDIVIDUAL_STOCK_CAP)-indiv_stock_mv, 0.0):,.0f}"
+        f"  INDIVIDUAL   MV ${indiv_stock_mv:>8,.0f} / ${float(INDIVIDUAL_STOCK_CAP):>8,.0f}"
+        f"  | Remaining ${max(float(INDIVIDUAL_STOCK_CAP) - indiv_stock_mv, 0.0):>8,.0f}"
     )
+    for acct in (IRA, ROTH):
+        acct_stock_mv = float(mv_ret.get(acct, 0.0)) + float(mv_stock.get(acct, 0.0))
+        cap = float(RETIREMENT_STOCK_CAPS.get(acct, 0))
+        print(
+            f"  {acct:<12} MV ${acct_stock_mv:>8,.0f} / ${cap:>8,.0f}"
+            f"  | Remaining ${max(cap - acct_stock_mv, 0.0):>8,.0f}"
+        )

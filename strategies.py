@@ -52,6 +52,8 @@ from config import (
     CSP_MIN_PREMIUM_CONSERVATIVE, CSP_MIN_PREMIUM_BALANCED, CSP_MIN_PREMIUM_AGGRESSIVE,
     CSP_MIN_YIELD_CONSERVATIVE, CSP_MIN_YIELD_BALANCED, CSP_MIN_YIELD_AGGRESSIVE,
     CSP_MAX_AGGRESSIVE_TOTAL, CSP_MAX_AGGRESSIVE_PER_WEEK,
+    CSP_MAX_POSITIONS_PER_SECTOR, CSP_TICKER_SECTOR,
+    CSP_EARLY_ASSIGN_ITM_PCT, CSP_EARLY_ASSIGN_WARN_ONLY, CSP_EARLY_ASSIGN_MAX_DTE,
 
     # CC policy
     CC_TARGET_DTE_MIN, CC_TARGET_DTE_MAX,
@@ -87,6 +89,22 @@ def set_data_cache(cache) -> None:
     """Inject the pre-warmed DataCache for this run."""
     global _cache
     _cache = cache
+
+
+# ── Option chain cache (per-run) ────────────────────────────────────────────
+# Keyed by "{ticker}-{expiry}" for full chains, "{ticker}" for expiry listings.
+# Both are reset once per run via reset_chain_cache() so every run sees fresh
+# quotes.  No TTL needed — the screener is single-process and short-lived.
+
+_chain_cache: Dict[str, object] = {}   # key: "{ticker}-{expiry}"
+_expiry_cache: Dict[str, tuple] = {}   # key: "{ticker}"
+
+
+def reset_chain_cache() -> None:
+    """Clear option chain caches.  Called once at screener startup."""
+    global _chain_cache, _expiry_cache
+    _chain_cache = {}
+    _expiry_cache = {}
 
 
 def download_ohlcv(ticker: str, period: str = DATA_PERIOD, interval: str = DATA_INTERVAL) -> pd.DataFrame:
@@ -1132,8 +1150,11 @@ def csp_already_logged(ledger_rows: List[dict], week_id: str, ticker: str, expir
 
 def _pick_expiry_in_dte_range(ticker_obj: yf.Ticker, dte_min: int, dte_max: int) -> Tuple[Optional[str], Optional[int]]:
     today = dt.date.today()
+    ticker_sym = ticker_obj.ticker
+    if ticker_sym not in _expiry_cache:
+        _expiry_cache[ticker_sym] = ticker_obj.options
     expiries: List[Tuple[str, int]] = []
-    for exp_str in ticker_obj.options:
+    for exp_str in _expiry_cache[ticker_sym]:
         try:
             exp_date = dt.date.fromisoformat(exp_str)
             dte = (exp_date - today).days
@@ -1217,7 +1238,10 @@ def evaluate_csp_candidate(
         if not exp_str:
             return None
 
-        chain = t.option_chain(exp_str)
+        chain_key = f"{ticker}-{exp_str}"
+        if chain_key not in _chain_cache:
+            _chain_cache[chain_key] = t.option_chain(exp_str)
+        chain = _chain_cache[chain_key]
         puts = chain.puts.copy()
         if puts.empty:
             return None
@@ -1316,6 +1340,11 @@ def allowed_tiers_for_regime(reg: str) -> set:
     return {"CONSERVATIVE", "BALANCED", "AGGRESSIVE"}
 
 
+def get_ticker_sector(ticker: str) -> str:
+    """Return the sector label for a ticker, or 'OTHER' if not mapped."""
+    return CSP_TICKER_SECTOR.get((ticker or "").strip().upper(), "OTHER")
+
+
 def plan_weekly_csp_orders(
     csp_candidates: List[dict],
     *,
@@ -1325,6 +1354,7 @@ def plan_weekly_csp_orders(
     week_remaining_cap: float,
     aggressive_total: int,
     aggressive_week: int,
+    open_sector_counts: Dict[str, int] = {},
 ) -> Dict[str, object]:
     week_id = iso_week_id(today)
     reg = csp_regime(vix_close)
@@ -1348,6 +1378,9 @@ def plan_weekly_csp_orders(
     total_remaining = float(total_remaining_cap)
     week_remaining = float(week_remaining_cap)
 
+    # Start sector counts from existing open positions; grow as we select within this run.
+    sector_counts: Dict[str, int] = dict(open_sector_counts)
+
     for idea in enriched:
         tkr = idea["ticker"]
         if tkr in used:
@@ -1366,8 +1399,18 @@ def plan_weekly_csp_orders(
             if aggressive_week >= CSP_MAX_AGGRESSIVE_PER_WEEK:
                 continue
 
+        # Sector concentration check — applied globally across accounts.
+        sector = get_ticker_sector(tkr)
+        if sector != "OTHER" and sector_counts.get(sector, 0) >= CSP_MAX_POSITIONS_PER_SECTOR:
+            log.debug(
+                "CSP %s skipped: sector %s already at limit (%d)",
+                tkr, sector, CSP_MAX_POSITIONS_PER_SECTOR,
+            )
+            continue
+
         selected.append(idea)
         used.add(tkr)
+        sector_counts[sector] = sector_counts.get(sector, 0) + 1
 
         week_remaining -= cash
         total_remaining -= cash
@@ -1522,7 +1565,10 @@ def process_csp_take_profits(today: dt.date) -> Dict[str, List[str]]:
 
         try:
             t = yf.Ticker(ticker)
-            chain = t.option_chain(exp_str)
+            chain_key = f"{ticker}-{exp_str}"
+            if chain_key not in _chain_cache:
+                _chain_cache[chain_key] = t.option_chain(exp_str)
+            chain = _chain_cache[chain_key]
             puts = chain.puts
             if puts is None or puts.empty:
                 log.info("CSP TP %s %s: no put chain available; skipping", ticker, exp_str)
@@ -1680,6 +1726,107 @@ def process_csp_expirations(today: dt.date) -> Dict[str, List[str]]:
     return {"expired": expired, "assigned": assigned}
 
 
+def scan_early_assignments(today: dt.date) -> Dict[str, List[str]]:
+    """Detect OPEN CSPs that are deeply ITM and likely already assigned.
+
+    American-style equity options can be exercised any business day.  Waiting
+    until the scheduled expiry date means the screener is blind to the assignment
+    for potentially weeks — no lot is created, no CC income is started, and the
+    position still appears as a live CSP eating into wheel capital.
+
+    Trigger: current_price <= strike * (1 - CSP_EARLY_ASSIGN_ITM_PCT)
+
+    Behaviour is controlled by CSP_EARLY_ASSIGN_WARN_ONLY:
+      False (default) — mark status ASSIGNED immediately, same fields as
+                        process_csp_expirations; create_lots_from_new_assignments
+                        will pick it up on the next call in the same run.
+      True            — log a warning and return the list for Discord alerting;
+                        no state change.
+
+    Returns {"warned": [...], "assigned": [...]} so the caller can surface
+    both modes in the Discord alert.
+    """
+    ensure_positions_files()
+    rows = load_csv_rows(CSP_POSITIONS_FILE)
+    if not rows:
+        return {"warned": [], "assigned": []}
+
+    threshold = float(CSP_EARLY_ASSIGN_ITM_PCT)
+    warned:   List[str] = []
+    assigned: List[str] = []
+    changed = False
+
+    for r in rows:
+        if (r.get("status") or "").upper() != "OPEN":
+            continue
+
+        exp_str = (r.get("expiry") or "").strip()
+        try:
+            exp = dt.date.fromisoformat(exp_str)
+        except Exception as e:
+            log.debug("scan_early_assignments: bad expiry %r: %s", exp_str, e)
+            continue
+
+        # Only scan positions that haven't expired yet — expirations are handled
+        # by process_csp_expirations which runs before this in the same step.
+        if exp <= today:
+            continue
+
+        # DTE gate: only trigger within the final days of the contract.
+        # A high-beta stock with 10+ DTE can still recover; one with 3 DTE cannot.
+        dte = (exp - today).days
+        if dte > CSP_EARLY_ASSIGN_MAX_DTE:
+            continue
+
+        ticker    = (r.get("ticker") or "").strip().upper()
+        strike    = safe_float(r.get("strike"), 0.0)
+        contracts = safe_int(r.get("contracts"), 0)
+        if not ticker or strike <= 0 or contracts < 1:
+            continue
+
+        try:
+            df = download_ohlcv(ticker)   # cache-first, no extra network call
+            if df is None or df.empty:
+                continue
+            current_price = float(df["Close"].iloc[-1])
+        except Exception as e:
+            log.warning("scan_early_assignments: price fetch failed for %s: %s", ticker, e)
+            continue
+
+        # Is the stock deeply enough ITM to trigger?
+        itm_threshold_price = strike * (1.0 - threshold)
+        if current_price > itm_threshold_price:
+            continue   # OTM or only mildly ITM — normal, leave it alone
+
+        pct_itm = (strike - current_price) / strike * 100.0
+        label   = f"{ticker} {exp_str} {strike:.0f}P ({pct_itm:.1f}% ITM, {dte}d left, current {current_price:.2f})"
+
+        if CSP_EARLY_ASSIGN_WARN_ONLY:
+            log.warning("Early assignment candidate: %s", label)
+            warned.append(label)
+            continue
+
+        # Auto-mark as ASSIGNED — identical fields to process_csp_expirations.
+        shares    = contracts * 100
+        est_prem  = safe_float(r.get("premium"), 0.0)
+
+        r["status"]                      = "ASSIGNED"
+        r["close_type"]                  = "ASSIGNED_EARLY"
+        r["close_date"]                  = today.isoformat()
+        r["underlying_close_at_expiry"]  = f"{current_price:.2f}"
+        r["shares_if_assigned"]          = str(shares)
+        r["assignment_cost_basis"]       = f"{(strike * shares - est_prem):.2f}"
+
+        assigned.append(label)
+        changed = True
+        log.info("Early assignment auto-marked: %s", label)
+
+    if changed:
+        write_csv_rows(CSP_POSITIONS_FILE, rows, CSP_POSITIONS_COLUMNS)
+
+    return {"warned": warned, "assigned": assigned}
+
+
 # ============================================================
 # CC planning from assigned CSPs (classic wheel)
 # ============================================================
@@ -1814,7 +1961,10 @@ def plan_covered_calls(today: dt.date, assigned_rows: List[dict], open_cc_lot_id
             if not exp_str:
                 log.info("CC %s: no expiry in %d–%d DTE window", ticker, CC_TARGET_DTE_MIN, CC_TARGET_DTE_MAX)
                 continue
-            chain = t.option_chain(exp_str)
+            chain_key = f"{ticker}-{exp_str}"
+            if chain_key not in _chain_cache:
+                _chain_cache[chain_key] = t.option_chain(exp_str)
+            chain = _chain_cache[chain_key]
             calls = chain.calls.copy()
             if calls.empty:
                 continue

@@ -90,6 +90,14 @@ WHEEL_CAP_PCT = WHEEL_ACCOUNT_CONFIG[INDIVIDUAL]["cap_pct"]
 INDIVIDUAL_STOCK_CAP_PCT = 1.0 - WHEEL_CAP_PCT
 INDIVIDUAL_STOCK_CAP = int(ACCOUNT_SIZES[INDIVIDUAL] * INDIVIDUAL_STOCK_CAP_PCT)
 
+# Retirement stock cap: same logic — the slice of each account not reserved for the wheel.
+# Covers both tactical swing entries and long-hold retirement positions combined.
+RETIREMENT_STOCK_CAP_PCT = 1.0 - WHEEL_ACCOUNT_CONFIG[IRA]["cap_pct"]
+RETIREMENT_STOCK_CAPS: Dict[str, int] = {
+    IRA:  int(ACCOUNT_SIZES[IRA]  * RETIREMENT_STOCK_CAP_PCT),
+    ROTH: int(ACCOUNT_SIZES[ROTH] * RETIREMENT_STOCK_CAP_PCT),
+}
+
 # Retirement accounts can be more aggressive but still capped by account size
 RETIREMENT_MAX_EQUITY_UTIL_PCT = 0.98  # cash buffer
 
@@ -329,6 +337,90 @@ CSP_MIN_YIELD_AGGRESSIVE = 0.020
 # ---- Tier caps ----
 CSP_MAX_AGGRESSIVE_TOTAL = 4
 CSP_MAX_AGGRESSIVE_PER_WEEK = 2
+
+# ---- Early assignment detection ----
+# Scan OPEN CSPs daily and flag (or auto-mark) those deeply ITM.
+# American-style options can be exercised any time — waiting until the
+# scheduled expiry date leaves assigned lots unrecognised for days,
+# blocking CC income and distorting exposure calculations.
+#
+# BOTH conditions must be true to trigger:
+#   1. current_price <= strike * (1 - CSP_EARLY_ASSIGN_ITM_PCT)
+#      Stock must be this far below the put strike.  15% is deep enough
+#      that even high-beta names are very unlikely to recover in time.
+#   2. DTE <= CSP_EARLY_ASSIGN_MAX_DTE
+#      Only fires in the final days of the contract — same expiry week.
+#      With 3 days left there is almost no realistic path back OTM for a
+#      deeply ITM position, so auto-marking is safe.
+#
+# Together these prevent phantom assignments on volatile names like ASTS
+# where a 10% ITM position with 8+ DTE still has a real chance of recovery.
+CSP_EARLY_ASSIGN_ITM_PCT = 0.15    # 15% below strike required
+CSP_EARLY_ASSIGN_MAX_DTE = 3       # must be within 3 calendar days of expiry
+
+# False  → auto-mark ASSIGNED immediately (starts CC income sooner, recommended).
+# True   → warn only, no state change (safer if you want manual confirmation).
+CSP_EARLY_ASSIGN_WARN_ONLY = False
+
+# ---- Sector concentration limit ----
+# No more than this many simultaneously OPEN CSPs in the same sector.
+# Counts both existing open positions and new entries selected in the same run.
+# Global across all accounts — the same underlying risk exists regardless of account.
+CSP_MAX_POSITIONS_PER_SECTOR = 2
+
+# Static ticker→sector map covering the full CSP_STOCKS universe.
+# Tickers not listed here fall into "OTHER" (no concentration limit applied).
+# Sectors are intentionally broad — the goal is to prevent correlated-assignment
+# blowups (e.g., all tech puts going ITM together), not precise GICS classification.
+CSP_TICKER_SECTOR: Dict[str, str] = {
+    # ── Technology ──────────────────────────────────────────────────
+    "AAPL":  "TECH", "MSFT": "TECH", "NVDA": "TECH", "AVGO": "TECH",
+    "TSM":   "TECH", "ASML": "TECH", "ORCL": "TECH", "CRM":  "TECH",
+    "ADBE":  "TECH", "INTU": "TECH", "AMD":  "TECH", "MU":   "TECH",
+    "INTC":  "TECH", "ON":   "TECH", "MCHP": "TECH", "ANET": "TECH",
+    "CDNS":  "TECH", "SNPS": "TECH", "ADSK": "TECH", "SMH":  "TECH",
+    "PLTR":  "TECH", "NET":  "TECH", "MDB":  "TECH", "SNOW": "TECH",
+
+    # ── Internet / E-Commerce ────────────────────────────────────────
+    "GOOGL": "INTERNET", "META": "INTERNET",
+    "NFLX":  "INTERNET", "SHOP":  "INTERNET",
+
+    # ── Financials ───────────────────────────────────────────────────
+    "V":    "FINANCIALS", "MA":  "FINANCIALS", "JPM": "FINANCIALS",
+    "GS":   "FINANCIALS", "MS":  "FINANCIALS", "BAC": "FINANCIALS",
+    "C":    "FINANCIALS", "AXP": "FINANCIALS", "BLK": "FINANCIALS",
+    "XLF":  "FINANCIALS",
+
+    # ── Healthcare ───────────────────────────────────────────────────
+    "LLY":  "HEALTHCARE", "ABBV": "HEALTHCARE", "UNH": "HEALTHCARE",
+    "VRTX": "HEALTHCARE", "PFE":  "HEALTHCARE", "MRK": "HEALTHCARE",
+    "BMY":  "HEALTHCARE", "ZTS":  "HEALTHCARE", "ELV": "HEALTHCARE",
+    "XLV":  "HEALTHCARE",
+
+    # ── Consumer Discretionary ───────────────────────────────────────
+    "AMZN": "CONSUMER_DISC", "LULU": "CONSUMER_DISC", "CMG": "CONSUMER_DISC",
+    "MCD":  "CONSUMER_DISC", "SBUX": "CONSUMER_DISC", "HD":  "CONSUMER_DISC",
+    "LOW":  "CONSUMER_DISC", "TGT":  "CONSUMER_DISC", "ABNB": "CONSUMER_DISC",
+    "UBER": "CONSUMER_DISC", "CELH": "CONSUMER_DISC", "BROS": "CONSUMER_DISC",
+    "ROST": "CONSUMER_DISC", "TJX":  "CONSUMER_DISC",
+
+    # ── Consumer Staples ─────────────────────────────────────────────
+    "WMT":  "STAPLES", "COST": "STAPLES", "KO":  "STAPLES",
+    "PEP":  "STAPLES", "PG":   "STAPLES", "CL":  "STAPLES",
+    "GIS":  "STAPLES", "KHC":  "STAPLES", "SCHD": "STAPLES",
+
+    # ── Energy ───────────────────────────────────────────────────────
+    "XOM":  "ENERGY", "CVX": "ENERGY", "COP": "ENERGY", "XLE": "ENERGY",
+
+    # ── Industrials ──────────────────────────────────────────────────
+    "DE":   "INDUSTRIALS", "CAT": "INDUSTRIALS", "ETN": "INDUSTRIALS",
+    "PH":   "INDUSTRIALS", "EMR": "INDUSTRIALS", "CARR": "INDUSTRIALS",
+    "SHW":  "INDUSTRIALS",
+
+    # ── Broad ETFs (low correlation — treated as their own sector) ───
+    "SPY":  "ETF_BROAD", "SPLG": "ETF_BROAD", "QQQ": "ETF_BROAD",
+    "JEPI": "ETF_BROAD", "XLU":  "ETF_BROAD",
+}
 
 # ============================================================
 # Covered Call (CC) policy

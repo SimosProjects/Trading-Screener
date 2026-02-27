@@ -38,6 +38,7 @@ from screener_display import (
     print_market_context,
     print_open_holdings,
     print_open_csps,
+    print_open_ccs,
     print_open_cc_roll_candidates,
     print_final_exposure_summary,
     build_discord_alert,
@@ -97,6 +98,7 @@ def run_screener() -> None:
     cache = DataCache(all_equity_tickers)
     cache.warm()
     strat.set_data_cache(cache)
+    strat.reset_chain_cache()   # fresh option chain cache for this run
     _wheel_mod.set_data_cache(cache)
 
     # ── 2. Market context + regime ────────────────────────────────
@@ -128,6 +130,7 @@ def run_screener() -> None:
 
     print_open_holdings(holdings)
     print_open_csps(today)
+    print_open_ccs(today, px)
 
     # ── 5. Close stock positions at stop / target ─────────────────
     closes       = strat.update_and_close_stock_positions(today, mkt)
@@ -141,11 +144,22 @@ def run_screener() -> None:
             print(f"  {s}")
 
     # ── 6. Wheel maintenance ──────────────────────────────────────
-    csp_tp_out = strat.process_csp_take_profits(today)
-    csp_out    = strat.process_csp_expirations(today)
-    cc_out     = process_cc_expirations(today)
+    csp_tp_out    = strat.process_csp_take_profits(today)
+    csp_out       = strat.process_csp_expirations(today)
+    cc_out        = process_cc_expirations(today)
+    early_asn_out = strat.scan_early_assignments(today)
     create_lots_from_new_assignments(today)
     link_new_ccs_to_lots(today)
+
+    if early_asn_out.get("assigned"):
+        print("\n⚠️  EARLY ASSIGNMENTS AUTO-MARKED")
+        for s in early_asn_out["assigned"]:
+            print(f"  {s}")
+
+    if early_asn_out.get("warned"):
+        print("\n⚠️  EARLY ASSIGNMENT CANDIDATES (warn-only)")
+        for s in early_asn_out["warned"]:
+            print(f"  {s}")
 
     if csp_tp_out.get("closed"):
         print("\n✅ CSP TAKE-PROFITS CLOSED")
@@ -196,6 +210,14 @@ def run_screener() -> None:
             and (c.get("ticker") or "").strip().upper() not in open_cc_tickers
         ]
 
+        # Count how many open CSPs already exist per sector so plan_weekly_csp_orders
+        # can enforce the global per-sector cap across all accounts.
+        open_sector_counts: dict = {}
+        for tkr in open_csp_tickers:
+            sec = strat.get_ticker_sector(tkr)
+            if sec != "OTHER":
+                open_sector_counts[sec] = open_sector_counts.get(sec, 0) + 1
+
         # Allocation priority: INDIVIDUAL first, then IRA vs ROTH by weekly
         # utilisation (whichever has used less of its weekly target gets priority).
         exp_ira  = compute_wheel_exposure(today, IRA)
@@ -242,6 +264,7 @@ def run_screener() -> None:
                 week_remaining_cap=float(week_remaining),
                 aggressive_total=int(exp.get("aggressive_total", 0)),
                 aggressive_week=int(exp.get("aggressive_week", 0)),
+                open_sector_counts=open_sector_counts,
             )
 
             orders = plan.get("selected", [])
@@ -362,6 +385,7 @@ def run_screener() -> None:
         stock_opens=stock_opened,
         stock_closes=stock_closed,
         ret_stopped=ret_stops.get("stopped", []),
+        early_asn=early_asn_out.get("assigned", []) + early_asn_out.get("warned", []),
     )
     send_discord(alert)
 
