@@ -50,14 +50,16 @@ from config import (
     CSP_TARGET_DTE_MIN, CSP_TARGET_DTE_MAX,
     CSP_TAKE_PROFIT_PCT, CSP_TP_MAX_SPREAD_PCT,
     CSP_MAX_CASH_PER_TRADE,
-    CSP_MIN_OI, CSP_MIN_VOLUME, CSP_MIN_BID, CSP_MIN_IV,
+    CSP_MIN_OI, CSP_MIN_OI_ETF, CSP_MIN_VOLUME, CSP_MIN_BID, CSP_MIN_IV,
     CSP_STRIKE_MODE,
     CSP_STRIKE_BASE_NORMAL,
     CSP_MIN_PREMIUM_CONSERVATIVE, CSP_MIN_PREMIUM_BALANCED, CSP_MIN_PREMIUM_AGGRESSIVE,
     CSP_MIN_YIELD_CONSERVATIVE, CSP_MIN_YIELD_BALANCED, CSP_MIN_YIELD_AGGRESSIVE,
+    CSP_MIN_YIELD_CONSERVATIVE_LOW_IV, CSP_MIN_YIELD_BALANCED_LOW_IV,
     CSP_MAX_AGGRESSIVE_TOTAL, CSP_MAX_AGGRESSIVE_PER_WEEK,
     CSP_MAX_POSITIONS_PER_SECTOR, CSP_TICKER_SECTOR,
     CSP_EARLY_ASSIGN_ITM_PCT, CSP_EARLY_ASSIGN_WARN_ONLY, CSP_EARLY_ASSIGN_MAX_DTE,
+    CSP_ROLL_CANDIDATE_ITM_PCT, CSP_ROLL_CANDIDATE_MIN_DTE,
 
     # CC policy
     CC_TARGET_DTE_MIN, CC_TARGET_DTE_MAX,
@@ -65,6 +67,8 @@ from config import (
     CC_UNDERWATER_MILD_PCT, CC_UNDERWATER_DEEP_PCT,
     CC_STRIKE_FLOOR_BELOW_CURRENT_PCT,
     CC_MIN_BID,
+    CC_TAKE_PROFIT_PCT, CC_TP_MAX_SPREAD_PCT,
+    CC_DTE_BY_TIER,
 
     # slippage / fill model
     STOCK_SLIPPAGE_PER_SHARE,
@@ -126,6 +130,38 @@ def download_ohlcv(ticker: str, period: str = DATA_PERIOD, interval: str = DATA_
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
     return df
+
+
+def get_live_price(ticker: str) -> Optional[float]:
+    """Return the most current price available for a ticker.
+
+    Tries yfinance fast_info (intraday last price) first so that pre-market
+    screener runs use today's actual market price, not yesterday's close.
+    Falls back to the DataCache/OHLCV iloc[-1] so the function always returns
+    something even when fast_info is unavailable (weekends, network issues).
+
+    This is used wherever a strategy *decision* depends on where the stock is
+    right now — roll candidate detection, early assignment gating, CC strike
+    selection — rather than just historical indicator calculation.
+    """
+    # Attempt live fast_info first
+    try:
+        info = yf.Ticker(ticker).fast_info
+        price = float(info.get("last_price") or info.get("lastPrice") or 0.0)
+        if price > 0:
+            return price
+    except Exception as e:
+        log.debug("get_live_price: fast_info failed for %s: %s", ticker, e)
+
+    # Fall back to DataCache / OHLCV last close
+    try:
+        df = download_ohlcv(ticker)
+        if df is not None and not df.empty:
+            return float(df["Close"].iloc[-1])
+    except Exception as e:
+        log.debug("get_live_price: ohlcv fallback failed for %s: %s", ticker, e)
+
+    return None
 
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -1163,43 +1199,89 @@ def append_csp_ledger_row(row: dict) -> None:
 
     We store *total premium dollars* in 'premium' (not per-contract credit).
     If caller provides only credit_mid, we compute premium.
+
+    All float fields are rounded to 2 decimal places before writing to
+    prevent binary floating-point garbage (e.g. 124.50000000000001).
+    account column is included so IRA/ROTH trades are distinguishable.
+    A trailing newline is ensured before appending to prevent row-gluing.
     """
-    fieldnames = ["date","week_id","ticker","expiry","strike","contracts","premium","cash_reserved","tier"]
+    fieldnames = ["date","week_id","account","ticker","expiry","strike","contracts","premium","cash_reserved","tier"]
     file_exists = os.path.isfile(CSP_LEDGER_FILE)
 
-    # normalize
+    # normalize contracts
     try:
         contracts = int(float(row.get("contracts") or 0)) or 1
     except Exception as e:
         log.warning("append_csp_ledger_row: bad contracts value for %s: %s",
                     row.get("ticker", "?"), e)
         contracts = 1
+
+    # compute premium if not supplied
     if "premium" not in row or row.get("premium") in ("", None):
         try:
             credit_mid = float(row.get("credit_mid") or 0.0)
-            row["premium"] = f"{credit_mid * 100.0 * contracts:.2f}"
+            row["premium"] = round(credit_mid * 100.0 * contracts, 2)
         except Exception as e:
             log.warning("append_csp_ledger_row: could not compute premium for %s: %s",
                         row.get("ticker", "?"), e)
             row["premium"] = ""
 
+    # Round all float fields to 2dp to eliminate binary float artifacts
+    for fld in ("strike", "premium", "cash_reserved"):
+        try:
+            if row.get(fld) not in ("", None):
+                row[fld] = f"{float(row[fld]):.2f}"
+        except Exception:
+            pass
+
+    # Ensure trailing newline before appending (prevents row-gluing on crash/retry)
+    if file_exists:
+        try:
+            with open(CSP_LEDGER_FILE, "rb") as f:
+                f.seek(0, 2)
+                if f.tell() > 0:
+                    f.seek(-1, 2)
+                    if f.read(1) != b"\n":
+                        with open(CSP_LEDGER_FILE, "a") as fa:
+                            fa.write("\n")
+        except Exception as e:
+            log.warning("append_csp_ledger_row: trailing newline check failed: %s", e)
+
     with open(CSP_LEDGER_FILE, mode="a", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
+        w = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore", lineterminator="\n")
         if not file_exists:
             w.writeheader()
         w.writerow({k: row.get(k, "") for k in fieldnames})
 
 
 
-def csp_already_logged(ledger_rows: List[dict], week_id: str, ticker: str, expiry: str, strike: float) -> bool:
+def csp_already_logged(
+    ledger_rows: List[dict],
+    week_id: str,
+    ticker: str,
+    expiry: str,
+    strike: float,
+    account: str = "",
+) -> bool:
+    """Return True if this CSP has already been logged in the ledger.
+
+    Matching requires week_id + ticker + expiry + strike to all match.
+    If account is provided (non-empty), it must also match — this prevents
+    the same ticker/strike/expiry in two different accounts being incorrectly
+    treated as duplicates (e.g. selling same put in both IRA and ROTH).
+    For legacy rows without an account column, account matching is skipped.
+    """
     for r in ledger_rows:
         try:
             if (r["week_id"] == week_id
                     and r["ticker"] == ticker
                     and r["expiry"] == expiry
-                    # Tolerance of half a cent handles float->string->float round-trips
-                    # (e.g. 50.0 stored as "50.0" parsed back as 50.000000001).
                     and abs(float(r["strike"]) - float(strike)) < 0.005):
+                # Account check: only apply if both sides have a non-empty account
+                row_acct = (r.get("account") or "").strip().upper()
+                chk_acct = (account or "").strip().upper()
+                if row_acct and chk_acct and row_acct != chk_acct:
+                    continue   # same trade in a different account — not a duplicate
                 return True
         except Exception as e:
             log.debug("csp_already_logged: bad row data (week=%s ticker=%s): %s", week_id, ticker, e)
@@ -1323,7 +1405,10 @@ def evaluate_csp_candidate(
 
         if bid < CSP_MIN_BID or ask <= 0 or ask < bid:
             return None
-        if oi < CSP_MIN_OI or vol < CSP_MIN_VOLUME:
+        # ETF_BROAD tickers are deeply liquid — lower OI floor is fine.
+        # All other tickers use the higher stock OI floor for stress-scenario rolls.
+        oi_floor = CSP_MIN_OI_ETF if get_ticker_sector(ticker) == "ETF_BROAD" else CSP_MIN_OI
+        if oi < oi_floor or vol < CSP_MIN_VOLUME:
             return None
         if CSP_MIN_IV and iv < CSP_MIN_IV:
             return None
@@ -1339,6 +1424,16 @@ def evaluate_csp_candidate(
         cash_reserved = cash_required_per_contract * contracts
         yield_pct = est_premium / cash_reserved if cash_reserved > 0 else 0.0
 
+        # Slippage-adjusted fill: retail put sells fill between bid and mid.
+        # Deduct per-contract commission.  This is the actual dollars collected
+        # and is stored separately from est_premium so cost_basis at assignment
+        # uses the real fill, not the optimistic mid-price.
+        fill_per_share = bid + (mid - bid) * float(OPT_SELL_FILL_PCT)
+        fill_premium = round(
+            fill_per_share * 100.0 * contracts - OPT_COMMISSION_PER_CONTRACT * contracts,
+            2,
+        )
+
         return {
             "ticker": ticker,
             "expiry": exp_str,
@@ -1350,7 +1445,8 @@ def evaluate_csp_candidate(
             "iv": iv,
             "contracts": int(contracts),
             "cash_reserved": float(cash_reserved),
-            "est_premium": float(est_premium),
+            "est_premium": float(est_premium),   # mid-price; used for display/scoring
+            "fill_premium": float(fill_premium),  # actual fill after slippage+commission
             "yield_pct": float(yield_pct),
             "atr_mult": float(atr_mult),
             "reason": f"Strike≈{base_ma}-{atr_mult:.2f}*ATR, minOTM={min_otm_pct:.0%} (raw {raw_strike:.2f})",
@@ -1399,6 +1495,27 @@ def allowed_tiers_for_regime(reg: str) -> set:
     return {"CONSERVATIVE", "BALANCED", "AGGRESSIVE"}
 
 
+def classify_csp_tier_for_regime(idea: dict, reg: str) -> str:
+    """Classify a CSP idea into a tier using regime-appropriate yield floors.
+
+    LOW_IV (VIX < 18): raises minimum yields so we don't sell thin premium
+    for the same downside risk. AGGRESSIVE blocked via allowed_tiers_for_regime.
+    NORMAL / HIGH_IV: standard thresholds.
+    """
+    prem = float(idea["est_premium"])
+    y    = float(idea["yield_pct"])
+
+    if reg == "LOW_IV":
+        if prem >= CSP_MIN_PREMIUM_BALANCED and y >= CSP_MIN_YIELD_BALANCED_LOW_IV:
+            return "BALANCED"
+        if prem >= CSP_MIN_PREMIUM_CONSERVATIVE and y >= CSP_MIN_YIELD_CONSERVATIVE_LOW_IV:
+            return "CONSERVATIVE"
+        return "REJECT"
+
+    # NORMAL / HIGH_IV: use standard thresholds
+    return classify_csp_tier(idea)
+
+
 def get_ticker_sector(ticker: str) -> str:
     """Return the sector label for a ticker, or 'OTHER' if not mapped."""
     return CSP_TICKER_SECTOR.get((ticker or "").strip().upper(), "OTHER")
@@ -1414,18 +1531,37 @@ def plan_weekly_csp_orders(
     aggressive_total: int,
     aggressive_week: int,
     open_sector_counts: Dict[str, int] = {},
+    live_vix: Optional[float] = None,
 ) -> Dict[str, object]:
+    from config import VIX_INTRADAY_SPIKE_THRESHOLD
     week_id = iso_week_id(today)
-    reg = csp_regime(vix_close)
+    reg     = csp_regime(vix_close)
     allowed = allowed_tiers_for_regime(reg)
+
+    # Intraday VIX spike guard: if live VIX has moved sharply above the prior-day
+    # EOD close, the market regime is worse than yesterday suggested. Downgrade
+    # AGGRESSIVE candidates to BALANCED so we don't sell puts into a morning panic.
+    vix_spiked = (
+        live_vix is not None
+        and live_vix > vix_close + float(VIX_INTRADAY_SPIKE_THRESHOLD)
+    )
+    if vix_spiked:
+        log.warning(
+            "Intraday VIX spike: live %.2f vs EOD close %.2f (+%.1f pts) — "
+            "AGGRESSIVE tier downgraded to BALANCED for this run.",
+            live_vix, vix_close, live_vix - vix_close,
+        )
 
     enriched: List[dict] = []
     for idea in csp_candidates:
-        tier = classify_csp_tier(idea)
+        tier = classify_csp_tier_for_regime(idea, reg)
         if tier == "REJECT" or tier not in allowed:
             continue
+        # Apply intraday VIX guard: silently cap AGGRESSIVE at BALANCED
+        if vix_spiked and tier == "AGGRESSIVE":
+            tier = "BALANCED"
         idea2 = dict(idea)
-        idea2["tier"] = tier
+        idea2["tier"]  = tier
         idea2["score"] = score_csp_idea(idea2)
         enriched.append(idea2)
 
@@ -1557,6 +1693,9 @@ def add_csp_position_from_selected(today: str, week_id: str, idea: dict) -> Tupl
         "contracts": str(int(idea["contracts"])),
         "cash_reserved": f"{float(idea['cash_reserved']):.2f}",
         "premium": f"{float(idea['est_premium']):.2f}",
+        # fill_premium = slippage+commission-adjusted actual fill.
+        # Falls back to est_premium for hand-crafted or legacy idea dicts.
+        "fill_premium": f"{float(idea.get('fill_premium') or idea.get('est_premium') or 0.0):.2f}",
         "tier": idea.get("tier", ""),
         "status": "OPEN",
         "close_date": "",
@@ -1694,6 +1833,254 @@ def process_csp_take_profits(today: dt.date) -> Dict[str, List[str]]:
     return {"closed": closed}
 
 
+# ============================================================
+# CC take-profit scan (mirrors CSP TP logic)
+# ============================================================
+
+def scan_cc_take_profits(today: dt.date) -> Dict[str, List[dict]]:
+    """Close open CCs that have decayed to <= 50% of their opening premium.
+
+    Closing early frees the lot's CC slot so a new covered call can be
+    opened at the current (likely higher) strike for fresh premium income.
+    This compounds the wheel income without waiting for full expiry.
+
+    Returns {"closed": [{summary, ticker, expiry, strike, contracts,
+                          ref_id, source_lot_id, buyback, profit}, ...]}
+    """
+    ensure_positions_files()
+    rows = load_csv_rows(CC_POSITIONS_FILE)
+    if not rows:
+        return {"closed": []}
+
+    closed: List[dict] = []
+    changed = False
+
+    for r in rows:
+        if (r.get("status") or "").upper() != "OPEN":
+            continue
+
+        exp_str = (r.get("expiry") or "").strip()
+        try:
+            if not exp_str:
+                continue
+            if dt.date.fromisoformat(exp_str) <= today:
+                continue   # expiry handled by process_cc_expirations
+        except Exception as e:
+            log.warning("scan_cc_take_profits: bad expiry %r for %s: %s",
+                        exp_str, r.get("ticker", "?"), e)
+            continue
+
+        ticker    = (r.get("ticker") or "").strip().upper()
+        strike    = safe_float(r.get("strike"), 0.0)
+        contracts = safe_int(r.get("contracts"), 0)
+        orig_premium = safe_float(r.get("premium"), 0.0)
+
+        if orig_premium <= 0 or strike <= 0 or contracts < 1 or not ticker:
+            continue
+
+        tp_threshold = orig_premium * float(CC_TAKE_PROFIT_PCT)
+
+        try:
+            t         = yf.Ticker(ticker)
+            chain_key = f"{ticker}-{exp_str}"
+            if chain_key not in _chain_cache:
+                _chain_cache[chain_key] = t.option_chain(exp_str)
+            chain = _chain_cache[chain_key]
+            calls = chain.calls
+            if calls is None or calls.empty:
+                log.info("CC TP %s %s: no call chain; skipping", ticker, exp_str)
+                continue
+
+            row = calls.loc[calls["strike"] == strike]
+            if row.empty:
+                log.info("CC TP %s %s: strike %.2f not in chain; skipping", ticker, exp_str, strike)
+                continue
+            row = row.iloc[0]
+
+            bid = safe_float(row.get("bid"), 0.0)
+            ask = safe_float(row.get("ask"), 0.0)
+            if bid <= 0 or ask <= 0 or ask < bid:
+                log.info("CC TP %s %s: bad quote bid=%.2f ask=%.2f; skipping",
+                         ticker, exp_str, bid, ask)
+                continue
+
+            mid        = (bid + ask) / 2.0
+            spread_pct = (ask - bid) / mid
+            if spread_pct > float(CC_TP_MAX_SPREAD_PCT):
+                log.info("CC TP %s %s: spread %.0f%% too wide; skipping",
+                         ticker, exp_str, spread_pct * 100)
+                continue
+
+            current_value = mid * 100.0 * contracts
+
+        except Exception as e:
+            log.warning("scan_cc_take_profits: chain fetch failed for %s %s: %s",
+                        ticker, exp_str, e)
+            continue
+
+        if current_value > tp_threshold:
+            continue   # not enough decay yet
+
+        profit = orig_premium - current_value
+        r["status"]     = "CLOSED_TP"
+        r["close_date"] = today.isoformat()
+        r["close_type"] = "CLOSED_TAKE_PROFIT"
+        r["notes"]      = (
+            f"CC TP at {float(CC_TAKE_PROFIT_PCT)*100:.0f}%: "
+            f"orig ${orig_premium:.0f} → now ${current_value:.0f} | profit ${profit:.0f}"
+        )
+        changed = True
+        closed.append({
+            "summary":       f"{ticker} {exp_str} {strike:.0f}C (${profit:.0f} profit)",
+            "ticker":        ticker,
+            "expiry":        exp_str,
+            "strike":        strike,
+            "contracts":     contracts,
+            "ref_id":        (r.get("id") or ""),
+            "source_lot_id": (r.get("source_lot_id") or ""),
+            "buyback":       float(current_value),
+            "profit":        float(profit),
+        })
+        log.info("CC TP closed: %s %s %.0fC — orig $%.0f now $%.0f profit $%.0f",
+                 ticker, exp_str, strike, orig_premium, current_value, profit)
+
+    if changed:
+        write_csv_rows(CC_POSITIONS_FILE, rows, CC_POSITIONS_COLUMNS)
+
+        # Clear the has_open_cc / cc_id flags on parent lots so new CCs can
+        # be planned for these lots next run.
+        #
+        # IMPORTANT: We cannot use `from wheel import ...` here because Python
+        # will resolve "wheel" to the installed system 'wheel' package instead
+        # of our local wheel.py. Use sys.modules to get our already-imported
+        # wheel module directly (it is always imported at screener startup via
+        # `import wheel as _wheel_mod`).
+        try:
+            import sys
+            _whl = sys.modules.get("wheel")
+            if _whl is None:
+                raise ImportError("wheel module not found in sys.modules — was it imported?")
+            _whl_read   = _whl._read_rows
+            _whl_write  = _whl._write_rows
+            _WLF        = _whl.WHEEL_LOTS_FILE
+            _LOT_FIELDS = _whl.LOT_FIELDS
+            lots = _whl_read(_WLF)
+            tp_lot_ids = {c["source_lot_id"] for c in closed if c.get("source_lot_id")}
+            lots_changed = False
+            for lot in lots:
+                if (lot.get("lot_id") or "").strip() in tp_lot_ids:
+                    lot["has_open_cc"]          = "0"
+                    lot["cc_id"]                = ""
+                    # Update net_cost_basis to reflect the CC premium kept.
+                    # Find the matching closed entry to get the profit amount.
+                    matching = next(
+                        (c for c in closed
+                         if c.get("source_lot_id") == (lot.get("lot_id") or "").strip()),
+                        None,
+                    )
+                    if matching:
+                        orig_basis   = float(lot.get("cost_basis") or 0)
+                        cc_net_kept  = float(matching.get("profit", 0))
+                        prev_collected = float(lot.get("cc_premium_collected") or 0)
+                        new_collected  = prev_collected + cc_net_kept
+                        # net_cost_basis is always (cost_basis - cc_premium_collected)
+                        # Compute from both source fields so it stays consistent
+                        # even if one field was manually edited.
+                        new_net_basis = max(0.0, orig_basis - new_collected)
+                        lot["cc_premium_collected"] = f"{new_collected:.2f}"
+                        lot["net_cost_basis"]       = f"{new_net_basis:.2f}"
+                    lots_changed = True
+            if lots_changed:
+                _whl_write(_WLF, lots, _LOT_FIELDS)
+                log.info("Cleared has_open_cc on %d lot(s) and updated net_cost_basis after CC TP close",
+                         len(tp_lot_ids))
+        except Exception as e:
+            log.warning("scan_cc_take_profits: failed to clear lot cc flags: %s", e)
+
+    return {"closed": closed}
+
+
+# ============================================================
+# CSP roll candidate detection (display-only)
+# ============================================================
+
+def scan_csp_roll_candidates(today: dt.date) -> List[dict]:
+    """Return open CSPs that are significantly ITM with DTE remaining to roll.
+
+    A roll candidate satisfies BOTH:
+      1. current_price < strike * (1 - CSP_ROLL_CANDIDATE_ITM_PCT)   [>=10% ITM]
+      2. DTE remaining > CSP_ROLL_CANDIDATE_MIN_DTE                   [>10 days left]
+
+    This is purely informational — no state change, no automated roll.
+    The human reviews and decides whether to buy-to-close and re-open at a
+    lower strike / further expiry for a net credit.
+
+    Returns list of dicts sorted most-ITM first.
+    """
+    ensure_positions_files()
+    rows = load_csv_rows(CSP_POSITIONS_FILE)
+    if not rows:
+        return []
+
+    itm_pct = float(CSP_ROLL_CANDIDATE_ITM_PCT)
+    min_dte  = int(CSP_ROLL_CANDIDATE_MIN_DTE)
+    candidates: List[dict] = []
+
+    for r in rows:
+        if (r.get("status") or "").upper() != "OPEN":
+            continue
+
+        exp_str = (r.get("expiry") or "").strip()
+        try:
+            exp = dt.date.fromisoformat(exp_str)
+        except Exception:
+            continue
+
+        if exp <= today:
+            continue   # expiry / early-assignment handled elsewhere
+
+        dte = (exp - today).days
+        if dte <= min_dte:
+            continue   # too close — this is an assignment situation, not a roll
+
+        ticker    = (r.get("ticker") or "").strip().upper()
+        strike    = safe_float(r.get("strike"), 0.0)
+        contracts = safe_int(r.get("contracts"), 0)
+        if not ticker or strike <= 0:
+            continue
+
+        try:
+            current_price = get_live_price(ticker)
+            if current_price is None:
+                log.warning("scan_csp_roll_candidates: no price for %s; skipping", ticker)
+                continue
+        except Exception as e:
+            log.warning("scan_csp_roll_candidates: price fetch failed for %s: %s", ticker, e)
+            continue
+
+        # Only flag when stock is sufficiently below strike
+        if current_price >= strike * (1.0 - itm_pct):
+            continue
+
+        pct_itm = (strike - current_price) / strike * 100.0
+        candidates.append({
+            "ticker":        ticker,
+            "account":       (r.get("account") or INDIVIDUAL).strip().upper(),
+            "expiry":        exp_str,
+            "strike":        strike,
+            "contracts":     contracts,
+            "dte":           dte,
+            "pct_itm":       round(pct_itm, 1),
+            "current_price": round(current_price, 2),
+            "orig_premium":  safe_float(r.get("premium"), 0.0),
+        })
+        log.info("CSP roll candidate: %s %s %.0fP | %.1f%% ITM | %dd | px %.2f",
+                 ticker, exp_str, strike, pct_itm, dte, current_price)
+
+    candidates.sort(key=lambda x: x["pct_itm"], reverse=True)
+    return candidates
+
+
 def process_csp_expirations(today: dt.date) -> Dict[str, List[str]]:
     ensure_positions_files()
     rows = load_csv_rows(CSP_POSITIONS_FILE)
@@ -1777,8 +2164,13 @@ def process_csp_expirations(today: dt.date) -> Dict[str, List[str]]:
             r["status"] = "ASSIGNED"
             r["close_type"] = "ASSIGNED_ITM"
             r["shares_if_assigned"] = str(shares)
-            est_prem = float(r.get("premium") or r.get("est_premium") or 0.0)
-            r["assignment_cost_basis"] = f"{(strike*shares - est_prem):.2f}"
+            # Use fill_premium (actual slippage+commission-adjusted fill) so cost
+            # basis reflects dollars truly collected. Legacy rows missing fill_premium
+            # fall back to premium, then est_premium.
+            actual_prem = float(
+                r.get("fill_premium") or r.get("premium") or r.get("est_premium") or 0.0
+            )
+            r["assignment_cost_basis"] = f"{(strike * shares - actual_prem):.2f}"
             assigned.append(f"{ticker} {exp_str} {strike:.0f}P -> {shares} sh")
 
     write_csv_rows(CSP_POSITIONS_FILE, rows, CSP_POSITIONS_COLUMNS)
@@ -1844,10 +2236,10 @@ def scan_early_assignments(today: dt.date) -> Dict[str, List[str]]:
             continue
 
         try:
-            df = download_ohlcv(ticker)   # cache-first, no extra network call
-            if df is None or df.empty:
+            current_price = get_live_price(ticker)
+            if current_price is None:
+                log.warning("scan_early_assignments: no price for %s; skipping", ticker)
                 continue
-            current_price = float(df["Close"].iloc[-1])
         except Exception as e:
             log.warning("scan_early_assignments: price fetch failed for %s: %s", ticker, e)
             continue
@@ -1866,15 +2258,19 @@ def scan_early_assignments(today: dt.date) -> Dict[str, List[str]]:
             continue
 
         # Auto-mark as ASSIGNED — identical fields to process_csp_expirations.
-        shares    = contracts * 100
-        est_prem  = safe_float(r.get("premium"), 0.0)
+        shares = contracts * 100
+        # fill_premium = actual slippage+commission-adjusted dollars collected.
+        # Fall back to premium for legacy rows that predate this field.
+        actual_prem = float(
+            r.get("fill_premium") or r.get("premium") or 0.0
+        )
 
-        r["status"]                      = "ASSIGNED"
-        r["close_type"]                  = "ASSIGNED_EARLY"
-        r["close_date"]                  = today.isoformat()
-        r["underlying_close_at_expiry"]  = f"{current_price:.2f}"
-        r["shares_if_assigned"]          = str(shares)
-        r["assignment_cost_basis"]       = f"{(strike * shares - est_prem):.2f}"
+        r["status"]                     = "ASSIGNED"
+        r["close_type"]                 = "ASSIGNED_EARLY"
+        r["close_date"]                 = today.isoformat()
+        r["underlying_close_at_expiry"] = f"{current_price:.2f}"
+        r["shares_if_assigned"]         = str(shares)
+        r["assignment_cost_basis"]      = f"{(strike * shares - actual_prem):.2f}"
 
         assigned.append(label)
         changed = True
@@ -1991,13 +2387,35 @@ def plan_covered_calls(today: dt.date, assigned_rows: List[dict], open_cc_lot_id
             if df.empty:
                 continue
             last = df.iloc[-1]
-            current_price = float(last["Close"])
             atr = float(last.get("ATR_14") or 0)
+            # Use live price for the strike decision so the CC is placed relative
+            # to where the stock actually is right now, not yesterday's close.
+            # ATR is computed from historical data (correct — it's a rolling avg).
+            live = get_live_price(ticker)
+            current_price = live if live else float(last["Close"])
         except Exception as e:
             log.warning("plan_covered_calls: price fetch failed for %s: %s", ticker, e)
             continue
 
         _decision, raw_target, cc_reason = decide_cc_strike(current_price, net_cost_basis_per_share, atr)
+
+        # Determine the CC underwater tier so we can pick the right DTE window.
+        # Mirrors the tier logic inside decide_cc_strike.
+        if net_cost_basis_per_share <= 0 or atr <= 0:
+            cc_tier = "NORMAL"
+        else:
+            pct_vs = (current_price - net_cost_basis_per_share) / net_cost_basis_per_share
+            if pct_vs >= 0.0:
+                cc_tier = "NORMAL"
+            elif pct_vs >= -float(CC_UNDERWATER_MILD_PCT):
+                cc_tier = "MILD"
+            elif pct_vs >= -float(CC_UNDERWATER_DEEP_PCT):
+                cc_tier = "DEEP"
+            else:
+                cc_tier = "SEVERE"
+
+        # Tier-aware DTE: deeper underwater → longer DTE → more premium per cycle.
+        dte_min, dte_max = CC_DTE_BY_TIER.get(cc_tier, (CC_TARGET_DTE_MIN, CC_TARGET_DTE_MAX))
 
         # Floor: never sell a CC whose target lands below current_price * (1 - floor%).
         # Anchored to current price — not original basis — because when the stock is
@@ -2016,9 +2434,15 @@ def plan_covered_calls(today: dt.date, assigned_rows: List[dict], open_cc_lot_id
 
         try:
             t = yf.Ticker(ticker)
-            exp_str, _ = _pick_expiry_in_dte_range(t, CC_TARGET_DTE_MIN, CC_TARGET_DTE_MAX)
+            exp_str, _ = _pick_expiry_in_dte_range(t, dte_min, dte_max)
             if not exp_str:
-                log.info("CC %s: no expiry in %d–%d DTE window", ticker, CC_TARGET_DTE_MIN, CC_TARGET_DTE_MAX)
+                # Fall back to global window if the tier window has no available expiry
+                exp_str, _ = _pick_expiry_in_dte_range(t, CC_TARGET_DTE_MIN, CC_TARGET_DTE_MAX)
+            if not exp_str:
+                log.info(
+                    "CC %s: no expiry in DTE window (tier=%s %d–%d or global %d–%d)",
+                    ticker, cc_tier, dte_min, dte_max, CC_TARGET_DTE_MIN, CC_TARGET_DTE_MAX,
+                )
                 continue
             chain_key = f"{ticker}-{exp_str}"
             if chain_key not in _chain_cache:
@@ -2058,11 +2482,11 @@ def plan_covered_calls(today: dt.date, assigned_rows: List[dict], open_cc_lot_id
                 "expiry":        exp_str,
                 "strike":        float(strike),
                 "contracts":     int(contracts),
-                "credit_mid":    float(net_credit),   # net per-share after fill model + commission
-                "reason":        f"{cc_reason} | basis {net_cost_basis_per_share:.2f}",
-                # Inherit account and lot_id from the lot that generated this CC idea.
+                "credit_mid":    float(net_credit),
+                "cc_tier":       cc_tier,
+                "reason":        f"[{cc_tier}] {cc_reason} | basis {net_cost_basis_per_share:.2f}",
                 "account":       (pos.get("account") or INDIVIDUAL).strip().upper(),
-                "source_lot_id": lot_id,              # links CC back to exact lot
+                "source_lot_id": lot_id,
             })
         except Exception as e:
             log.warning("plan_covered_calls failed for %s: %s", ticker, e)

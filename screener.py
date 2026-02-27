@@ -22,6 +22,8 @@ from __future__ import annotations
 import datetime as dt
 from typing import List
 
+import yfinance as yf
+
 from utils import get_logger, iso_week_id as _iso_week_id
 from config import (
     ENABLE_CSP,
@@ -40,6 +42,7 @@ from screener_display import (
     print_open_csps,
     print_open_ccs,
     print_open_cc_roll_candidates,
+    print_csp_roll_candidates,
     print_final_exposure_summary,
     build_discord_alert,
     send_discord,
@@ -69,6 +72,73 @@ from wheel import (
 )
 
 log = get_logger(__name__)
+
+
+def _run_integrity_check(today: dt.date) -> None:
+    """Warn on CSP/lot/CC state inconsistencies.  Warn-and-continue — never aborts the run.
+
+    Checks:
+      1. Every ASSIGNED CSP has a matching lot in wheel_lots.csv.
+      2. Every lot with has_open_cc=1 has a matching OPEN CC in cc_positions.csv.
+
+    Check 2 uses TWO matching paths to avoid false positives on legacy rows
+    that pre-date the source_lot_id field:
+      Path A (new):    lot.lot_id  matches an OPEN cc.source_lot_id
+      Path B (legacy): lot.cc_id   matches an OPEN cc.id
+    A lot is considered correctly linked if EITHER path finds a match.
+    """
+    try:
+        csp_rows = strat.load_csv_rows(strat.CSP_POSITIONS_FILE)
+        cc_rows  = strat.load_csv_rows(strat.CC_POSITIONS_FILE)
+
+        # Use sys.modules to avoid the system 'wheel' package collision
+        import sys as _sys
+        _whl  = _sys.modules.get("wheel") or __import__("wheel")
+        lots  = _whl.get_open_lots()
+
+        lot_by_csp_id = {(r.get("source_csp_id") or "").strip(): r for r in lots}
+
+        open_cc_rows = [r for r in cc_rows if (r.get("status") or "").upper() == "OPEN"]
+        # Path A: lot_id → cc.source_lot_id  (new CCs with explicit linkage)
+        open_by_source_lot = {
+            (r.get("source_lot_id") or "").strip()
+            for r in open_cc_rows
+            if (r.get("source_lot_id") or "").strip()
+        }
+        # Path B: lot.cc_id → cc.id  (legacy CCs written before source_lot_id existed)
+        open_by_cc_id = {
+            (r.get("id") or "").strip()
+            for r in open_cc_rows
+        }
+
+        for r in csp_rows:
+            if (r.get("status") or "").upper() != "ASSIGNED":
+                continue
+            csp_id = (r.get("id") or "").strip()
+            if csp_id and csp_id not in lot_by_csp_id:
+                log.warning(
+                    "INTEGRITY: ASSIGNED CSP %s (%s %s) has no matching wheel lot — "
+                    "create_lots_from_new_assignments may not have run yet.",
+                    csp_id, r.get("ticker", "?"), r.get("expiry", "?"),
+                )
+
+        for lot in lots:
+            if (lot.get("has_open_cc") or "").strip() not in ("1", "true", "TRUE"):
+                continue
+            lot_id = (lot.get("lot_id") or "").strip()
+            cc_id  = (lot.get("cc_id")  or "").strip()
+            linked = (
+                (lot_id and lot_id in open_by_source_lot)   # Path A
+                or (cc_id  and cc_id  in open_by_cc_id)     # Path B (legacy)
+            )
+            if not linked:
+                log.warning(
+                    "INTEGRITY: lot %s (%s) has_open_cc=1 but no matching OPEN CC "
+                    "(checked source_lot_id and cc_id=%s).",
+                    lot_id, lot.get("ticker", "?"), cc_id,
+                )
+    except Exception as e:
+        log.warning("Pre-run integrity check failed (non-fatal): %s", e)
 
 
 def run_screener() -> None:
@@ -144,12 +214,20 @@ def run_screener() -> None:
             print(f"  {s}")
 
     # ── 6. Wheel maintenance ──────────────────────────────────────
+    # Pre-run integrity check: warn if CSP/lot/CC state is inconsistent.
+    # Warn-and-continue — never block a run on stale data.
+    _run_integrity_check(today)
+
     csp_tp_out    = strat.process_csp_take_profits(today)
+    cc_tp_out     = strat.scan_cc_take_profits(today)
     csp_out       = strat.process_csp_expirations(today)
     cc_out        = process_cc_expirations(today)
     early_asn_out = strat.scan_early_assignments(today)
     create_lots_from_new_assignments(today)
     link_new_ccs_to_lots(today)
+
+    # CSP roll candidates (display only — no state change)
+    csp_roll_candidates = strat.scan_csp_roll_candidates(today)
 
     if early_asn_out.get("assigned"):
         print("\n⚠️  EARLY ASSIGNMENTS AUTO-MARKED")
@@ -174,9 +252,27 @@ def run_screener() -> None:
                 strike=float(c["strike"]),
                 contracts=int(c["contracts"]),
                 shares=int(c["contracts"]) * 100,
-                premium=-float(c["buyback"]),   # negative = cash paid out to close
+                premium=-float(c["buyback"]),
                 wheel_value=0.0,
                 notes=f"CSP take-profit close, profit ${c['profit']:.0f}",
+            )
+
+    if cc_tp_out.get("closed"):
+        print("\n✅ CC TAKE-PROFITS CLOSED")
+        for c in cc_tp_out["closed"]:
+            print(f"  {c['summary']}")
+            record_event(
+                date=today.isoformat(),
+                ticker=c["ticker"],
+                event_type="CC_CLOSE_TP",
+                ref_id=c["ref_id"],
+                expiry=c["expiry"],
+                strike=float(c["strike"]),
+                contracts=int(c["contracts"]),
+                shares=int(c["contracts"]) * 100,
+                premium=-float(c["buyback"]),
+                wheel_value=0.0,
+                notes=f"CC take-profit close, profit ${c['profit']:.0f}",
             )
 
     # ── 7. Stock scan + execution ─────────────────────────────────
@@ -194,7 +290,16 @@ def run_screener() -> None:
 
     # ── 8. CSP planning + execution ───────────────────────────────
     new_csp_orders: List[dict] = []
-    if ENABLE_CSP and csp_regime in ("NORMAL", "RISK_OFF"):
+    if ENABLE_CSP and csp_regime in ("NORMAL", "RISK_OFF", "LOW_IV"):
+
+        # Fetch live intraday VIX for the spike guard (single fast_info call).
+        live_vix: float | None = None
+        try:
+            live_vix = float(yf.Ticker("^VIX").fast_info.get("last_price") or 0) or None
+            if live_vix:
+                log.info("Live intraday VIX: %.2f (EOD close: %.2f)", live_vix, float(mkt["vix_close"]))
+        except Exception as e:
+            log.warning("Could not fetch live VIX for spike guard: %s", e)
 
         # Build the candidate list once — same universe regardless of account.
         candidates = build_csp_candidates(mkt, csp_regime)
@@ -265,6 +370,7 @@ def run_screener() -> None:
                 aggressive_total=int(exp.get("aggressive_total", 0)),
                 aggressive_week=int(exp.get("aggressive_week", 0)),
                 open_sector_counts=open_sector_counts,
+                live_vix=live_vix,
             )
 
             orders = plan.get("selected", [])
@@ -303,17 +409,19 @@ def run_screener() -> None:
                 ledger_rows = strat.load_csv_rows(CSP_LEDGER_FILE)
                 if not strat.csp_already_logged(
                     ledger_rows, week_id,
-                    o["ticker"], o["expiry"], float(o["strike"])
+                    o["ticker"], o["expiry"], float(o["strike"]),
+                    account=(o.get("account") or INDIVIDUAL),
                 ):
                     strat.append_csp_ledger_row({
                         "date":          today.isoformat(),
                         "week_id":       week_id,
+                        "account":       (o.get("account") or INDIVIDUAL),
                         "ticker":        o["ticker"],
                         "expiry":        o["expiry"],
                         "strike":        f"{float(o['strike']):.2f}",
                         "contracts":     int(o.get("contracts", 1)),
-                        "premium":       float(o.get("est_premium", 0.0)),
-                        "cash_reserved": float(o.get("cash_reserved", 0.0)),
+                        "premium":       round(float(o.get("est_premium", 0.0)), 2),
+                        "cash_reserved": round(float(o.get("cash_reserved", 0.0)), 2),
                         "tier":          o.get("tier", ""),
                     })
             except Exception as e:
@@ -321,6 +429,7 @@ def run_screener() -> None:
 
             record_event(
                 date=today.isoformat(),
+                account=(o.get("account") or INDIVIDUAL),
                 ticker=o["ticker"],
                 event_type="CSP_OPEN",
                 ref_id=csp_id,
@@ -353,8 +462,10 @@ def run_screener() -> None:
         print("\n📞 CC: No calls triggered today.")
 
     # Surface any open CCs where the stock has recovered close to the strike.
-    # px was built for holdings display (step 4) and covers all lot tickers.
     print_open_cc_roll_candidates(px)
+
+    # Surface CSP roll candidates (ITM with enough DTE to act).
+    print_csp_roll_candidates(csp_roll_candidates)
 
     # ── 10. Backfill + monthly rebuild ───────────────────────────
     if should_backfill_events():
@@ -378,6 +489,7 @@ def run_screener() -> None:
         planned_stocks=planned_stocks,
         watch=watch,
         csp_tp=[c["summary"] for c in csp_tp_out.get("closed", [])],
+        cc_tp=[c["summary"] for c in cc_tp_out.get("closed", [])],
         csp_exp=csp_out.get("expired", []),
         csp_asn=csp_out.get("assigned", []),
         cc_exp=cc_out.get("expired", []),
@@ -386,6 +498,7 @@ def run_screener() -> None:
         stock_closes=stock_closed,
         ret_stopped=ret_stops.get("stopped", []),
         early_asn=early_asn_out.get("assigned", []) + early_asn_out.get("warned", []),
+        csp_roll=csp_roll_candidates,
     )
     send_discord(alert)
 

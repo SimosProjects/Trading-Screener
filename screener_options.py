@@ -41,6 +41,13 @@ def build_csp_candidates(mkt: Dict, mode: str) -> List[dict]:
             f" | Universe: DEFENSIVE ONLY ({len(defensive_set)} tickers)"
             f" | Strike base: {CSP_STRIKE_BASE_RISK_OFF} | Min OTM: {float(CSP_RISK_OFF_MIN_OTM_PCT_DEFENSIVE)*100:.0f}%"
         )
+    elif mode == "LOW_IV":
+        print(
+            f"\n🟡 CSP MODE: LOW_IV | VIX {float(mkt.get('vix_close') or 0):.2f} < 18"
+            f" | Universe: STANDARD ({len(CSP_STOCKS)} tickers)"
+            f" | Tighter yield floors | AGGRESSIVE blocked"
+            f" | Strike base: {CSP_STRIKE_BASE_NORMAL} | Min OTM: {float(CSP_NORMAL_MIN_OTM_PCT)*100:.0f}%"
+        )
     else:
         print(
             f"\n🟦 CSP MODE: NORMAL | VIX {float(mkt.get('vix_close') or 0):.2f} <= {float(CSP_RISK_OFF_VIX):.1f}"
@@ -66,7 +73,7 @@ def build_csp_candidates(mkt: Dict, mode: str) -> List[dict]:
                 continue
             last = df.iloc[-1]
 
-            if mode == "NORMAL":
+            if mode in ("NORMAL", "LOW_IV"):
                 if not strat.is_csp_eligible(last, allow_below_200=False):
                     continue
                 min_otm  = float(CSP_NORMAL_MIN_OTM_PCT)

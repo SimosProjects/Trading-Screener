@@ -17,6 +17,7 @@ from config import (
     INDIVIDUAL, IRA, ROTH,
     INDIVIDUAL_STOCK_CAP,
     RETIREMENT_STOCK_CAPS,
+    RETIREMENT_STOCK_YIELDS,
     WEBHOOK_URL,
     CSP_RISK_OFF_VIX,
     CSP_STRIKE_BASE_NORMAL, CSP_STRIKE_BASE_RISK_OFF,
@@ -57,6 +58,7 @@ def build_discord_alert(
     planned_stocks: List[dict],
     watch: List[dict],
     csp_tp: List[str],
+    cc_tp: List[str],
     csp_exp: List[str],
     csp_asn: List[str],
     cc_exp: List[str],
@@ -65,6 +67,7 @@ def build_discord_alert(
     stock_closes: List[str],
     ret_stopped: List[str] = [],
     early_asn: List[str] = [],
+    csp_roll: List[dict] = [],
 ) -> str:
     lines: List[str] = []
     lines.append(f"📅 {dt.date.today().isoformat()} Screener")
@@ -73,17 +76,26 @@ def build_discord_alert(
         f"QQQ {mkt['qqq_close']:.2f} | VIX {mkt['vix_close']:.2f}"
     )
 
-    if csp_tp or csp_exp or csp_asn or cc_exp or cc_call or stock_opens or stock_closes or ret_stopped or early_asn:
+    if csp_tp or cc_tp or csp_exp or csp_asn or cc_exp or cc_call or stock_opens or stock_closes or ret_stopped or early_asn:
         lines.append("— Maintenance —")
         if ret_stopped:  lines.append(f"🛑 Retirement stops: {', '.join(ret_stopped[:8])}{'…' if len(ret_stopped)>8 else ''}")
         if early_asn:    lines.append(f"⚠️ Early assigned: {', '.join(early_asn[:8])}{'…' if len(early_asn)>8 else ''}")
-        if csp_tp:       lines.append(f"CSP closed (TP): {', '.join(csp_tp[:8])}{'…' if len(csp_tp)>8 else ''}")
+        if csp_tp:       lines.append(f"✅ CSP closed (TP): {', '.join(csp_tp[:8])}{'…' if len(csp_tp)>8 else ''}")
+        if cc_tp:        lines.append(f"✅ CC closed (TP): {', '.join(cc_tp[:8])}{'…' if len(cc_tp)>8 else ''}")
         if csp_exp:      lines.append(f"CSP expired: {', '.join(csp_exp[:8])}{'…' if len(csp_exp)>8 else ''}")
         if csp_asn:      lines.append(f"CSP assigned: {', '.join(csp_asn[:8])}{'…' if len(csp_asn)>8 else ''}")
         if cc_exp:       lines.append(f"CC expired: {', '.join(cc_exp[:8])}{'…' if len(cc_exp)>8 else ''}")
         if cc_call:      lines.append(f"Called away: {', '.join(cc_call[:8])}{'…' if len(cc_call)>8 else ''}")
         if stock_closes: lines.append(f"Stocks closed: {', '.join(stock_closes[:10])}{'…' if len(stock_closes)>10 else ''}")
         if stock_opens:  lines.append(f"Stocks opened: {', '.join(stock_opens[:10])}{'…' if len(stock_opens)>10 else ''}")
+
+    if csp_roll:
+        lines.append("— CSP Roll Candidates —")
+        for r in csp_roll[:6]:
+            lines.append(
+                f"🔄 [{r['account']}] {r['ticker']} {r['strike']:.0f}P {r['expiry']} "
+                f"| {r['pct_itm']:.1f}% ITM | {r['dte']}d | px {r['current_price']:.2f}"
+            )
 
     if new_csps:
         lines.append("— New CSP ideas —")
@@ -291,9 +303,8 @@ def print_open_cc_roll_candidates(px: Dict[str, float]) -> None:
             if cur is None or cur <= 0:
                 continue
 
-            # How close is the stock to being called away?
-            pct_to_strike = (strike - cur) / strike  # positive = OTM, negative = ITM
-            proximity = cur / strike  # >= threshold means "getting close"
+            pct_to_strike = (strike - cur) / strike
+            proximity = cur / strike
 
             if proximity >= float(CC_ROLL_SIGNAL_THRESHOLD):
                 exp = (r.get("expiry") or "").strip()
@@ -309,6 +320,27 @@ def print_open_cc_roll_candidates(px: Dict[str, float]) -> None:
                 print(f"  {flag} {tkr:<6} {strike:.0f}C {exp} | Now {cur:.2f} ({abs(pct_otm):.1f}% {direction})")
     except Exception as e:
         log.warning("print_open_cc_roll_candidates failed: %s", e)
+
+
+def print_csp_roll_candidates(candidates: List[dict]) -> None:
+    """Display CSP roll candidates flagged by scan_csp_roll_candidates.
+
+    These are open CSPs that are >=10% ITM with >10 DTE remaining — enough
+    time to buy-to-close and re-open at a lower strike / further expiry for
+    a potential net credit.  Display-only — no automated action.
+    """
+    if not candidates:
+        return
+    print(f"\n🔄 CSP ROLL CANDIDATES ({len(candidates)} position{'s' if len(candidates) != 1 else ''})")
+    print("   (>=10% ITM, >10 DTE — consider rolling down/out for net credit)")
+    for c in candidates:
+        print(
+            f"  [{c['account']}] {c['ticker']:<6} {c['strike']:.0f}P {c['expiry']} "
+            f"| {c['pct_itm']:.1f}% ITM | {c['dte']}d left "
+            f"| px {c['current_price']:.2f} "
+            f"| orig prem ${c['orig_premium']:.0f} "
+            f"| {c['contracts']}x"
+        )
 
 
 # ============================================================
@@ -343,6 +375,33 @@ def print_final_exposure_summary(
             mv = mv_ret.get(acct, 0.0) + mv_stock.get(acct, 0.0)
             if mv > 0:
                 print(f"  {acct}: ${mv:,.0f}")
+
+        # Estimated annual dividends per holding
+        try:
+            ret_rows = strat.load_retirement_positions()
+            total_est_div = 0.0
+            div_lines = []
+            for r in ret_rows:
+                tkr   = (r.get("ticker") or "").strip().upper()
+                acct  = (r.get("account") or "").strip().upper()
+                if acct not in (IRA, ROTH) or not tkr:
+                    continue
+                try:
+                    sh  = float(r.get("shares") or 0)
+                    px  = float(r.get("current_price") or 0)
+                    yld = float(RETIREMENT_STOCK_YIELDS.get(tkr, 0.0))
+                    if sh > 0 and px > 0 and yld > 0:
+                        est_div = sh * px * yld
+                        total_est_div += est_div
+                        div_lines.append(f"    {acct} {tkr}: ~${est_div:,.0f}/yr ({yld*100:.1f}% yield)")
+                except Exception:
+                    pass
+            if div_lines:
+                print(f"  📆 Est. annual dividends: ~${total_est_div:,.0f}/yr")
+                for dl in div_lines:
+                    print(dl)
+        except Exception as e:
+            log.warning("Retirement dividend display failed: %s", e)
     if ret_flagged:
         print(f"  ⚠️ Breakeven-only flagged: {', '.join(ret_flagged)}")
 

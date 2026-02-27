@@ -596,6 +596,17 @@ def process_cc_expirations(today: dt.date) -> Dict[str, List[str]]:
             if (lot.get("status") or "").upper() != "OPEN":
                 continue
             cc_id = (lot.get("cc_id") or "").strip()
+
+            # Detect corrupted state: lot thinks it has an open CC but has no cc_id.
+            # This means process_cc_expirations would silently skip the lot update,
+            # leaving the lot permanently blocked from new CC cycles.
+            if (lot.get("has_open_cc") or "").strip() in ("1", "true", "TRUE") and not cc_id:
+                log.warning(
+                    "Lot %s (%s) has has_open_cc=1 but cc_id is empty — "
+                    "lot is stuck; manually clear has_open_cc or re-link cc_id to unblock.",
+                    lot.get("lot_id", "?"), lot.get("ticker", "?"),
+                )
+
             if not cc_id or cc_id not in closed_cc_by_id:
                 continue
 
@@ -641,24 +652,27 @@ def process_cc_expirations(today: dt.date) -> Dict[str, List[str]]:
                         tkr_lot, sh_lot, proceeds, net_basis, pnl_abs, pnl_pct,
                     )
             else:
-                # CC expired worthless — collect the premium, reduce basis, clear CC link
-                prev_collected = _safe_float(lot.get("cc_premium_collected"), 0.0)
+                # CC expired worthless — collect the premium, reduce basis, clear CC link.
+                # net_cost_basis is always derived as (cost_basis - cc_premium_collected)
+                # so it self-corrects even if either field was edited manually.
+                prev_collected  = _safe_float(lot.get("cc_premium_collected"), 0.0)
                 new_collected   = prev_collected + prem
                 orig_basis      = _safe_float(lot.get("cost_basis"), 0.0)
                 new_net_basis   = max(orig_basis - new_collected, 0.0)
 
                 lot["cc_premium_collected"] = f"{new_collected:.2f}"
-                lot["net_cost_basis"]        = f"{new_net_basis:.2f}"
-                lot["has_open_cc"]           = "0"
-                lot["cc_id"]                 = ""
+                lot["net_cost_basis"]       = f"{new_net_basis:.2f}"   # formula: cost_basis - cc_premium_collected
+                lot["has_open_cc"]          = "0"
+                lot["cc_id"]               = ""
 
                 tkr_lot = (lot.get("ticker") or "").strip().upper()
                 sh_lot  = _safe_int(lot.get("shares"), 0)
                 net_per_share = new_net_basis / sh_lot if sh_lot > 0 else 0.0
                 log.info(
-                    "CC expired — lot %s basis reduced: collected $%.2f total, "
-                    "net_cost_basis $%.2f ($%.4f/sh)",
-                    lot.get("lot_id", tkr_lot), new_collected, new_net_basis, net_per_share,
+                    "CC expired — lot %s: +$%.2f collected (total $%.2f), "
+                    "net_cost_basis $%.2f ($%.4f/sh) [formula: $%.2f cost_basis - $%.2f collected]",
+                    lot.get("lot_id", tkr_lot), prem, new_collected,
+                    new_net_basis, net_per_share, orig_basis, new_collected,
                 )
 
             lot_changed = True
@@ -798,7 +812,7 @@ def rebuild_monthly_from_events() -> None:
     os.makedirs(WHEEL_MONTHLY_DIR, exist_ok=True)
 
     # Relevant event types for the premium income statement
-    INCOME_TYPES = {"CSP_OPEN", "CC_OPEN", "CSP_CLOSE_TP", "CSP_EXPIRED", "CC_EXPIRED"}
+    INCOME_TYPES = {"CSP_OPEN", "CC_OPEN", "CSP_CLOSE_TP", "CC_CLOSE_TP", "CSP_EXPIRED", "CC_EXPIRED"}
 
     # Build a lookup of open-event amounts keyed by ref_id so we can compute
     # net profit on close/expiry rows without a second pass.
@@ -840,7 +854,7 @@ def rebuild_monthly_from_events() -> None:
             prem   = _safe_float(e.get("premium"), 0.0)
 
             # amount: positive for income, negative for cost
-            if et == "CSP_CLOSE_TP":
+            if et in ("CSP_CLOSE_TP", "CC_CLOSE_TP"):
                 amount = -abs(prem)   # buyback is a cash outflow
             else:
                 amount = prem         # open premium or $0 expiry
@@ -849,7 +863,7 @@ def rebuild_monthly_from_events() -> None:
 
             # net: on close/expiry rows, compute realised profit for this cycle
             net = ""
-            if et in ("CSP_CLOSE_TP",):
+            if et in ("CSP_CLOSE_TP", "CC_CLOSE_TP"):
                 orig = open_premiums.get(ref, 0.0)
                 net  = f"{orig + amount:.2f}"   # orig is positive; amount is negative buyback
             elif et in ("CSP_EXPIRED", "CC_EXPIRED"):
@@ -870,6 +884,8 @@ def rebuild_monthly_from_events() -> None:
                 notes = f"{strk}C exp {exp}" + (f" x{contr}" if contr and contr != "1" else "")
             elif et == "CSP_CLOSE_TP":
                 notes = f"TP buyback — net ${float(net):.0f}" if net else "TP buyback"
+            elif et == "CC_CLOSE_TP":
+                notes = f"CC TP buyback — net ${float(net):.0f}" if net else "CC TP buyback"
             elif et in ("CSP_EXPIRED", "CC_EXPIRED"):
                 notes = "expired worthless"
             else:

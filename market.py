@@ -67,9 +67,11 @@ def allow_retirement_tactical(mkt: Dict) -> bool:
 
 def csp_mode(mkt: Dict) -> str:
     """
-    Return 'NORMAL' or 'RISK_OFF' based on SPY trend + VIX level.
+    Return 'NORMAL', 'LOW_IV', or 'RISK_OFF' based on SPY trend + VIX level.
 
-    RISK_OFF means: defensive names only, farther OTM, slower MA base.
+    LOW_IV  : VIX < 18 — premiums thin; tighter yield floors, AGGRESSIVE blocked.
+    NORMAL  : VIX 18–25, SPY above 200 — standard full operation.
+    RISK_OFF: VIX > 25 or SPY below 200 — defensive names only, farther OTM.
     Defaults to RISK_OFF when market data is unavailable (fail-safe).
     """
     try:
@@ -80,4 +82,6 @@ def csp_mode(mkt: Dict) -> str:
     spy_above_200 = bool(mkt.get("spy_above_200"))
     if (not spy_above_200) or (vix > float(CSP_RISK_OFF_VIX)):
         return "RISK_OFF"
+    if vix < 18.0:
+        return "LOW_IV"
     return "NORMAL"

@@ -19,6 +19,8 @@ from config import (
     RETIREMENT_STOCKS,
     RETIREMENT_MAX_STOCK_POSITIONS,
     RETIREMENT_STOP_LOSS_PCT,
+    RETIREMENT_DIVERSIFY_SECTORS,
+    CSP_TICKER_SECTOR,
 )
 
 log = get_logger(__name__)
@@ -221,6 +223,22 @@ def plan_and_execute_stocks(
         if picked_acct in (IRA, ROTH):
             open_retirement.add(tkr)
             ret_open_count[picked_acct] = ret_open_count.get(picked_acct, 0) + 1
+
+            # Soft cross-sector diversification check.
+            # If we already hold one name in this account and the new name is in
+            # the same sector, warn — but proceed. Human makes the final call.
+            if RETIREMENT_DIVERSIFY_SECTORS and ret_open_count[picked_acct] >= 2:
+                existing_sectors = {
+                    CSP_TICKER_SECTOR.get(t.upper(), "OTHER")
+                    for t in open_by_acct.get(picked_acct, set())
+                    if t.upper() != tkr.upper()
+                }
+                new_sector = CSP_TICKER_SECTOR.get(tkr.upper(), "OTHER")
+                if new_sector != "OTHER" and new_sector in existing_sectors:
+                    print(
+                        f"  ⚠️  SECTOR CONCENTRATION: [{picked_acct}] {tkr} ({new_sector}) joins "
+                        f"another {new_sector} holding — consider diversifying across sectors."
+                    )
         else:
             indiv_planned += 1
 

@@ -148,6 +148,25 @@ RETIREMENT_STOCKS: List[str] = [
     "MCD", "SBUX",
 ]
 
+# Soft cross-sector diversification for retirement buy-and-hold.
+# When True: if both retirement slots in an account would be in the same
+# sector (e.g., both TECH), print a warning at entry time. No hard block.
+RETIREMENT_DIVERSIFY_SECTORS = True
+
+# Estimated annual dividend yields for retirement holdings.
+# Used for display-only annotation of estimated dividend income — not written
+# to any CSV. Approximate trailing figures; update periodically.
+RETIREMENT_STOCK_YIELDS: Dict[str, float] = {
+    "AAPL": 0.005, "MSFT": 0.007, "GOOGL": 0.005, "AMZN": 0.000,
+    "META": 0.004, "NVDA": 0.001, "AVGO": 0.013, "ORCL": 0.013,
+    "ADBE": 0.000, "INTU": 0.007,
+    "V":    0.008, "MA":   0.006,
+    "LLY":  0.006, "ABBV": 0.035, "UNH":  0.015, "VRTX": 0.000,
+    "WMT":  0.010, "COST": 0.006, "KO":   0.030, "PEP":  0.030,
+    "HD":   0.023, "JPM":  0.022, "GS":   0.022,
+    "MCD":  0.022, "SBUX": 0.030,
+}
+
 # ============================================================
 # Stock swing trade rules -- INDIVIDUAL account only
 # ============================================================
@@ -302,7 +321,8 @@ CSP_POSITIONS_COLUMNS = [
     "dte_open",
     "strike",
     "contracts",
-    "premium",
+    "premium",        # mid-price estimate (display/scoring)
+    "fill_premium",   # slippage+commission-adjusted actual fill (used for cost_basis at assignment)
     "cash_reserved",
     "tier",
     "status",
@@ -345,15 +365,27 @@ CSP_TARGET_DTE_MIN = 25
 CSP_TARGET_DTE_MAX = 45
 
 # ---- Risk / sizing ----
-CSP_MAX_CASH_PER_TRADE = 8_000  # => $80/share max if 1 contract
+CSP_MAX_CASH_PER_TRADE = 15_000  # => $150/share max if 1 contract
 
-# ---- Liquidity filters ----
-CSP_MIN_OI = 100
-CSP_MIN_VOLUME = 10
+# Liquidity filters
+# Individual stocks need higher OI so stressed-market rolls stay fillable.
+# ETFs (SPY, QQQ, SPLG, etc.) are deeply liquid; the lower floor is fine.
+CSP_MIN_OI      = 300   # stocks
+CSP_MIN_OI_ETF  = 100   # ETF_BROAD sector tickers only
+CSP_MIN_VOLUME  = 10
 CSP_MIN_BID = 0.10
 
-# IV sanity check (set to 0.0/None to disable)
-CSP_MIN_IV = 0.20  # IV filter is redundant with premium/yield; lower IV does not increase risk
+# IV sanity check (set to 0.0 to disable).
+# Lower IV = less premium per unit of risk. This filter prevents selling very
+# cheap options where the edge doesn't justify the capital commitment.
+CSP_MIN_IV = 0.20
+
+# LOW_IV regime (VIX < 18): tighter yield floors.
+# When markets are calm, premiums thin out. Raise the bar so we only sell
+# when risk/reward still makes sense. Better to sit out than chase thin credits.
+# AGGRESSIVE tier is blocked entirely in LOW_IV via allowed_tiers_for_regime().
+CSP_MIN_YIELD_CONSERVATIVE_LOW_IV = 0.015   # vs 0.010 in NORMAL
+CSP_MIN_YIELD_BALANCED_LOW_IV     = 0.020   # vs 0.015 in NORMAL
 
 # ---- Strike selection ----
 CSP_STRIKE_MODE = "ema21_atr"
@@ -398,6 +430,23 @@ CSP_EARLY_ASSIGN_MAX_DTE = 3       # must be within 3 calendar days of expiry
 # False  → auto-mark ASSIGNED immediately (starts CC income sooner, recommended).
 # True   → warn only, no state change (safer if you want manual confirmation).
 CSP_EARLY_ASSIGN_WARN_ONLY = False
+
+# ---- CSP roll candidate detection (display only) ----
+# Flag open CSPs that are meaningfully ITM with enough DTE remaining that a
+# roll (buy-to-close + re-open lower / further out) may collect a net credit.
+# Both conditions must be true to flag:
+#   1. current_price < strike * (1 - CSP_ROLL_CANDIDATE_ITM_PCT)
+#   2. DTE remaining > CSP_ROLL_CANDIDATE_MIN_DTE
+# No automated action — human decides whether to roll.
+CSP_ROLL_CANDIDATE_ITM_PCT = 0.10   # 10% below strike
+CSP_ROLL_CANDIDATE_MIN_DTE = 10     # at least 10 DTE remaining
+
+# ---- Intraday VIX spike guard ----
+# Before executing CSP orders, fetch the live VIX and compare to the prior
+# EOD close. If the intraday VIX has risen by more than this threshold, any
+# AGGRESSIVE-tier candidates are downgraded to BALANCED for that run.
+# This prevents selling into a morning panic the prior day's VIX didn't show.
+VIX_INTRADAY_SPIKE_THRESHOLD = 4.0  # points
 
 # ---- Sector concentration limit ----
 # No more than this many simultaneously OPEN CSPs in the same sector.
@@ -509,6 +558,22 @@ CC_MIN_BID = 0.05
 # current_price / cc_strike >= this value (i.e., within ~3% of being called away).
 # Informational only — no automated roll execution.
 CC_ROLL_SIGNAL_THRESHOLD = 0.97
+
+# ---- CC take-profit ----
+# Close a CC when current mid value <= this fraction of opening premium.
+# Mirrors the CSP take-profit rule — lock in gains early and recycle the lot.
+CC_TAKE_PROFIT_PCT     = 0.50   # close at 50% profit
+CC_TP_MAX_SPREAD_PCT   = 0.50   # skip if bid/ask spread > 50% of mid
+
+# ---- CC DTE window by underwater tier ----
+# Shorter DTE for NORMAL/MILD (fast cycling near or above basis).
+# Longer DTE for DEEP/SEVERE (more premium per cycle on underwater lots).
+CC_DTE_BY_TIER: Dict[str, tuple] = {
+    "NORMAL": (14, 21),
+    "MILD":   (14, 25),
+    "DEEP":   (21, 35),
+    "SEVERE": (25, 35),
+}
 # ============================================================
 # Slippage & fill model  (paper trading realism)
 # ============================================================
