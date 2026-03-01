@@ -49,7 +49,7 @@ from config import (
     CSP_POSITIONS_COLUMNS, CC_POSITIONS_COLUMNS,
     CSP_TARGET_DTE_MIN, CSP_TARGET_DTE_MAX,
     CSP_TAKE_PROFIT_PCT, CSP_TP_MAX_SPREAD_PCT,
-    CSP_MAX_CASH_PER_TRADE,
+    CSP_MAX_CASH_PER_TRADE, CSP_MAX_CONTRACTS,
     CSP_MIN_OI, CSP_MIN_OI_ETF, CSP_MIN_VOLUME, CSP_MIN_BID, CSP_MIN_IV,
     CSP_STRIKE_MODE,
     CSP_STRIKE_BASE_NORMAL,
@@ -78,9 +78,6 @@ from config import (
 )
 
 log = get_logger(__name__)
-
-# Derived: max underlying price allowed for CSPs (e.g., $6,500 cap => $65/share for 1 contract)
-CSP_MAX_SHARE_PRICE = float(CSP_MAX_CASH_PER_TRADE) / 100.0
 
 
 # ============================================================
@@ -1289,6 +1286,123 @@ def csp_already_logged(
     return False
 
 
+def has_upcoming_ex_dividend(ticker: str, days_window: int = 10) -> bool:
+    """Return True if the stock has an ex-dividend date within days_window days of today.
+
+    Deep-ITM American-style puts can be exercised early the day before ex-dividend
+    so the put holder captures the dividend.  We skip opening new CSPs whenever a
+    dividend is imminent — the theta premium does not compensate for the unmodeled
+    early-assignment risk and the sudden cost-basis surprise.
+
+    days_window=10: conservative buffer since market makers begin hedging
+    aggressively in the week before ex-div even for mildly ITM puts.
+    """
+    # ETFs distribute dividends differently and are not subject to early assignment
+    # for dividend capture in practice.  Skip the check to avoid noise.
+    from config import CSP_TICKER_SECTOR
+    if CSP_TICKER_SECTOR.get(ticker, "OTHER") == "ETF_BROAD":
+        return False
+    try:
+        today   = dt.date.today()
+        cutoff  = today + dt.timedelta(days=days_window)
+        divs    = yf.Ticker(ticker).dividends
+        if divs is None or divs.empty:
+            return False
+        for ts in divs.index:
+            try:
+                ex_date = ts.date() if hasattr(ts, "date") else dt.date.fromisoformat(str(ts)[:10])
+            except Exception:
+                continue
+            if today <= ex_date <= cutoff:
+                log.info(
+                    "has_upcoming_ex_dividend: %s ex-div %s within %d days — skipping CSP open",
+                    ticker, ex_date, days_window,
+                )
+                return True
+    except Exception as e:
+        log.debug("has_upcoming_ex_dividend: could not check %s: %s", ticker, e)
+    return False
+
+
+def has_earnings_within_window(ticker: str, expiry_str: str, buffer_days: int = 2) -> bool:
+    """Return True if an earnings announcement falls within the CSP's lifetime.
+
+    The check window is today → expiry + buffer_days.  buffer_days=2 gives a
+    small pad so we don't open a 30-DTE put expiring the Friday right before
+    a Monday earnings call.
+
+    Logic:
+      - ETFs are skipped immediately — they have no earnings calendar.
+      - If we can't get the date, return False (fail-open — don't block on
+        missing data from yfinance).
+      - yfinance returns earnings dates from the calendar property.
+        We look at 'Earnings Date' which can be a single value or a range.
+
+    Why this matters:
+      IV spikes into earnings then collapses immediately after (IV crush).
+      Selling a CSP before earnings means: (1) you capture inflated IV on the
+      way in, but (2) the stock can gap 10-20% on the announcement, blowing
+      through your strike with no opportunity to manage.  The premium collected
+      never compensates for that tail risk.  Skip it — better candidates exist.
+    """
+    # ETFs have no earnings — yfinance returns a 404 if you try to fetch their
+    # calendar.  Skip immediately rather than burning a network call.
+    from config import CSP_TICKER_SECTOR
+    if CSP_TICKER_SECTOR.get(ticker, "OTHER") == "ETF_BROAD":
+        return False
+    try:
+        today   = dt.date.today()
+        exp     = dt.date.fromisoformat(expiry_str)
+        cutoff  = exp + dt.timedelta(days=buffer_days)
+
+        cal = yf.Ticker(ticker).calendar
+        if cal is None or (hasattr(cal, "empty") and cal.empty):
+            return False
+
+        # calendar can be a dict or a DataFrame depending on yfinance version
+        if isinstance(cal, dict):
+            earn_raw = cal.get("Earnings Date")
+        else:
+            # DataFrame: index is field names, column 0 is value
+            try:
+                earn_raw = cal.loc["Earnings Date"].iloc[0] if "Earnings Date" in cal.index else None
+            except Exception:
+                earn_raw = None
+
+        if earn_raw is None:
+            return False
+
+        # Normalise to a list of dates
+        dates_to_check = []
+        if hasattr(earn_raw, "__iter__") and not isinstance(earn_raw, str):
+            for v in earn_raw:
+                try:
+                    d = v.date() if hasattr(v, "date") else dt.date.fromisoformat(str(v)[:10])
+                    dates_to_check.append(d)
+                except Exception:
+                    continue
+        else:
+            try:
+                d = earn_raw.date() if hasattr(earn_raw, "date") else dt.date.fromisoformat(str(earn_raw)[:10])
+                dates_to_check.append(d)
+            except Exception:
+                pass
+
+        for earn_date in dates_to_check:
+            if today <= earn_date <= cutoff:
+                log.info(
+                    "has_earnings_within_window: %s earnings %s falls within CSP window "
+                    "(today=%s expiry=%s +%dd) — skipping",
+                    ticker, earn_date, today, expiry_str, buffer_days,
+                )
+                return True
+
+    except Exception as e:
+        log.debug("has_earnings_within_window: could not check %s: %s", ticker, e)
+
+    return False
+
+
 def _pick_expiry_in_dte_range(ticker_obj: yf.Ticker, dte_min: int, dte_max: int) -> Tuple[Optional[str], Optional[int]]:
     today = dt.date.today()
     ticker_sym = ticker_obj.ticker
@@ -1360,7 +1474,12 @@ def evaluate_csp_candidate(
     min_otm_pct: float = 0.0,
     base_ma: str = CSP_STRIKE_BASE_NORMAL,
 ) -> Optional[dict]:
-    """Evaluate a single CSP candidate (enforces share price cap)."""
+    """Evaluate a single CSP candidate.
+
+    Contracts are sized by available_capital so expensive stocks (MSFT, NVDA)
+    are never silently rejected by price — they get 1 contract when that is
+    all capital supports.  CSP_MAX_CONTRACTS is the hard ceiling per position.
+    """
     if df is None or df.empty:
         return None
 
@@ -1370,7 +1489,7 @@ def evaluate_csp_candidate(
     except Exception as e:
         log.debug("evaluate_csp_candidate: bad Close price for %s: %s", ticker, e)
         close_px = 0.0
-    if close_px > CSP_MAX_SHARE_PRICE:
+    if close_px <= 0:
         return None
 
     try:
@@ -1416,8 +1535,18 @@ def evaluate_csp_candidate(
         mid = (bid + ask) / 2.0
 
         cash_required_per_contract = strike * 100.0
-        contracts = int(CSP_MAX_CASH_PER_TRADE // cash_required_per_contract)
+        # Size contracts by how many fit in the per-trade budget, bounded by
+        # CSP_MAX_CONTRACTS.  plan_weekly_csp_orders will re-size again using
+        # the actual account-level remaining capital before selecting.
+        contracts = min(
+            int(CSP_MAX_CASH_PER_TRADE // cash_required_per_contract),
+            int(CSP_MAX_CONTRACTS),
+        )
         if contracts < 1:
+            log.debug(
+                "evaluate_csp_candidate: %s skipped — 1 contract ($%.0f) > per-trade budget ($%.0f)",
+                ticker, cash_required_per_contract, CSP_MAX_CASH_PER_TRADE,
+            )
             return None
 
         est_premium = mid * 100.0 * contracts
@@ -1581,9 +1710,26 @@ def plan_weekly_csp_orders(
         if tkr in used:
             continue
 
-        cash = float(idea["cash_reserved"])
-        if cash <= 0:
+        cash_per_contract = float(idea.get("strike", 0)) * 100.0
+        if cash_per_contract <= 0:
             continue
+
+        # Re-size using actual account capital available right now.
+        # evaluate_csp_candidate sized conservatively; here we know the exact budget.
+        budget = min(week_remaining, total_remaining)
+        contracts = min(int(budget // cash_per_contract), int(CSP_MAX_CONTRACTS))
+        if contracts < 1:
+            log.debug("CSP %s skipped: 1 contract ($%.0f) > available capital ($%.0f)",
+                      tkr, cash_per_contract, budget)
+            continue
+
+        cash = cash_per_contract * contracts
+
+        # Scale premium fields linearly to the re-sized contract count.
+        orig_contracts = max(int(idea.get("contracts", 1)), 1)
+        scale = contracts / orig_contracts
+        est_premium  = round(float(idea.get("est_premium",  0)) * scale, 2)
+        fill_premium = round(float(idea.get("fill_premium", idea.get("est_premium", 0))) * scale, 2)
 
         if cash > week_remaining or cash > total_remaining:
             continue
@@ -1603,7 +1749,13 @@ def plan_weekly_csp_orders(
             )
             continue
 
-        selected.append(idea)
+        selected.append({
+            **idea,
+            "contracts":    contracts,
+            "cash_reserved": cash,
+            "est_premium":  est_premium,
+            "fill_premium": fill_premium,
+        })
         used.add(tkr)
         sector_counts[sector] = sector_counts.get(sector, 0) + 1
 
@@ -1654,7 +1806,10 @@ def load_open_csp_tickers(today: Optional[dt.date] = None) -> set:
 
 
 def make_csp_position_id(ticker: str, expiry: str, strike: float, open_date: str) -> str:
-    return f"{ticker}-{expiry}-{float(strike):.2f}-{open_date}"
+    # Include seconds-level timestamp so a crash-and-restart on the same day
+    # produces a distinct ID rather than silently colliding with the first attempt.
+    ts = dt.datetime.now().strftime("%H%M%S")
+    return f"{ticker}-{expiry}-{float(strike):.2f}-{open_date}-{ts}"
 
 
 def add_csp_position_from_selected(today: str, week_id: str, idea: dict) -> Tuple[str, bool]:
@@ -1815,14 +1970,15 @@ def process_csp_take_profits(today: dt.date) -> Dict[str, List[str]]:
         )
         changed = True
         closed.append({
-            "summary":    f"{ticker} {exp_str} {strike:.0f}P (${profit:.0f} profit)",
-            "ticker":     ticker,
-            "expiry":     exp_str,
-            "strike":     strike,
-            "contracts":  contracts,
-            "ref_id":     (r.get("id") or ""),
-            "buyback":    float(current_value),   # dollars paid to close
-            "profit":     float(profit),
+            "summary":   f"{ticker} {exp_str} {strike:.0f}P (${profit:.0f} profit)",
+            "ticker":    ticker,
+            "account":   (r.get("account") or INDIVIDUAL).strip().upper(),
+            "expiry":    exp_str,
+            "strike":    strike,
+            "contracts": contracts,
+            "ref_id":    (r.get("id") or ""),
+            "buyback":   float(current_value),   # dollars paid to close
+            "profit":    float(profit),
         })
         log.info("CSP TP closed: %s %s %.0fP — orig $%.0f current $%.0f profit $%.0f",
                  ticker, exp_str, strike, orig_premium, current_value, profit)
@@ -1933,6 +2089,7 @@ def scan_cc_take_profits(today: dt.date) -> Dict[str, List[dict]]:
         closed.append({
             "summary":       f"{ticker} {exp_str} {strike:.0f}C (${profit:.0f} profit)",
             "ticker":        ticker,
+            "account":       (r.get("account") or INDIVIDUAL).strip().upper(),
             "expiry":        exp_str,
             "strike":        strike,
             "contracts":     contracts,

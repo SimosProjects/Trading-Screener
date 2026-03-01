@@ -245,6 +245,7 @@ def run_screener() -> None:
             print(f"  {c['summary']}")
             record_event(
                 date=today.isoformat(),
+                account=c.get("account", INDIVIDUAL),
                 ticker=c["ticker"],
                 event_type="CSP_CLOSE_TP",
                 ref_id=c["ref_id"],
@@ -263,6 +264,7 @@ def run_screener() -> None:
             print(f"  {c['summary']}")
             record_event(
                 date=today.isoformat(),
+                account=c.get("account", INDIVIDUAL),
                 ticker=c["ticker"],
                 event_type="CC_CLOSE_TP",
                 ref_id=c["ref_id"],

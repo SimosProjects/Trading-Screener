@@ -365,7 +365,10 @@ CSP_TARGET_DTE_MIN = 25
 CSP_TARGET_DTE_MAX = 45
 
 # ---- Risk / sizing ----
-CSP_MAX_CASH_PER_TRADE = 15_000  # => $150/share max if 1 contract
+CSP_MAX_CASH_PER_TRADE = 15_000  # per-contract notional ceiling (strike * 100); used for early-exit sizing check only
+# Hard cap on contracts per CSP position — prevents oversizing cheap stocks.
+# 3 contracts = manageable assignment risk (~$15-45K notional depending on strike).
+CSP_MAX_CONTRACTS = 3
 
 # Liquidity filters
 # Individual stocks need higher OI so stressed-market rolls stay fillable.
@@ -464,7 +467,7 @@ CSP_TICKER_SECTOR: Dict[str, str] = {
     "TSM":   "TECH", "ASML": "TECH", "ORCL": "TECH", "CRM":  "TECH",
     "ADBE":  "TECH", "INTU": "TECH", "AMD":  "TECH", "MU":   "TECH",
     "INTC":  "TECH", "ON":   "TECH", "MCHP": "TECH", "ANET": "TECH",
-    "CDNS":  "TECH", "SNPS": "TECH", "ADSK": "TECH", "SMH":  "TECH",
+    "CDNS":  "TECH", "SNPS": "TECH", "ADSK": "TECH",
     "PLTR":  "TECH", "NET":  "TECH", "MDB":  "TECH", "SNOW": "TECH",
 
     # ── Internet / E-Commerce ────────────────────────────────────────
@@ -493,10 +496,10 @@ CSP_TICKER_SECTOR: Dict[str, str] = {
     # ── Consumer Staples ─────────────────────────────────────────────
     "WMT":  "STAPLES", "COST": "STAPLES", "KO":  "STAPLES",
     "PEP":  "STAPLES", "PG":   "STAPLES", "CL":  "STAPLES",
-    "GIS":  "STAPLES", "KHC":  "STAPLES", "SCHD": "STAPLES",
+    "GIS":  "STAPLES", "KHC":  "STAPLES",
 
     # ── Energy ───────────────────────────────────────────────────────
-    "XOM":  "ENERGY", "CVX": "ENERGY", "COP": "ENERGY", "XLE": "ENERGY",
+    "XOM":  "ENERGY", "CVX": "ENERGY", "COP": "ENERGY",
 
     # ── Industrials ──────────────────────────────────────────────────
     "DE":   "INDUSTRIALS", "CAT": "INDUSTRIALS", "ETN": "INDUSTRIALS",
@@ -506,6 +509,9 @@ CSP_TICKER_SECTOR: Dict[str, str] = {
     # ── Broad ETFs (low correlation — treated as their own sector) ───
     "SPY":  "ETF_BROAD", "SPLG": "ETF_BROAD", "QQQ": "ETF_BROAD",
     "JEPI": "ETF_BROAD", "XLU":  "ETF_BROAD",
+    # Sector ETFs — no earnings calendar, treated same as broad ETFs for guard purposes
+    "SMH":  "ETF_BROAD", "SCHD": "ETF_BROAD", "XLE":  "ETF_BROAD",
+    "XLF":  "ETF_BROAD", "XLV":  "ETF_BROAD",
 }
 
 # ============================================================

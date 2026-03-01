@@ -88,6 +88,23 @@ def build_csp_candidates(mkt: Dict, mode: str) -> List[dict]:
             best       = None
             best_score = -1e9
 
+            # Per-ticker guards — run once here, not inside each ATR iteration.
+            # Ex-dividend: early assignment risk before ex-date.
+            if strat.has_upcoming_ex_dividend(tkr_u):
+                continue
+
+            # Earnings: IV crush + gap risk if announcement falls within CSP window.
+            # Need an expiry estimate — use the first valid expiry in range for the check.
+            # evaluate_csp_candidate will select the exact expiry; this is just the guard.
+            try:
+                import yfinance as yf
+                _t = yf.Ticker(tkr_u)
+                _exp, _ = strat._pick_expiry_in_dte_range(_t, strat.CSP_TARGET_DTE_MIN, strat.CSP_TARGET_DTE_MAX)
+                if _exp and strat.has_earnings_within_window(tkr_u, _exp):
+                    continue
+            except Exception:
+                pass  # fail-open — let evaluate_csp_candidate proceed
+
             for atr_mult in CSP_ATR_MULTS:
                 c = strat.evaluate_csp_candidate(
                     tkr_u, df, atr_mult=float(atr_mult),
@@ -95,6 +112,10 @@ def build_csp_candidates(mkt: Dict, mode: str) -> List[dict]:
                     min_otm_pct=min_otm,
                     base_ma=base_ma,
                 )
+                # Note: available_capital defaults to CSP_MAX_CASH_PER_TRADE inside
+                # evaluate_csp_candidate — sufficient to admit 1-contract candidates
+                # for any priced stock.  Actual per-account sizing happens in
+                # plan_weekly_csp_orders which knows the real remaining capital.
                 if not c:
                     continue
 
