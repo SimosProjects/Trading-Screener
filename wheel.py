@@ -209,6 +209,16 @@ def _append_stock_trade_record(row: dict) -> None:
         "pnl_abs", "pnl_pct",
     ]
     file_exists = os.path.isfile(STOCK_TRADES_FILE)
+    # Ensure trailing newline before appending — prevents row-gluing if the
+    # last write was interrupted before the newline was flushed (same fix
+    # applied to append_csp_ledger_row in Session 10).
+    if file_exists:
+        with open(STOCK_TRADES_FILE, "rb+") as f:
+            f.seek(0, 2)
+            if f.tell() > 0:
+                f.seek(-1, 2)
+                if f.read(1) != b"\n":
+                    f.write(b"\n")
     with open(STOCK_TRADES_FILE, "a", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore", lineterminator="\n")
         if not file_exists:
@@ -812,7 +822,7 @@ def rebuild_monthly_from_events() -> None:
     os.makedirs(WHEEL_MONTHLY_DIR, exist_ok=True)
 
     # Relevant event types for the premium income statement
-    INCOME_TYPES = {"CSP_OPEN", "CC_OPEN", "CSP_CLOSE_TP", "CC_CLOSE_TP", "CSP_EXPIRED", "CC_EXPIRED"}
+    INCOME_TYPES = {"CSP_OPEN", "CC_OPEN", "CSP_CLOSE_TP", "CC_CLOSE_TP", "CSP_EXPIRED", "CC_EXPIRED", "CC_MANUAL_EXIT_BUYBACK"}
 
     # Build a lookup of open-event amounts keyed by ref_id so we can compute
     # net profit on close/expiry rows without a second pass.
@@ -854,7 +864,7 @@ def rebuild_monthly_from_events() -> None:
             prem   = _safe_float(e.get("premium"), 0.0)
 
             # amount: positive for income, negative for cost
-            if et in ("CSP_CLOSE_TP", "CC_CLOSE_TP"):
+            if et in ("CSP_CLOSE_TP", "CC_CLOSE_TP", "CC_MANUAL_EXIT_BUYBACK"):
                 amount = -abs(prem)   # buyback is a cash outflow
             else:
                 amount = prem         # open premium or $0 expiry
@@ -863,7 +873,7 @@ def rebuild_monthly_from_events() -> None:
 
             # net: on close/expiry rows, compute realised profit for this cycle
             net = ""
-            if et in ("CSP_CLOSE_TP", "CC_CLOSE_TP"):
+            if et in ("CSP_CLOSE_TP", "CC_CLOSE_TP", "CC_MANUAL_EXIT_BUYBACK"):
                 orig = open_premiums.get(ref, 0.0)
                 net  = f"{orig + amount:.2f}"   # orig is positive; amount is negative buyback
             elif et in ("CSP_EXPIRED", "CC_EXPIRED"):
@@ -886,6 +896,8 @@ def rebuild_monthly_from_events() -> None:
                 notes = f"TP buyback — net ${float(net):.0f}" if net else "TP buyback"
             elif et == "CC_CLOSE_TP":
                 notes = f"CC TP buyback — net ${float(net):.0f}" if net else "CC TP buyback"
+            elif et == "CC_MANUAL_EXIT_BUYBACK":
+                notes = f"CC buyback (manual exit) — net ${float(net):.0f}" if net else "CC buyback (manual exit)"
             elif et in ("CSP_EXPIRED", "CC_EXPIRED"):
                 notes = "expired worthless"
             else:

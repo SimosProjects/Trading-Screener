@@ -274,15 +274,30 @@ def print_open_ccs(today: dt.date, px: Dict[str, float]) -> None:
     except Exception as e:
         log.warning("print_open_ccs failed: %s", e)
 
-def print_open_cc_roll_candidates(px: Dict[str, float]) -> None:
+def print_open_cc_roll_candidates(px: Dict[str, float], today: "dt.date | None" = None) -> None:
     """
-    Flag open CCs where the stock has recovered close to the strike.
+    Flag open CCs where the stock has recovered close to or through the strike,
+    then prompt the user to act on each one interactively.
 
-    When current_price / strike >= CC_ROLL_SIGNAL_THRESHOLD the CC is at
-    risk of assignment before expiry on a continued rally.  This is purely
-    informational — no automated roll is executed.  The human decides whether
-    to buy-to-close and re-sell at a higher strike / later expiry.
+    Options presented per candidate:
+      1  Roll up & out  — buy-to-close, sell higher strike on later expiry
+                          (strike chosen by ATR-tier logic, same as fresh CC open)
+      2  Roll out       — buy-to-close, re-sell SAME strike on later expiry
+      3  Close only     — buy-to-close, no replacement (lot stays open, new CC
+                          can be planned on next run)
+      4  Skip           — do nothing for this candidate this run
+
+    Debit rolls are blocked by policy — if the net of closing+opening would cost
+    money the system explains why and treats the candidate as skipped.
+
+    The function is intentionally defensive: any failure in the interactive path
+    logs a warning and falls through to the next candidate rather than crashing
+    the screener run.
     """
+    import datetime as _dt
+    if today is None:
+        today = _dt.date.today()
+
     try:
         cc_rows = strat.load_csv_rows(CC_POSITIONS_FILE)
         candidates = []
@@ -304,20 +319,141 @@ def print_open_cc_roll_candidates(px: Dict[str, float]) -> None:
                 continue
 
             pct_to_strike = (strike - cur) / strike
-            proximity = cur / strike
+            proximity     = cur / strike
 
             if proximity >= float(CC_ROLL_SIGNAL_THRESHOLD):
                 exp = (r.get("expiry") or "").strip()
-                candidates.append((tkr, strike, cur, pct_to_strike * 100, exp))
+                candidates.append({
+                    "row":    r,
+                    "tkr":    tkr,
+                    "strike": strike,
+                    "cur":    cur,
+                    "pct":    pct_to_strike * 100,   # negative = ITM
+                    "exp":    exp,
+                })
 
-        if candidates:
-            print("\n⚠️  CC ROLL CANDIDATES (within {:.0f}% of strike — consider rolling up/out)".format(
-                (1.0 - float(CC_ROLL_SIGNAL_THRESHOLD)) * 100
-            ))
-            for tkr, strike, cur, pct_otm, exp in candidates:
-                flag = "🔴 ITM" if pct_otm < 0 else "🟡 near"
-                direction = "ITM" if pct_otm < 0 else "OTM"
-                print(f"  {flag} {tkr:<6} {strike:.0f}C {exp} | Now {cur:.2f} ({abs(pct_otm):.1f}% {direction})")
+        if not candidates:
+            return
+
+        threshold_pct = (1.0 - float(CC_ROLL_SIGNAL_THRESHOLD)) * 100
+        print(f"\n⚠️  CC ROLL CANDIDATES (within {threshold_pct:.0f}% of strike — action required?)")
+
+        for cand in candidates:
+            tkr    = cand["tkr"]
+            strike = cand["strike"]
+            cur    = cand["cur"]
+            pct    = cand["pct"]        # negative means ITM
+            exp    = cand["exp"]
+            r      = cand["row"]
+
+            flag      = "🔴 ITM " if pct < 0 else "🟡 near"
+            direction = "ITM"         if pct < 0 else "OTM"
+
+            print(f"\n  {flag} {tkr:<6} {strike:.0f}C {exp} | Now {cur:.2f} ({abs(pct):.1f}% {direction})")
+            print(f"    1  Roll up & out  (new strike via ATR tier, later expiry)")
+            print(f"    2  Roll out only  (same strike {strike:.0f}C, later expiry)")
+            print(f"    3  Close CC only  (buy to close, keep shares, fresh CC next run)")
+            print(f"    4  Close CC + exit shares  (unwind entire position, book P&L)")
+            print(f"    5  Skip           (do nothing)")
+
+            # Read user choice with a 30-second timeout.
+            # If no input arrives (background run, piped, or user away) the
+            # default is always Skip — the screener never hangs.
+            choice = "5"
+            try:
+                import sys as _sys
+                import select as _select
+                print("    Choice [1/2/3/4/5, default=5, 30s timeout]: ", end="", flush=True)
+                ready, _, _ = _select.select([_sys.stdin], [], [], 30)
+                if ready:
+                    raw = _sys.stdin.readline().strip()
+                    if raw in ("1", "2", "3", "4", "5"):
+                        choice = raw
+                    elif raw == "":
+                        choice = "5"
+                    else:
+                        print(f"\n    ⚠️  Unrecognised input '{raw}' — defaulting to Skip.")
+                        choice = "5"
+                else:
+                    print("\n    [no response in 30s — defaulting to Skip]")
+                    choice = "5"
+            except (EOFError, KeyboardInterrupt):
+                print("\n    [non-interactive — skipping]")
+                choice = "5"
+            except Exception as e:
+                log.warning("CC roll prompt error for %s: %s", tkr, e)
+                choice = "5"
+
+            if choice == "5":
+                print(f"    → Skipped {tkr}.")
+                continue
+
+            if choice == "3":
+                # Close CC only — mark CC closed, leave shares, fresh CC next run
+                print(f"    Closing CC for {tkr} {exp} {strike:.0f}C …", end=" ", flush=True)
+                try:
+                    rows_all = strat.load_csv_rows(CC_POSITIONS_FILE)
+                    old_id   = (r.get("id") or "").strip()
+                    changed  = False
+                    for row in rows_all:
+                        if (row.get("id") or "").strip() == old_id:
+                            row["status"]     = "CLOSED_MANUAL"
+                            row["close_date"] = today.isoformat()
+                            row["close_type"] = "CLOSED_MANUAL"
+                            row["notes"]      = f"Manually closed via roll-prompt on {today}"
+                            changed = True
+                            break
+                    if changed:
+                        strat.write_csv_rows(CC_POSITIONS_FILE, rows_all,
+                                             strat.CC_POSITIONS_COLUMNS)
+                        import sys
+                        _whl = sys.modules.get("wheel")
+                        src_lot = (r.get("source_lot_id") or "").strip()
+                        if _whl and src_lot:
+                            lots = _whl._read_rows(_whl.WHEEL_LOTS_FILE)
+                            for lot in lots:
+                                if (lot.get("lot_id") or "").strip() == src_lot:
+                                    lot["has_open_cc"] = "0"
+                                    lot["cc_id"]       = ""
+                                    break
+                            _whl._write_rows(_whl.WHEEL_LOTS_FILE, lots, _whl.LOT_FIELDS)
+                        print("✅  CC closed. Shares kept — new CC will be planned next run.")
+                    else:
+                        print("⚠️  CC row not found — nothing changed.")
+                except Exception as e:
+                    log.warning("CC close-only failed for %s: %s", tkr, e)
+                    print(f"❌  Failed: {e}")
+                continue
+
+            if choice == "4":
+                # Close CC + sell shares — full position exit
+                print(f"    Closing CC and exiting {tkr} shares …", end=" ", flush=True)
+                try:
+                    result = strat.execute_cc_close_and_exit(today, r)
+                    if result["ok"]:
+                        print(f"✅  {result['reason']}")
+                    else:
+                        print(f"❌  Failed: {result['reason']}")
+                except Exception as e:
+                    log.warning("execute_cc_close_and_exit failed for %s: %s", tkr, e)
+                    print(f"❌  Error: {e}")
+                continue
+
+            # Choice 1 or 2 — execute a roll
+            roll_up = (choice == "1")
+            roll_label = "up & out" if roll_up else "out only"
+            print(f"    Rolling {tkr} {roll_label} …", end=" ", flush=True)
+            try:
+                result = strat.execute_cc_roll(today, r, roll_up=roll_up)
+                if result["ok"]:
+                    print(f"✅  {result['reason']}")
+                else:
+                    print(f"❌  Blocked: {result['reason']}")
+                    print(f"    Position unchanged — choose Skip or Close only to proceed manually.")
+            except Exception as e:
+                log.warning("execute_cc_roll failed for %s: %s", tkr, e)
+                print(f"❌  Error: {e}")
+
     except Exception as e:
         log.warning("print_open_cc_roll_candidates failed: %s", e)
 

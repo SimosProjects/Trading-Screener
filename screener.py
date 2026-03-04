@@ -94,7 +94,11 @@ def _run_integrity_check(today: dt.date) -> None:
         # Use sys.modules to avoid the system 'wheel' package collision
         import sys as _sys
         _whl  = _sys.modules.get("wheel") or __import__("wheel")
-        lots  = _whl.get_open_lots()
+        # Use all lots (OPEN and CLOSED) so that a fully-exited position
+        # (CLOSED lot) still satisfies the ASSIGNED CSP integrity check.
+        # Using get_open_lots() here caused false-positive orphan warnings
+        # after a manual exit closed the lot.
+        lots  = _whl._read_rows(_whl.WHEEL_LOTS_FILE)
 
         lot_by_csp_id = {(r.get("source_csp_id") or "").strip(): r for r in lots}
 
@@ -464,7 +468,7 @@ def run_screener() -> None:
         print("\n📞 CC: No calls triggered today.")
 
     # Surface any open CCs where the stock has recovered close to the strike.
-    print_open_cc_roll_candidates(px)
+    print_open_cc_roll_candidates(px, today=today)
 
     # Surface CSP roll candidates (ITM with enough DTE to act).
     print_csp_roll_candidates(csp_roll_candidates)

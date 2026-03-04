@@ -2652,6 +2652,476 @@ def plan_covered_calls(today: dt.date, assigned_rows: List[dict], open_cc_lot_id
     return ideas
 
 
+def execute_cc_roll(
+    today: dt.date,
+    cc_row: dict,
+    roll_up: bool,
+) -> Dict[str, object]:
+    """Close an existing open CC and open a replacement on the same lot.
+
+    This is the execution path for the interactive CC roll prompt.  The caller
+    has already confirmed the action; this function does the work and returns
+    a result dict so the caller can report back to the user.
+
+    Parameters
+    ----------
+    today    : run date
+    cc_row   : the OPEN row from cc_positions.csv to be rolled
+    roll_up  : True  → roll UP & out (new strike above current price via ATR tier)
+               False → roll OUT only  (keep same strike, push expiry out)
+
+    Steps
+    -----
+    1. Fetch live price + ATR for the ticker.
+    2. Determine the new expiry using the same tier-aware DTE window as a fresh CC.
+    3. Determine the new strike:
+         roll_up   → decide_cc_strike() (ATR-tier logic, same as fresh CC open)
+         roll_out  → keep current strike, round to nearest chain strike
+    4. Look up both legs on the chain:
+         close leg : buyback cost  (ask-side fill: ask - (ask-mid)*OPT_BUY_FILL_PCT)
+         open leg  : credit received (bid-side fill: bid + (mid-bid)*OPT_SELL_FILL_PCT)
+    5. Compute net credit = new_credit - buyback_cost.
+       BLOCK if net_credit < 0 (debit roll policy).
+    6. Mark old CC row CLOSED_ROLLED, open new CC row, update parent lot atomically.
+
+    Returns dict with keys:
+      ok         : bool
+      reason     : human-readable outcome string
+      net_credit : float (0.0 if ok=False)
+      new_expiry : str
+      new_strike : float
+    """
+    ticker    = (cc_row.get("ticker") or "").strip().upper()
+    old_exp   = (cc_row.get("expiry") or "").strip()
+    old_strike = safe_float(cc_row.get("strike"), 0.0)
+    contracts  = safe_int(cc_row.get("contracts"), 1)
+    account    = (cc_row.get("account") or INDIVIDUAL).strip().upper()
+    source_lot_id = (cc_row.get("source_lot_id") or "").strip()
+
+    FAIL = lambda msg: {"ok": False, "reason": msg, "net_credit": 0.0,
+                        "new_expiry": "", "new_strike": 0.0}
+
+    # ── 1. Price & ATR ────────────────────────────────────────────────────
+    try:
+        df = add_indicators(download_ohlcv(ticker))
+        if df is None or df.empty:
+            return FAIL(f"No OHLCV data for {ticker}")
+        last = df.iloc[-1]
+        atr  = safe_float(last.get("ATR_14"), 0.0)
+        live = get_live_price(ticker)
+        current_price = live if live else safe_float(last.get("Close"), 0.0)
+        if current_price <= 0:
+            return FAIL(f"Could not get current price for {ticker}")
+    except Exception as e:
+        return FAIL(f"Price fetch failed for {ticker}: {e}")
+
+    # ── 2. Tier + DTE window ──────────────────────────────────────────────
+    # Derive net_cost_basis from the parent lot for tier calculation.
+    try:
+        import sys
+        _whl = sys.modules.get("wheel")
+        lots = _whl._read_rows(_whl.WHEEL_LOTS_FILE) if _whl else []
+        parent_lot = next(
+            (l for l in lots if (l.get("lot_id") or "").strip() == source_lot_id),
+            None
+        ) if source_lot_id else None
+        net_basis_per_sh = 0.0
+        if parent_lot:
+            shares_lot = safe_int(parent_lot.get("shares"), 0)
+            net_cb     = safe_float(parent_lot.get("net_cost_basis") or
+                                    parent_lot.get("cost_basis"), 0.0)
+            net_basis_per_sh = (net_cb / shares_lot) if shares_lot > 0 else 0.0
+    except Exception:
+        net_basis_per_sh = 0.0
+
+    if net_basis_per_sh <= 0 or atr <= 0:
+        cc_tier = "NORMAL"
+    else:
+        pct_vs = (current_price - net_basis_per_sh) / net_basis_per_sh
+        if pct_vs >= 0.0:
+            cc_tier = "NORMAL"
+        elif pct_vs >= -float(CC_UNDERWATER_MILD_PCT):
+            cc_tier = "MILD"
+        elif pct_vs >= -float(CC_UNDERWATER_DEEP_PCT):
+            cc_tier = "DEEP"
+        else:
+            cc_tier = "SEVERE"
+
+    dte_min, dte_max = CC_DTE_BY_TIER.get(cc_tier, (CC_TARGET_DTE_MIN, CC_TARGET_DTE_MAX))
+
+    # ── 3. New expiry ─────────────────────────────────────────────────────
+    try:
+        t = yf.Ticker(ticker)
+        new_exp, _ = _pick_expiry_in_dte_range(t, dte_min, dte_max)
+        if not new_exp:
+            new_exp, _ = _pick_expiry_in_dte_range(t, CC_TARGET_DTE_MIN, CC_TARGET_DTE_MAX)
+        if not new_exp:
+            return FAIL(f"No expiry available in DTE window for {ticker}")
+        # Roll must push the expiry OUT, not backwards
+        if new_exp <= old_exp:
+            # Try one window wider
+            new_exp, _ = _pick_expiry_in_dte_range(t, dte_max, dte_max + 21)
+        if not new_exp or new_exp <= old_exp:
+            return FAIL(
+                f"Could not find a later expiry than {old_exp} for {ticker}. "
+                f"Try again closer to expiration."
+            )
+    except Exception as e:
+        return FAIL(f"Expiry fetch failed for {ticker}: {e}")
+
+    # ── 4. New strike ─────────────────────────────────────────────────────
+    try:
+        chain_key_new = f"{ticker}-{new_exp}"
+        if chain_key_new not in _chain_cache:
+            _chain_cache[chain_key_new] = t.option_chain(new_exp)
+        calls_new = _chain_cache[chain_key_new].calls.copy()
+        if calls_new.empty:
+            return FAIL(f"No call chain for {ticker} {new_exp}")
+
+        if roll_up:
+            _dec, raw_target, _reason = decide_cc_strike(
+                current_price, net_basis_per_sh, atr
+            )
+            new_strike = _round_call_strike_to_chain(calls_new, raw_target)
+            # Floor: new strike must be above current price (genuinely OTM)
+            if new_strike <= current_price:
+                otm_fallback = current_price * 1.01
+                new_strike = _round_call_strike_to_chain(calls_new, otm_fallback)
+        else:
+            # Roll out: keep the same strike on the new expiry
+            new_strike = _round_call_strike_to_chain(calls_new, old_strike)
+
+        # Apply hard OTM floor regardless of roll type
+        if CC_STRIKE_FLOOR_BELOW_CURRENT_PCT > 0:
+            floor = current_price * (1.0 - float(CC_STRIKE_FLOOR_BELOW_CURRENT_PCT))
+            if new_strike < floor:
+                return FAIL(
+                    f"New strike {new_strike:.2f} is below OTM floor {floor:.2f} "
+                    f"(current {current_price:.2f}). Strike too close to money — wait."
+                )
+    except Exception as e:
+        return FAIL(f"Strike selection failed for {ticker}: {e}")
+
+    # ── 5. Quote both legs ────────────────────────────────────────────────
+    try:
+        # Close leg: buy back the old CC
+        chain_key_old = f"{ticker}-{old_exp}"
+        if chain_key_old not in _chain_cache:
+            _chain_cache[chain_key_old] = t.option_chain(old_exp)
+        calls_old = _chain_cache[chain_key_old].calls.copy()
+        old_row = calls_old.loc[calls_old["strike"] == old_strike]
+        if old_row.empty:
+            return FAIL(f"Old strike {old_strike:.2f} not found in chain for {old_exp}")
+        old_row = old_row.iloc[0]
+        bid_old = safe_float(old_row.get("bid"), 0.0)
+        ask_old = safe_float(old_row.get("ask"), 0.0)
+        if ask_old <= 0:
+            return FAIL(f"Cannot get buyback quote for {ticker} {old_exp} {old_strike:.0f}C")
+        mid_old     = (bid_old + ask_old) / 2.0
+        # Buying back: pay between mid and ask (worse than mid, conservative)
+        buyback_per_sh = ask_old - (ask_old - mid_old) * float(OPT_BUY_FILL_PCT)
+        buyback_total  = buyback_per_sh * 100.0 * contracts
+
+        # Open leg: sell the new CC
+        new_row = calls_new.loc[calls_new["strike"] == new_strike]
+        if new_row.empty:
+            return FAIL(f"New strike {new_strike:.2f} not found in chain for {new_exp}")
+        new_row = new_row.iloc[0]
+        bid_new = safe_float(new_row.get("bid"), 0.0)
+        ask_new = safe_float(new_row.get("ask"), 0.0)
+        if bid_new < float(CC_MIN_BID):
+            return FAIL(
+                f"New CC {ticker} {new_exp} {new_strike:.0f}C bid {bid_new:.2f} "
+                f"below minimum {CC_MIN_BID}. No useful premium available."
+            )
+        mid_new       = (bid_new + ask_new) / 2.0
+        credit_per_sh = bid_new + (mid_new - bid_new) * float(OPT_SELL_FILL_PCT)
+        commission    = float(OPT_COMMISSION_PER_CONTRACT) * contracts
+        credit_total  = credit_per_sh * 100.0 * contracts - commission
+
+    except Exception as e:
+        return FAIL(f"Chain quote failed for {ticker}: {e}")
+
+    # ── 6. Net credit check ───────────────────────────────────────────────
+    net_credit = credit_total - buyback_total
+    if net_credit < 0:
+        return FAIL(
+            f"Roll is a net DEBIT of ${abs(net_credit):.2f} "
+            f"(buyback ${buyback_total:.2f}, new credit ${credit_total:.2f}). "
+            f"Debit rolls are blocked by policy. Wait for more decay or try roll-out only."
+        )
+
+    # ── 7. Execute: mark old CC closed, open new CC, update lot ──────────
+    try:
+        rows = load_csv_rows(CC_POSITIONS_FILE)
+        old_id = (cc_row.get("id") or "").strip()
+        for r in rows:
+            if (r.get("id") or "").strip() == old_id:
+                r["status"]     = "CLOSED_ROLLED"
+                r["close_date"] = today.isoformat()
+                r["close_type"] = "ROLLED"
+                r["notes"]      = (
+                    f"Rolled {'up ' if roll_up else ''}& out → "
+                    f"{new_exp} {new_strike:.0f}C | "
+                    f"buyback ${buyback_total:.0f}, credit ${credit_total:.0f}, "
+                    f"net ${net_credit:.0f}"
+                )
+                break
+        write_csv_rows(CC_POSITIONS_FILE, rows, CC_POSITIONS_COLUMNS)
+
+        # Open the replacement CC
+        new_idea = {
+            "ticker":        ticker,
+            "expiry":        new_exp,
+            "strike":        float(new_strike),
+            "contracts":     contracts,
+            "credit_mid":    credit_per_sh,
+            "cc_tier":       cc_tier,
+            "reason":        f"[ROLL {'UP+OUT' if roll_up else 'OUT'}] {cc_tier} tier → {new_exp} {new_strike:.0f}C | net ${net_credit:.0f}",
+            "account":       account,
+            "source_lot_id": source_lot_id,
+        }
+        new_cc_id = add_cc_position_from_candidate(today.isoformat(), new_idea)
+
+        # Update parent lot: link to new CC id
+        import sys
+        _whl = sys.modules.get("wheel")
+        if _whl and source_lot_id:
+            lots = _whl._read_rows(_whl.WHEEL_LOTS_FILE)
+            for lot in lots:
+                if (lot.get("lot_id") or "").strip() == source_lot_id:
+                    lot["cc_id"]      = new_cc_id
+                    lot["has_open_cc"] = "1"
+                    break
+            _whl._write_rows(_whl.WHEEL_LOTS_FILE, lots, _whl.LOT_FIELDS)
+
+        log.info(
+            "CC rolled %s: %s %.0fC → %s %.0fC | buyback $%.0f credit $%.0f net $%.0f",
+            ticker, old_exp, old_strike, new_exp, new_strike,
+            buyback_total, credit_total, net_credit,
+        )
+
+        return {
+            "ok":         True,
+            "reason":     (
+                f"Rolled {ticker} {'up ' if roll_up else ''}& out: "
+                f"{old_exp} {old_strike:.0f}C → {new_exp} {new_strike:.0f}C | "
+                f"buyback ${buyback_total:.0f}  new credit ${credit_total:.0f}  "
+                f"net credit ${net_credit:.0f}"
+            ),
+            "net_credit": net_credit,
+            "new_expiry": new_exp,
+            "new_strike": new_strike,
+        }
+
+    except Exception as e:
+        log.error("execute_cc_roll: write failed for %s: %s", ticker, e)
+        return FAIL(f"Failed to write position files: {e}")
+
+
+def execute_cc_close_and_exit(
+    today: dt.date,
+    cc_row: dict,
+) -> Dict[str, object]:
+    """Buy to close an open CC and immediately sell the underlying shares.
+
+    This is the full wheel exit path: the position is unwound entirely.
+    Used when the trader wants to cut losses or take profits and redeploy
+    capital rather than continuing the CC cycle.
+
+    Steps
+    -----
+    1. Fetch live price for both the share sale and P&L calculation.
+    2. Buy back the CC at ask-side fill (same as TP buyback).
+    3. Sell shares at live price (stock slippage applied).
+    4. Mark CC row CLOSED_MANUAL_EXIT.
+    5. Mark wheel lot CLOSED, write stock_trades.csv record with full P&L.
+    6. Record a CC_MANUAL_EXIT wheel event so monthly reports are complete.
+
+    Returns dict with keys:
+      ok             : bool
+      reason         : human-readable outcome
+      share_proceeds : float
+      cc_buyback     : float
+      net_pnl        : float
+    """
+    ticker        = (cc_row.get("ticker") or "").strip().upper()
+    old_exp       = (cc_row.get("expiry") or "").strip()
+    old_strike    = safe_float(cc_row.get("strike"), 0.0)
+    contracts     = safe_int(cc_row.get("contracts"), 1)
+    account       = (cc_row.get("account") or INDIVIDUAL).strip().upper()
+    source_lot_id = (cc_row.get("source_lot_id") or "").strip()
+
+    FAIL = lambda msg: {"ok": False, "reason": msg,
+                        "share_proceeds": 0.0, "cc_buyback": 0.0, "net_pnl": 0.0}
+
+    # ── 1. Live price ─────────────────────────────────────────────────────
+    try:
+        live = get_live_price(ticker)
+        if not live or live <= 0:
+            df = add_indicators(download_ohlcv(ticker))
+            if df is None or df.empty:
+                return FAIL(f"No price data for {ticker}")
+            live = safe_float(df.iloc[-1].get("Close"), 0.0)
+        if live <= 0:
+            return FAIL(f"Could not get current price for {ticker}")
+    except Exception as e:
+        return FAIL(f"Price fetch failed for {ticker}: {e}")
+
+    # ── 2. CC buyback quote ───────────────────────────────────────────────
+    cc_buyback_total = 0.0
+    try:
+        t         = yf.Ticker(ticker)
+        chain_key = f"{ticker}-{old_exp}"
+        if chain_key not in _chain_cache:
+            _chain_cache[chain_key] = t.option_chain(old_exp)
+        calls = _chain_cache[chain_key].calls.copy()
+        row   = calls.loc[calls["strike"] == old_strike]
+        if not row.empty:
+            row            = row.iloc[0]
+            bid_cc         = safe_float(row.get("bid"), 0.0)
+            ask_cc         = safe_float(row.get("ask"), 0.0)
+            if ask_cc > 0:
+                mid_cc           = (bid_cc + ask_cc) / 2.0
+                buyback_per_sh   = ask_cc - (ask_cc - mid_cc) * float(OPT_BUY_FILL_PCT)
+                cc_buyback_total = buyback_per_sh * 100.0 * contracts
+    except Exception as e:
+        log.warning(
+            "execute_cc_close_and_exit: CC quote failed for %s, treating as $0: %s",
+            ticker, e,
+        )
+
+    # ── 3. Locate the parent wheel lot ────────────────────────────────────
+    import sys
+    _whl = sys.modules.get("wheel")
+    if not _whl:
+        return FAIL("wheel module not available in sys.modules")
+
+    lots = _whl._read_rows(_whl.WHEEL_LOTS_FILE)
+    parent_lot = next(
+        (l for l in lots if (l.get("lot_id") or "").strip() == source_lot_id),
+        None,
+    ) if source_lot_id else None
+
+    if not parent_lot:
+        return FAIL(
+            f"Could not find wheel lot {source_lot_id!r} for {ticker}. "
+            f"Cannot exit safely — close the CC manually and update the lot."
+        )
+
+    shares    = safe_int(parent_lot.get("shares"), 0)
+    net_basis = safe_float(
+        parent_lot.get("net_cost_basis") or parent_lot.get("cost_basis"), 0.0
+    )
+    open_date = (parent_lot.get("open_date") or "").strip()
+
+    if shares <= 0:
+        return FAIL(f"Lot {source_lot_id} has 0 shares — cannot sell.")
+
+    # ── 4. Share sale (slippage applied) ──────────────────────────────────
+    exit_price     = max(live - float(STOCK_SLIPPAGE_PER_SHARE), 0.01)
+    share_proceeds = exit_price * shares
+
+    net_pnl        = share_proceeds - cc_buyback_total - net_basis
+    net_pnl_pct    = (net_pnl / net_basis * 100.0) if net_basis > 0 else 0.0
+    entry_per_sh   = (net_basis / shares) if shares > 0 else 0.0
+
+    # ── 5. Write all records ──────────────────────────────────────────────
+    try:
+        # Close the CC row
+        cc_rows = load_csv_rows(CC_POSITIONS_FILE)
+        old_id  = (cc_row.get("id") or "").strip()
+        for r in cc_rows:
+            if (r.get("id") or "").strip() == old_id:
+                r["status"]     = "CLOSED_MANUAL"
+                r["close_date"] = today.isoformat()
+                r["close_type"] = "CLOSED_MANUAL_EXIT"
+                r["notes"]      = (
+                    f"Manual exit: CC buyback ${cc_buyback_total:.0f}, "
+                    f"shares sold @ ${exit_price:.2f}, net P&L ${net_pnl:.0f}"
+                )
+                break
+        write_csv_rows(CC_POSITIONS_FILE, cc_rows, CC_POSITIONS_COLUMNS)
+
+        # Close the wheel lot
+        for lot in lots:
+            if (lot.get("lot_id") or "").strip() == source_lot_id:
+                lot["status"]      = "CLOSED"
+                lot["has_open_cc"] = "0"
+                lot["cc_id"]       = ""
+                break
+        _whl._write_rows(_whl.WHEEL_LOTS_FILE, lots, _whl.LOT_FIELDS)
+
+        # Stock trade record — appears in stock_monthly report
+        _whl._append_stock_trade_record({
+            "id":          f"{ticker}-{today.isoformat()}-MANUAL_EXIT",
+            "account":     account,
+            "ticker":      ticker,
+            "entry_date":  open_date,
+            "entry_price": f"{entry_per_sh:.4f}",
+            "shares":      str(shares),
+            "exit_date":   today.isoformat(),
+            "exit_price":  f"{exit_price:.2f}",
+            "reason":      "MANUAL_EXIT",
+            "close_type":  "CC_MANUAL_EXIT",
+            "pnl_abs":     f"{net_pnl:.2f}",
+            "pnl_pct":     f"{net_pnl_pct:.2f}",
+        })
+
+        # Wheel event 1: buyback cost as negative premium so the wheel monthly
+        # report correctly nets the CC income against what was paid to close it.
+        # Mirrors the CC_CLOSE_TP pattern — premium is negative (cash outflow).
+        _whl.record_event(
+            date=today.isoformat(),
+            account=account,
+            ticker=ticker,
+            event_type="CC_MANUAL_EXIT_BUYBACK",
+            ref_id=old_id,
+            expiry=old_exp,
+            strike=old_strike,
+            contracts=contracts,
+            premium=-abs(cc_buyback_total),
+        )
+
+        # Wheel event 2: zero-premium marker so the position shows as exited
+        # in event logs (useful for backfill / integrity checks).
+        _whl.record_event(
+            date=today.isoformat(),
+            account=account,
+            ticker=ticker,
+            event_type="CC_MANUAL_EXIT",
+            ref_id=old_id,
+            expiry=old_exp,
+            strike=old_strike,
+            contracts=contracts,
+            premium=0.0,
+        )
+
+        log.info(
+            "CC manual exit — %s %d sh sold @ $%.2f, CC buyback $%.0f, "
+            "net_basis $%.0f, P&L $%.0f (%.1f%%)",
+            ticker, shares, exit_price, cc_buyback_total,
+            net_basis, net_pnl, net_pnl_pct,
+        )
+
+        return {
+            "ok":             True,
+            "reason": (
+                f"Exited {ticker}: {shares} sh @ ${exit_price:.2f} "
+                f"(proceeds ${share_proceeds:.0f}), "
+                f"CC buyback ${cc_buyback_total:.0f}, "
+                f"net P&L ${net_pnl:+.0f} ({net_pnl_pct:+.1f}%)"
+            ),
+            "share_proceeds": share_proceeds,
+            "cc_buyback":     cc_buyback_total,
+            "net_pnl":        net_pnl,
+        }
+
+    except Exception as e:
+        log.error("execute_cc_close_and_exit: write failed for %s: %s", ticker, e)
+        return FAIL(f"Failed to write position files: {e}")
+
+
 def load_open_cc_tickers() -> set:
     """Return the set of tickers that already have an open CC.
     Kept for backward-compat; prefer load_open_cc_lot_ids for new code."""
