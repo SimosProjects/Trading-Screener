@@ -3010,9 +3010,7 @@ def execute_cc_close_and_exit(
         )
 
     shares    = safe_int(parent_lot.get("shares"), 0)
-    net_basis = safe_float(
-        parent_lot.get("net_cost_basis") or parent_lot.get("cost_basis"), 0.0
-    )
+    net_basis = safe_float(parent_lot.get("cost_basis"), 0.0)
     open_date = (parent_lot.get("open_date") or "").strip()
 
     if shares <= 0:

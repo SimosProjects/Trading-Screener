@@ -635,7 +635,7 @@ def process_cc_expirations(today: dt.date) -> Dict[str, List[str]]:
                 cc_strike = _safe_float(cc_row.get("strike"), 0.0)
                 cc_exp    = (cc_row.get("expiry") or "").strip()
                 cc_acct   = (cc_row.get("account") or INDIVIDUAL).strip().upper()
-                net_basis = _safe_float(lot.get("net_cost_basis") or lot.get("cost_basis"), 0.0)
+                net_basis = _safe_float(lot.get("cost_basis"), 0.0)
                 proceeds  = cc_strike * sh_lot
                 pnl_abs   = proceeds - net_basis
                 pnl_pct   = (pnl_abs / net_basis * 100.0) if net_basis > 0 else 0.0
