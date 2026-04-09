@@ -47,9 +47,9 @@ ROTH = "ROTH"
 IRA_ACCOUNTS = (IRA, ROTH)
 
 ACCOUNT_SIZES: Dict[str, int] = {
-    INDIVIDUAL: 100_000,
-    IRA: 100_000,
-    ROTH: 100_000,
+    INDIVIDUAL: 120_000,
+    IRA: 150_000,
+    ROTH: 150_000,
 }
 
 # ---- Per-account wheel configuration ----
@@ -352,8 +352,8 @@ CC_POSITIONS_COLUMNS = [
 
 # ---- Take-profit / early close ----
 # Close a CSP when current mid-price <= original premium * this fraction.
-# 0.50 = close at 50% profit (the classic "half-profit" rule).
-CSP_TAKE_PROFIT_PCT = 0.50
+# 0.60 = close at 60% profit.
+CSP_TAKE_PROFIT_PCT = 0.60
 
 # Skip the take-profit close if the bid/ask spread is wider than this fraction
 # of mid.  Wide spreads mean the quote is stale or illiquid — better to hold
@@ -365,7 +365,7 @@ CSP_TARGET_DTE_MIN = 25
 CSP_TARGET_DTE_MAX = 45
 
 # ---- Risk / sizing ----
-CSP_MAX_CASH_PER_TRADE = 15_000  # per-contract notional ceiling (strike * 100); used for early-exit sizing check only
+CSP_MAX_CASH_PER_TRADE = 20_000  # per-contract notional ceiling (strike * 100); used for early-exit sizing check only
 # Hard cap on contracts per CSP position — prevents oversizing cheap stocks.
 # 3 contracts = manageable assignment risk (~$15-45K notional depending on strike).
 CSP_MAX_CONTRACTS = 3
@@ -568,7 +568,7 @@ CC_ROLL_SIGNAL_THRESHOLD = 0.97
 # ---- CC take-profit ----
 # Close a CC when current mid value <= this fraction of opening premium.
 # Mirrors the CSP take-profit rule — lock in gains early and recycle the lot.
-CC_TAKE_PROFIT_PCT     = 0.50   # close at 50% profit
+CC_TAKE_PROFIT_PCT     = 0.60   # close at 50% profit
 CC_TP_MAX_SPREAD_PCT   = 0.50   # skip if bid/ask spread > 50% of mid
 
 # ---- CC DTE window by underwater tier ----
