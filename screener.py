@@ -20,7 +20,7 @@ Sequence:
 from __future__ import annotations
 
 import datetime as dt
-from typing import List
+from typing import Dict, List
 
 import yfinance as yf
 
@@ -321,13 +321,29 @@ def run_screener() -> None:
             and (c.get("ticker") or "").strip().upper() not in open_cc_tickers
         ]
 
-        # Count how many open CSPs already exist per sector so plan_weekly_csp_orders
-        # can enforce the global per-sector cap across all accounts.
-        open_sector_counts: dict = {}
-        for tkr in open_csp_tickers:
-            sec = strat.get_ticker_sector(tkr)
-            if sec != "OTHER":
-                open_sector_counts[sec] = open_sector_counts.get(sec, 0) + 1
+        # Build per-account sector counts from existing open CSP positions.
+        # Sector concentration is enforced per-account (not globally) because
+        # IRA, ROTH, and INDIVIDUAL are separate legal entities with separate
+        # capital pools — a TECH position in IRA does not increase INDIVIDUAL's
+        # correlated assignment risk.
+        # open_csp_rows keyed by account for fast per-account lookup.
+        _open_csp_rows = strat.load_csv_rows(strat.CSP_POSITIONS_FILE)
+        _open_csp_by_acct: Dict[str, set] = {INDIVIDUAL: set(), IRA: set(), ROTH: set()}
+        for _r in _open_csp_rows:
+            if (_r.get("status") or "").upper() != "OPEN":
+                continue
+            _acct = (_r.get("account") or INDIVIDUAL).strip().upper()
+            _tkr  = (_r.get("ticker") or "").strip().upper()
+            if _acct in _open_csp_by_acct and _tkr:
+                _open_csp_by_acct[_acct].add(_tkr)
+
+        def _sector_counts_for_account(acct: str) -> dict:
+            counts: dict = {}
+            for tkr in _open_csp_by_acct.get(acct, set()):
+                sec = strat.get_ticker_sector(tkr)
+                if sec != "OTHER":
+                    counts[sec] = counts.get(sec, 0) + 1
+            return counts
 
         # Allocation priority: INDIVIDUAL first, then IRA vs ROTH by weekly
         # utilisation (whichever has used less of its weekly target gets priority).
@@ -375,7 +391,7 @@ def run_screener() -> None:
                 week_remaining_cap=float(week_remaining),
                 aggressive_total=int(exp.get("aggressive_total", 0)),
                 aggressive_week=int(exp.get("aggressive_week", 0)),
-                open_sector_counts=open_sector_counts,
+                open_sector_counts=_sector_counts_for_account(acct),
                 live_vix=live_vix,
             )
 

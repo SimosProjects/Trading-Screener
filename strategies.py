@@ -51,6 +51,7 @@ from config import (
     CSP_TAKE_PROFIT_PCT, CSP_TP_MAX_SPREAD_PCT,
     CSP_MAX_CASH_PER_TRADE, CSP_MAX_CONTRACTS,
     CSP_MIN_OI, CSP_MIN_OI_ETF, CSP_MIN_VOLUME, CSP_MIN_BID, CSP_MIN_IV,
+    CSP_SMA200_MIN_SLOPE,
     CSP_STRIKE_MODE,
     CSP_STRIKE_BASE_NORMAL,
     CSP_MIN_PREMIUM_CONSERVATIVE, CSP_MIN_PREMIUM_BALANCED, CSP_MIN_PREMIUM_AGGRESSIVE,
@@ -173,6 +174,10 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     df["SMA_50"] = ta.trend.sma_indicator(close, window=50)
     df["SMA_200"] = ta.trend.sma_indicator(close, window=200)
+    # 20-trading-day % change in the SMA200 — positive means the long-term trend
+    # is still rising, negative means it has rolled over into a structural downtrend.
+    # Used by is_csp_eligible instead of a hard close > SMA200 binary check.
+    df["SMA200_SLOPE"] = df["SMA_200"].pct_change(periods=20)
     df["EMA_21"] = ta.trend.ema_indicator(close, window=21)
     df["EMA_50"] = ta.trend.ema_indicator(close, window=50)
     df["EMA_10"] = ta.trend.ema_indicator(close, window=10)
@@ -268,19 +273,36 @@ def is_eligible(stock_row: pd.Series) -> bool:
 def is_csp_eligible(stock_row: pd.Series, *, allow_below_200: bool = False) -> bool:
     """Eligibility filter for CSP scanning.
 
-    Default (allow_below_200=False) is conservative:
-      - Require Close > SMA200 (structural uptrend)
-      - Avoid ultra-low ADX (often choppy / directionless)
+    NORMAL mode (allow_below_200=False):
+      Instead of the legacy binary "close > SMA200" check, we inspect the
+      *slope* of the SMA200 over the past 20 trading days (SMA200_SLOPE,
+      computed as pct_change(20) in add_indicators).
 
-    Risk-off variant (allow_below_200=True) is *defensive-only* oriented:
-      - Allow names below SMA200, but require Close > SMA50 (avoid true waterfalls)
-      - Looser ADX floor
+      A rising SMA200 with price below it = pullback/correction in a healthy
+      uptrend.  These are acceptable CSP candidates — the business hasn't
+      broken down, the macro did.
+
+      A flat-or-falling SMA200 = the long-term trend has rolled over into a
+      structural downtrend.  These are excluded regardless of where price sits,
+      because assignment risk in a genuine downtrend is high and recovering
+      the cost basis through CCs can take many months.
+
+      Threshold is controlled by CSP_SMA200_MIN_SLOPE in config.py.
+      Default 0.0 = SMA200 must be non-negative (flat or rising).
+      Raise to e.g. 0.001 to require meaningfully positive slope.
+
+    RISK-OFF mode (allow_below_200=True):
+      Defensive-only universe with loose guards — close > SMA50 is the floor.
+      Used when VIX > CSP_RISK_OFF_VIX; slope check is relaxed here because
+      the universe is already restricted to defensive names.
     """
     try:
-        close = float(stock_row["Close"])
-        sma50 = float(stock_row.get("SMA_50", 0) or 0)
-        sma200 = float(stock_row.get("SMA_200", 0) or 0)
-        adx = float(stock_row.get("ADX_14", 0) or 0)
+        close      = float(stock_row["Close"])
+        sma50      = float(stock_row.get("SMA_50", 0) or 0)
+        sma200     = float(stock_row.get("SMA_200", 0) or 0)
+        adx        = float(stock_row.get("ADX_14", 0) or 0)
+        sma200_slope = stock_row.get("SMA200_SLOPE")
+        sma200_slope = float(sma200_slope) if sma200_slope is not None and not (isinstance(sma200_slope, float) and math.isnan(sma200_slope)) else None
     except Exception as e:
         log.debug("is_csp_eligible: indicator field missing or non-numeric: %s", e)
         return False
@@ -289,15 +311,31 @@ def is_csp_eligible(stock_row: pd.Series, *, allow_below_200: bool = False) -> b
         return False
 
     if not allow_below_200:
+        # Require SMA200 to be calculable (needs ~200 days of data)
         if sma200 <= 0:
             return False
-        if close < sma200:
-            return False
+
+        # Core slope check: SMA200 must be flat or rising over the past 20 days.
+        # If slope data is unavailable (e.g. <220 bars of history), fall back to
+        # the legacy close > SMA200 check so we don't silently pass everything.
+        min_slope = float(CSP_SMA200_MIN_SLOPE) if CSP_SMA200_MIN_SLOPE is not None else 0.0
+        if sma200_slope is not None:
+            if sma200_slope < min_slope:
+                log.debug(
+                    "is_csp_eligible: SMA200 slope %.4f < min %.4f — structural downtrend, skipping",
+                    sma200_slope, min_slope,
+                )
+                return False
+        else:
+            # Fallback: not enough history to compute slope — use legacy binary check
+            if close < sma200:
+                return False
+
         if adx and adx < 15:
             return False
         return True
 
-    # risk-off: keep it very restrained
+    # risk-off: keep it very restrained — close must be above SMA50 at minimum
     if close < sma50:
         return False
     if adx and adx < 10:
@@ -3010,7 +3048,9 @@ def execute_cc_close_and_exit(
         )
 
     shares    = safe_int(parent_lot.get("shares"), 0)
-    net_basis = safe_float(parent_lot.get("cost_basis"), 0.0)
+    net_basis = safe_float(
+        parent_lot.get("net_cost_basis") or parent_lot.get("cost_basis"), 0.0
+    )
     open_date = (parent_lot.get("open_date") or "").strip()
 
     if shares <= 0:

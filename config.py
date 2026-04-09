@@ -361,7 +361,13 @@ CSP_TAKE_PROFIT_PCT = 0.60
 CSP_TP_MAX_SPREAD_PCT = 0.50
 
 # ---- DTE window ----
-CSP_TARGET_DTE_MIN = 25
+# Min lowered to 14 so the expiry picker can find pre-earnings expirations
+# during earnings season, when 25-45 DTE windows land squarely on announcement
+# dates for most of the universe.  The earnings guard in build_csp_candidates
+# still blocks any expiry that straddles an earnings date, so lowering the
+# floor does not increase earnings IV-crush risk — it simply gives the picker
+# more expiry candidates to evaluate.
+CSP_TARGET_DTE_MIN = 14
 CSP_TARGET_DTE_MAX = 45
 
 # ---- Risk / sizing ----
@@ -373,7 +379,9 @@ CSP_MAX_CONTRACTS = 3
 # Liquidity filters
 # Individual stocks need higher OI so stressed-market rolls stay fillable.
 # ETFs (SPY, QQQ, SPLG, etc.) are deeply liquid; the lower floor is fine.
-CSP_MIN_OI      = 300   # stocks
+CSP_MIN_OI      = 200   # stocks — lowered from 300; still a meaningful liquidity floor
+                        # for 1-2 contract retail trades while admitting quality names
+                        # whose 6%+ OTM strikes have OI in the 150-300 range
 CSP_MIN_OI_ETF  = 100   # ETF_BROAD sector tickers only
 CSP_MIN_VOLUME  = 10
 CSP_MIN_BID = 0.10
@@ -382,6 +390,17 @@ CSP_MIN_BID = 0.10
 # Lower IV = less premium per unit of risk. This filter prevents selling very
 # cheap options where the edge doesn't justify the capital commitment.
 CSP_MIN_IV = 0.20
+
+# SMA200 slope filter for CSP eligibility (NORMAL mode).
+# Instead of requiring close > SMA200 (a hard binary cross), we require the
+# SMA200 itself to still be rising — meaning the long-term trend was intact
+# until recently.  Price below a rising SMA200 = pullback/correction in an
+# uptrend.  Price below a falling SMA200 = structural downtrend; avoid.
+#
+# Measured as the 20-trading-day % change in SMA200 (pct_change(20)).
+# 0.0 = flat or better.  Set higher (e.g. 0.001) to require meaningful upslope.
+# Set to None or 0.0 to fall back to the legacy close > SMA200 binary check.
+CSP_SMA200_MIN_SLOPE = 0.0   # SMA200 must be non-negative over the past 20 days
 
 # LOW_IV regime (VIX < 18): tighter yield floors.
 # When markets are calm, premiums thin out. Raise the bar so we only sell
@@ -452,10 +471,13 @@ CSP_ROLL_CANDIDATE_MIN_DTE = 10     # at least 10 DTE remaining
 VIX_INTRADAY_SPIKE_THRESHOLD = 4.0  # points
 
 # ---- Sector concentration limit ----
-# No more than this many simultaneously OPEN CSPs in the same sector.
-# Counts both existing open positions and new entries selected in the same run.
-# Global across all accounts — the same underlying risk exists regardless of account.
-CSP_MAX_POSITIONS_PER_SECTOR = 2
+# No more than this many simultaneously OPEN CSPs in the same sector,
+# enforced PER ACCOUNT.  Each account (INDIVIDUAL, IRA, ROTH) has its own
+# independent sector count — they are separate legal entities with separate
+# capital, so a TECH CSP in IRA does not block TECH capacity in INDIVIDUAL.
+# The per-account cap still prevents correlated-assignment blowup within
+# each pool of capital.
+CSP_MAX_POSITIONS_PER_SECTOR = 3
 
 # Static ticker→sector map covering the full CSP_STOCKS universe.
 # Tickers not listed here fall into "OTHER" (no concentration limit applied).
