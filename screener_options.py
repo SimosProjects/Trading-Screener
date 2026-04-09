@@ -15,6 +15,7 @@ from utils import get_logger
 from config import (
     CSP_STOCKS,
     CSP_DEFENSIVE_STOCKS,
+    CSP_EXCLUDED_TICKERS,
     CSP_RISK_OFF_VIX,
     CSP_RISK_OFF_MIN_OTM_PCT_DEFENSIVE,
     CSP_RISK_OFF_MIN_OTM_PCT_RISKY,
@@ -61,6 +62,11 @@ def build_csp_candidates(mkt: Dict, mode: str) -> List[dict]:
         try:
             tkr_u = (tkr or "").strip().upper()
             if not tkr_u:
+                continue
+
+            # Excluded tickers: growth/speculative names kept in STOCKS for swing
+            # trades but explicitly barred from the Wheel universe.
+            if tkr_u in CSP_EXCLUDED_TICKERS:
                 continue
 
             defensive = tkr_u in defensive_set

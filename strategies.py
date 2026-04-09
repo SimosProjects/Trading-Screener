@@ -51,6 +51,7 @@ from config import (
     CSP_TAKE_PROFIT_PCT, CSP_TP_MAX_SPREAD_PCT,
     CSP_MAX_CASH_PER_TRADE, CSP_MAX_CONTRACTS,
     CSP_MIN_OI, CSP_MIN_OI_ETF, CSP_MIN_VOLUME, CSP_MIN_BID, CSP_MIN_IV,
+    CSP_MAX_STOCK_PRICE, CSP_EXCLUDED_TICKERS,
     CSP_SMA200_MIN_SLOPE,
     CSP_STRIKE_MODE,
     CSP_STRIKE_BASE_NORMAL,
@@ -308,6 +309,15 @@ def is_csp_eligible(stock_row: pd.Series, *, allow_below_200: bool = False) -> b
         return False
 
     if sma50 <= 0:
+        return False
+
+    # Price ceiling: reject stocks trading above CSP_MAX_STOCK_PRICE.
+    # Belt-and-suspenders catch for any high-priced name not in CSP_EXCLUDED_TICKERS.
+    # High-priced momentum stocks tend to have elevated IV that reflects genuine
+    # tail risk rather than selling edge.  Also prevents $10K+ per-contract
+    # concentration from a single position.  Set CSP_MAX_STOCK_PRICE = 0 to disable.
+    if CSP_MAX_STOCK_PRICE and close > float(CSP_MAX_STOCK_PRICE):
+        log.debug("is_csp_eligible: price %.2f > max %.2f — skipping", close, float(CSP_MAX_STOCK_PRICE))
         return False
 
     if not allow_below_200:

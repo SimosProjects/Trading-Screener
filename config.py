@@ -235,9 +235,34 @@ STOCKS: List[str] = list(dict.fromkeys([
     "PLTR","SHOP","NET","MDB","SNOW","BROS","CELH",
 ]))
 
-# CSP Universe
+# Tickers explicitly excluded from the CSP/Wheel universe.
+# These remain in STOCKS for swing-trade entries but are not eligible for
+# cash-secured puts.  The Wheel requires willingness to own the stock at the
+# assigned price for potentially months while selling CCs to recover cost
+# basis.  High-multiple growth names with no dividend, extreme intraday vol,
+# and unpredictable earnings gaps are poor Wheel candidates regardless of
+# the premium they generate — high IV on these names reflects genuine tail
+# risk, not just an attractive selling opportunity.
+#
+# CELH is included as a lesson already learned: assigned at $48.59, currently
+# -25%, selling CCs at strikes still well below cost basis.
+CSP_EXCLUDED_TICKERS: List[str] = [
+    # === Speculative / hypergrowth — no dividend, extreme vol, assignment is a trap ===
+    "PLTR",   # 100x+ revenue multiple, 2.5 beta, no dividend
+    "SHOP",   # hypergrowth e-commerce, no dividend, wide swings
+    "NET",    # unprofitable cloud, no dividend
+    "MDB",    # unprofitable database, no dividend
+    "SNOW",   # hypergrowth data, no dividend, prone to -20% earnings gaps
+    "BROS",   # small cap, speculative consumer
+    "CELH",   # lesson learned — assigned at $48.59, -25% unrealized
+    # === Add others here as needed ===
+]
+
+# CSP Universe — STOCKS minus excluded tickers, plus stable ETFs and additional
+# quality names suited to the Wheel (comfortable holding at assigned price).
 CSP_STOCKS: List[str] = list(dict.fromkeys(
-    STOCKS + [
+    [t for t in STOCKS if t not in CSP_EXCLUDED_TICKERS]
+    + [
         # =========================
         # Core ETFs (wheel stabilizers)
         # =========================
@@ -390,6 +415,14 @@ CSP_MIN_BID = 0.10
 # Lower IV = less premium per unit of risk. This filter prevents selling very
 # cheap options where the edge doesn't justify the capital commitment.
 CSP_MIN_IV = 0.20
+
+# Maximum underlying stock price for CSP eligibility.
+# Belt-and-suspenders guard against high-priced speculative names that aren't
+# explicitly listed in CSP_EXCLUDED_TICKERS.  Stocks above this price tend to
+# either be high-multiple growth names (poor Wheel fit — high IV reflects real
+# tail risk, not edge) or require $10K+ notional per contract (concentration).
+# Set to 0.0 to disable this guard entirely.
+CSP_MAX_STOCK_PRICE = 200.0
 
 # SMA200 slope filter for CSP eligibility (NORMAL mode).
 # Instead of requiring close > SMA200 (a hard binary cross), we require the
