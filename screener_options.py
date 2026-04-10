@@ -152,6 +152,15 @@ def build_csp_candidates(mkt: Dict, mode: str) -> List[dict]:
             log.warning("CSP candidate eval failed for %s: %s", tkr, e)
             continue
 
+    log.info("build_csp_candidates: %d candidates passed all filters (universe=%d)",
+             len(candidates), len(CSP_STOCKS))
+    if candidates:
+        for c in candidates:
+            log.info("  CANDIDATE: %s strike=%.0f yield=%.2f%% prem=$%.0f iv=%.0f%%",
+                     c.get("ticker"), c.get("strike", 0),
+                     float(c.get("yield_pct", 0)) * 100,
+                     float(c.get("est_premium", 0)),
+                     float(c.get("iv", 0)) * 100)
     return candidates
 
 

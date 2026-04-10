@@ -392,7 +392,7 @@ CSP_TP_MAX_SPREAD_PCT = 0.50
 # still blocks any expiry that straddles an earnings date, so lowering the
 # floor does not increase earnings IV-crush risk — it simply gives the picker
 # more expiry candidates to evaluate.
-CSP_TARGET_DTE_MIN = 14
+CSP_TARGET_DTE_MIN = 25
 CSP_TARGET_DTE_MAX = 45
 
 # ---- Risk / sizing ----
@@ -422,7 +422,7 @@ CSP_MIN_IV = 0.20
 # either be high-multiple growth names (poor Wheel fit — high IV reflects real
 # tail risk, not edge) or require $10K+ notional per contract (concentration).
 # Set to 0.0 to disable this guard entirely.
-CSP_MAX_STOCK_PRICE = 200.0
+CSP_MAX_STOCK_PRICE = 350.0
 
 # SMA200 slope filter for CSP eligibility (NORMAL mode).
 # Instead of requiring close > SMA200 (a hard binary cross), we require the
@@ -431,9 +431,12 @@ CSP_MAX_STOCK_PRICE = 200.0
 # uptrend.  Price below a falling SMA200 = structural downtrend; avoid.
 #
 # Measured as the 20-trading-day % change in SMA200 (pct_change(20)).
-# 0.0 = flat or better.  Set higher (e.g. 0.001) to require meaningful upslope.
-# Set to None or 0.0 to fall back to the legacy close > SMA200 binary check.
-CSP_SMA200_MIN_SLOPE = 0.0   # SMA200 must be non-negative over the past 20 days
+# -0.002 = allows very slight SMA200 softening (up to -0.2% over 20 days).
+#   Genuine downtrends show -0.005 or worse; correction-phase quality names
+#   sit in the -0.001 to -0.003 range.  Tighten back toward 0.0 once the
+#   market recovery is confirmed.
+# Set to None to fall back to the legacy close > SMA200 binary check.
+CSP_SMA200_MIN_SLOPE = -0.002   # allow very slight SMA200 softening (correction phase)
 
 # LOW_IV regime (VIX < 18): tighter yield floors.
 # When markets are calm, premiums thin out. Raise the bar so we only sell
@@ -450,13 +453,21 @@ CSP_STRIKE_MODE = "ema21_atr"
 CSP_ATR_MULTS = [1.50, 1.25, 1.00]  # safer strikes (farther OTM)
 
 # ---- Premium / yield tiers ----
+# Yield floors calibrated for VIX ~18-25 (NORMAL regime).
+# Original floors (1.0% / 1.5% / 2.0%) were set for a low-VIX bull market
+# where quality names at 6% OTM / 30 DTE generated richer premiums.  In a
+# VIX-20 correction, the same quality names (NVDA 170P, XLE 53P) produce
+# 0.89-0.99% — just below the old floor.  Lowered by ~20% to reflect the
+# current premium environment while keeping real yield requirements.
+# At 0.8% on $17K cash over 28 days = ~$136 collected = ~10.5% annualised.
+# Tighten back toward 1.0% once VIX settles below 18 (LOW_IV regime takes over).
 CSP_MIN_PREMIUM_CONSERVATIVE = 100
 CSP_MIN_PREMIUM_BALANCED = 175
 CSP_MIN_PREMIUM_AGGRESSIVE = 250
 
-CSP_MIN_YIELD_CONSERVATIVE = 0.010
-CSP_MIN_YIELD_BALANCED = 0.015
-CSP_MIN_YIELD_AGGRESSIVE = 0.020
+CSP_MIN_YIELD_CONSERVATIVE = 0.008
+CSP_MIN_YIELD_BALANCED = 0.013
+CSP_MIN_YIELD_AGGRESSIVE = 0.018
 
 # ---- Tier caps ----
 CSP_MAX_AGGRESSIVE_TOTAL = 4

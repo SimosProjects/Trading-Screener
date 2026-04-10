@@ -317,7 +317,7 @@ def is_csp_eligible(stock_row: pd.Series, *, allow_below_200: bool = False) -> b
     # tail risk rather than selling edge.  Also prevents $10K+ per-contract
     # concentration from a single position.  Set CSP_MAX_STOCK_PRICE = 0 to disable.
     if CSP_MAX_STOCK_PRICE and close > float(CSP_MAX_STOCK_PRICE):
-        log.debug("is_csp_eligible: price %.2f > max %.2f — skipping", close, float(CSP_MAX_STOCK_PRICE))
+        log.info("is_csp_eligible REJECT price: close=%.2f > max=%.2f", close, float(CSP_MAX_STOCK_PRICE))
         return False
 
     if not allow_below_200:
@@ -331,17 +331,22 @@ def is_csp_eligible(stock_row: pd.Series, *, allow_below_200: bool = False) -> b
         min_slope = float(CSP_SMA200_MIN_SLOPE) if CSP_SMA200_MIN_SLOPE is not None else 0.0
         if sma200_slope is not None:
             if sma200_slope < min_slope:
-                log.debug(
-                    "is_csp_eligible: SMA200 slope %.4f < min %.4f — structural downtrend, skipping",
-                    sma200_slope, min_slope,
+                log.info(
+                    "is_csp_eligible REJECT slope: slope=%.4f < min=%.4f (close=%.2f sma200=%.2f)",
+                    sma200_slope, min_slope, close, sma200,
                 )
                 return False
         else:
             # Fallback: not enough history to compute slope — use legacy binary check
             if close < sma200:
+                log.info(
+                    "is_csp_eligible REJECT sma200 fallback: close=%.2f < sma200=%.2f",
+                    close, sma200,
+                )
                 return False
 
         if adx and adx < 15:
+            log.info("is_csp_eligible REJECT adx: adx=%.1f < 15 (close=%.2f)", adx, close)
             return False
         return True
 
@@ -1571,13 +1576,17 @@ def evaluate_csp_candidate(
         iv  = float(row.get("impliedVolatility", 0) or 0)
 
         if bid < CSP_MIN_BID or ask <= 0 or ask < bid:
+            log.info("evaluate_csp_candidate REJECT %s: bad bid/ask bid=%.2f ask=%.2f strike=%.0f",
+                     ticker, bid, ask, strike)
             return None
-        # ETF_BROAD tickers are deeply liquid — lower OI floor is fine.
-        # All other tickers use the higher stock OI floor for stress-scenario rolls.
         oi_floor = CSP_MIN_OI_ETF if get_ticker_sector(ticker) == "ETF_BROAD" else CSP_MIN_OI
         if oi < oi_floor or vol < CSP_MIN_VOLUME:
+            log.info("evaluate_csp_candidate REJECT %s: liquidity oi=%d (floor=%d) vol=%d strike=%.0f",
+                     ticker, oi, oi_floor, vol, strike)
             return None
         if CSP_MIN_IV and iv < CSP_MIN_IV:
+            log.info("evaluate_csp_candidate REJECT %s: iv=%.2f < min=%.2f strike=%.0f",
+                     ticker, iv, CSP_MIN_IV, strike)
             return None
 
         mid = (bid + ask) / 2.0
@@ -1733,6 +1742,10 @@ def plan_weekly_csp_orders(
     for idea in csp_candidates:
         tier = classify_csp_tier_for_regime(idea, reg)
         if tier == "REJECT" or tier not in allowed:
+            log.info("plan_weekly_csp_orders REJECT %s: tier=%s prem=$%.0f yield=%.2f%%",
+                     idea.get("ticker"), tier,
+                     float(idea.get("est_premium", 0)),
+                     float(idea.get("yield_pct", 0)) * 100)
             continue
         # Apply intraday VIX guard: silently cap AGGRESSIVE at BALANCED
         if vix_spiked and tier == "AGGRESSIVE":
@@ -1741,6 +1754,9 @@ def plan_weekly_csp_orders(
         idea2["tier"]  = tier
         idea2["score"] = score_csp_idea(idea2)
         enriched.append(idea2)
+
+    log.info("plan_weekly_csp_orders: %d candidates passed tier filter, %d enriched",
+             len(csp_candidates), len(enriched))
 
     enriched.sort(key=lambda x: x["score"], reverse=True)
 
