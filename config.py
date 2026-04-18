@@ -8,6 +8,23 @@ from __future__ import annotations
 import os
 from typing import Dict, List
 
+# ============================================================
+# Market Regime Thresholds
+# ============================================================
+# These VIX levels define the four market regimes used to dynamically
+# tune all strategy parameters throughout the system.  A single source
+# of truth here means tuning one number adjusts every downstream parameter.
+#
+#   STRONG_BULL : VIX < 18 AND SPY above all 3 MAs
+#   BULL        : VIX < 22 AND SPY above 200 + 50
+#   NEUTRAL     : VIX < 25 AND SPY above 200
+#   RISK_OFF    : VIX >= 25 OR SPY below 200
+#
+# Adjust these if your personal risk tolerance or market view changes.
+REGIME_VIX_STRONG_BULL = 18.0   # VIX below this = calm/recovering market
+REGIME_VIX_BULL        = 22.0   # VIX below this = normal healthy market
+REGIME_VIX_NEUTRAL     = 25.0   # VIX below this = elevated but manageable
+
 # ---- Discord Webhook ---- #
 # Read from environment so the URL is never committed to version control.
 # If the env var is not set, Discord alerting is silently skipped (same
@@ -174,20 +191,71 @@ RETIREMENT_STOCK_YIELDS: Dict[str, float] = {
 # Run after close: entries detected using EOD data, filled next open.
 STOCK_REQUIRE_NEXTDAY_VALIDATION = True
 
-# Position sizing: max % of INDIVIDUAL_STOCK_CAP per position
-STOCK_MAX_POSITION_PCT_INDIVIDUAL = 0.15   # 15% of $20K slice = ~$3K max
+# Risk per trade: % of INDIVIDUAL_STOCK_CAP at risk on the stop.
+# Unchanged across regimes — core risk management, not market-condition dependent.
+STOCK_RISK_PCT_INDIVIDUAL = 0.050          # 5% of stock slice = ~$1.2K risk cap
 
-# Risk per trade: % of INDIVIDUAL_STOCK_CAP at risk on the stop
-STOCK_RISK_PCT_INDIVIDUAL = 0.050          # 5% of $20K slice = ~$1K risk cap
-
-# Targets / exits
+# Targets / exits — unchanged across regimes
 STOCK_TARGET_R_MULTIPLE = 2.0           # take-profit at ~2R
 STOCK_BREAKEVEN_AFTER_R = 1.0           # move stop to breakeven after +1R
 STOCK_USE_BREAKEVEN_TRAIL = True
 
-# Stop building blocks
+# Stop building blocks — unchanged across regimes
 STOCK_STOP_ATR_PULLBACK = 1.0  # stop = EMA21 - ATR*X for pullbacks
 STOCK_STOP_ATR_BREAKOUT = 1.2  # stop = breakout_level - ATR*X
+
+# ---- Regime-dynamic stock parameters ----
+# All keyed by market regime (STRONG_BULL / BULL / NEUTRAL / RISK_OFF).
+# market.market_regime(mkt) selects the active regime each run.
+
+# Max position size as % of INDIVIDUAL_STOCK_CAP.
+# Larger in strong trends (more conviction), smaller in uncertain markets.
+STOCK_MAX_POSITION_PCT: Dict[str, float] = {
+    "STRONG_BULL": 0.20,   # 20% of $24K slice = ~$4.8K max
+    "BULL":        0.17,   # ~$4.1K max
+    "NEUTRAL":     0.15,   # ~$3.6K max (original)
+    "RISK_OFF":    0.12,   # ~$2.9K max — smaller in choppy markets
+}
+
+# ADX minimum for stock eligibility (is_eligible).
+# Trending markets naturally show lower ADX after consolidation — too strict
+# a floor misses valid entries in calm uptrends.
+STOCK_MIN_ADX: Dict[str, float] = {
+    "STRONG_BULL": 15.0,   # strong trend established, ADX can be lower
+    "BULL":        18.0,   # slightly looser than original
+    "NEUTRAL":     22.0,   # require stronger confirmation
+    "RISK_OFF":    25.0,   # only trade the strongest trends defensively
+}
+
+# RSI(2) threshold for pullback signal.
+# In a strong uptrend, RSI(2) < 8 is still genuinely oversold; in risk-off
+# conditions require more extreme readings before trusting the bounce.
+STOCK_PULLBACK_RSI2_MAX: Dict[str, float] = {
+    "STRONG_BULL": 8.0,    # slightly looser — trend is strong
+    "BULL":        6.0,    # between original and strong_bull
+    "NEUTRAL":     5.0,    # original
+    "RISK_OFF":    4.0,    # only extreme oversold in risky markets
+}
+
+# EMA21 proximity band for pullback signal (fraction of EMA21 price).
+# In a stronger trend, a stock can pull back slightly further from EMA21
+# and still be a valid entry — the trend provides more support.
+STOCK_PULLBACK_EMA_BAND: Dict[str, float] = {
+    "STRONG_BULL": 0.03,   # within 3% of EMA21
+    "BULL":        0.025,  # within 2.5%
+    "NEUTRAL":     0.02,   # original (2%)
+    "RISK_OFF":    0.015,  # tighter in risky conditions
+}
+
+# Volume multiplier for breakout signal (vs 10-day average).
+# Strong bull markets can sustain breakouts on lighter volume — the trend
+# has momentum.  Risk-off requires heavier confirmation.
+STOCK_BREAKOUT_VOL_MULT: Dict[str, float] = {
+    "STRONG_BULL": 1.3,    # lighter confirmation needed in clear uptrend
+    "BULL":        1.4,
+    "NEUTRAL":     1.5,    # original
+    "RISK_OFF":    1.8,    # require strong volume confirmation
+}
 
 # ============================================================
 # Stock Universe
@@ -319,7 +387,7 @@ CSP_DEFENSIVE_STOCKS: List[str] = [
 CSP_RISK_OFF_VIX = 25.0  # VIX > this => "RISK_OFF" (defensive-only + farther OTM)
 CSP_RISK_OFF_MIN_OTM_PCT_DEFENSIVE = 0.10  # at least 10% OTM when risk-off (defensive)
 CSP_RISK_OFF_MIN_OTM_PCT_RISKY = 0.15      # at least 15% OTM when risk-off
-CSP_NORMAL_MIN_OTM_PCT = 0.06              # baseline cushion
+# CSP_NORMAL_MIN_OTM_PCT is now a regime-dynamic dict — defined below in the CSP section.
 
 # Strike base for puts
 CSP_STRIKE_BASE_NORMAL = "EMA_21"          # fast, but fine when trend is healthy
@@ -377,12 +445,17 @@ CC_POSITIONS_COLUMNS = [
 
 # ---- Take-profit / early close ----
 # Close a CSP when current mid-price <= original premium * this fraction.
-# 0.60 = close at 60% profit.
-CSP_TAKE_PROFIT_PCT = 0.60
+# Regime-dynamic: hold longer in calm markets (collect more premium per cycle),
+# close faster in choppy/risk-off markets (recycle capital, avoid reversals).
+CSP_TAKE_PROFIT_PCT: Dict[str, float] = {
+    "STRONG_BULL": 0.75,   # hold to 75% profit — calm market, theta decay reliable
+    "BULL":        0.70,   # hold to 70% profit
+    "NEUTRAL":     0.60,   # original — recycle faster in uncertain conditions
+    "RISK_OFF":    0.50,   # take profit quickly — don't let ITM risk build
+}
 
 # Skip the take-profit close if the bid/ask spread is wider than this fraction
-# of mid.  Wide spreads mean the quote is stale or illiquid — better to hold
-# than close at an unknown price.  0.50 = spread must be <= 50% of mid.
+# of mid.  Wide spreads mean the quote is stale or illiquid.
 CSP_TP_MAX_SPREAD_PCT = 0.50
 
 # ---- DTE window ----
@@ -436,14 +509,8 @@ CSP_MAX_STOCK_PRICE = 350.0
 #   sit in the -0.001 to -0.003 range.  Tighten back toward 0.0 once the
 #   market recovery is confirmed.
 # Set to None to fall back to the legacy close > SMA200 binary check.
-CSP_SMA200_MIN_SLOPE = -0.002   # allow very slight SMA200 softening (correction phase)
-
-# LOW_IV regime (VIX < 18): tighter yield floors.
-# When markets are calm, premiums thin out. Raise the bar so we only sell
-# when risk/reward still makes sense. Better to sit out than chase thin credits.
-# AGGRESSIVE tier is blocked entirely in LOW_IV via allowed_tiers_for_regime().
-CSP_MIN_YIELD_CONSERVATIVE_LOW_IV = 0.015   # vs 0.010 in NORMAL
-CSP_MIN_YIELD_BALANCED_LOW_IV     = 0.020   # vs 0.015 in NORMAL
+# CSP_SMA200_MIN_SLOPE is now a regime-dynamic dict — defined below.
+# CSP_MIN_YIELD_CONSERVATIVE_LOW_IV / _BALANCED_LOW_IV removed — LOW_IV regime removed.
 
 # ---- Strike selection ----
 CSP_STRIKE_MODE = "ema21_atr"
@@ -465,9 +532,62 @@ CSP_MIN_PREMIUM_CONSERVATIVE = 100
 CSP_MIN_PREMIUM_BALANCED = 175
 CSP_MIN_PREMIUM_AGGRESSIVE = 250
 
-CSP_MIN_YIELD_CONSERVATIVE = 0.008
-CSP_MIN_YIELD_BALANCED = 0.013
-CSP_MIN_YIELD_AGGRESSIVE = 0.018
+CSP_SMA200_MIN_SLOPE: Dict[str, float] = {
+    "STRONG_BULL": 0.0,     # require flat-or-rising — market recovered, stricter
+    "BULL":        -0.001,  # allow very slight softening
+    "NEUTRAL":     -0.002,  # correction-phase tolerance (previous static value)
+    "RISK_OFF":    -0.003,  # most tolerant — defensive universe already restricted
+}
+
+# ---- Strike selection ----
+CSP_STRIKE_MODE = "ema21_atr"
+CSP_ATR_MULTS = [1.50, 1.25, 1.00]  # safer strikes (farther OTM)
+
+# ---- Minimum OTM floor (regime-dynamic) ----
+# In calm/bull markets the ATR formula produces good strikes without a wide
+# forced cushion.  In neutral/risk-off conditions ensure adequate buffer.
+CSP_NORMAL_MIN_OTM_PCT: Dict[str, float] = {
+    "STRONG_BULL": 0.03,   # 3% — let ATR work, modest safety net
+    "BULL":        0.04,   # 4% — recovering market, moderate cushion
+    "NEUTRAL":     0.05,   # 5% — elevated vol, more buffer needed
+    "RISK_OFF":    0.10,   # 10% — handled by defensive path
+}
+
+# ---- ADX floor for CSP eligibility (regime-dynamic) ----
+CSP_MIN_ADX: Dict[str, float] = {
+    "STRONG_BULL": 12.0,
+    "BULL":        15.0,   # previous static value
+    "NEUTRAL":     18.0,
+    "RISK_OFF":    10.0,   # defensive universe, loose floor
+}
+
+# ---- Premium / yield tiers (regime-dynamic) ----
+# Per-candidate IV is filtered by CSP_MIN_IV; yield floor is the final gate.
+# Tighter OTM floor in bull markets → strikes closer to price → more premium
+# → can afford slightly higher bar.  Wider OTM in neutral → thinner premium
+# → slightly lower bar while still requiring meaningful yield.
+CSP_MIN_PREMIUM_CONSERVATIVE = 100
+CSP_MIN_PREMIUM_BALANCED = 175
+CSP_MIN_PREMIUM_AGGRESSIVE = 250
+
+CSP_MIN_YIELD_CONSERVATIVE: Dict[str, float] = {
+    "STRONG_BULL": 0.009,
+    "BULL":        0.008,  # previous static value
+    "NEUTRAL":     0.007,
+    "RISK_OFF":    0.010,
+}
+CSP_MIN_YIELD_BALANCED: Dict[str, float] = {
+    "STRONG_BULL": 0.014,
+    "BULL":        0.013,  # previous static value
+    "NEUTRAL":     0.011,
+    "RISK_OFF":    0.015,
+}
+CSP_MIN_YIELD_AGGRESSIVE: Dict[str, float] = {
+    "STRONG_BULL": 0.020,
+    "BULL":        0.018,  # previous static value
+    "NEUTRAL":     0.016,
+    "RISK_OFF":    0.025,
+}
 
 # ---- Tier caps ----
 CSP_MAX_AGGRESSIVE_TOTAL = 4
@@ -498,30 +618,22 @@ CSP_EARLY_ASSIGN_MAX_DTE = 3       # must be within 3 calendar days of expiry
 CSP_EARLY_ASSIGN_WARN_ONLY = False
 
 # ---- CSP roll candidate detection (display only) ----
-# Flag open CSPs that are meaningfully ITM with enough DTE remaining that a
-# roll (buy-to-close + re-open lower / further out) may collect a net credit.
-# Both conditions must be true to flag:
-#   1. current_price < strike * (1 - CSP_ROLL_CANDIDATE_ITM_PCT)
-#   2. DTE remaining > CSP_ROLL_CANDIDATE_MIN_DTE
-# No automated action — human decides whether to roll.
 CSP_ROLL_CANDIDATE_ITM_PCT = 0.10   # 10% below strike
 CSP_ROLL_CANDIDATE_MIN_DTE = 10     # at least 10 DTE remaining
 
 # ---- Intraday VIX spike guard ----
-# Before executing CSP orders, fetch the live VIX and compare to the prior
-# EOD close. If the intraday VIX has risen by more than this threshold, any
-# AGGRESSIVE-tier candidates are downgraded to BALANCED for that run.
-# This prevents selling into a morning panic the prior day's VIX didn't show.
 VIX_INTRADAY_SPIKE_THRESHOLD = 4.0  # points
 
-# ---- Sector concentration limit ----
-# No more than this many simultaneously OPEN CSPs in the same sector,
-# enforced PER ACCOUNT.  Each account (INDIVIDUAL, IRA, ROTH) has its own
-# independent sector count — they are separate legal entities with separate
-# capital, so a TECH CSP in IRA does not block TECH capacity in INDIVIDUAL.
-# The per-account cap still prevents correlated-assignment blowup within
-# each pool of capital.
-CSP_MAX_POSITIONS_PER_SECTOR = 3
+# ---- Sector concentration limit (per account, regime-dynamic) ----
+# In bull markets correlation between sectors is lower and the universe wider.
+# In neutral/risk-off conditions sectors move together — tighter cap.
+# Enforced PER ACCOUNT — IRA/ROTH/INDIVIDUAL each have independent counts.
+CSP_MAX_POSITIONS_PER_SECTOR: Dict[str, int] = {
+    "STRONG_BULL": 4,   # lower correlation, more diversity available
+    "BULL":        3,   # previous static value
+    "NEUTRAL":     2,   # sectors more correlated in uncertainty
+    "RISK_OFF":    1,   # defensive universe is already narrow
+}
 
 # Static ticker→sector map covering the full CSP_STOCKS universe.
 # Tickers not listed here fall into "OTHER" (no concentration limit applied).
@@ -631,10 +743,15 @@ CC_MIN_BID = 0.05
 # Informational only — no automated roll execution.
 CC_ROLL_SIGNAL_THRESHOLD = 0.97
 
-# ---- CC take-profit ----
+# ---- CC take-profit (regime-dynamic) ----
 # Close a CC when current mid value <= this fraction of opening premium.
-# Mirrors the CSP take-profit rule — lock in gains early and recycle the lot.
-CC_TAKE_PROFIT_PCT     = 0.60   # close at 50% profit
+# Mirrors CSP TP logic — regime-dynamic for same reasons.
+CC_TAKE_PROFIT_PCT: Dict[str, float] = {
+    "STRONG_BULL": 0.75,   # hold to 75% profit in calm markets
+    "BULL":        0.70,   # hold to 70% profit
+    "NEUTRAL":     0.60,   # close at 60% profit — recycle faster
+    "RISK_OFF":    0.50,   # take profit quickly in defensive mode
+}
 CC_TP_MAX_SPREAD_PCT   = 0.50   # skip if bid/ask spread > 50% of mid
 
 # ---- CC DTE window by underwater tier ----

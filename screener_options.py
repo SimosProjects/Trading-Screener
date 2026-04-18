@@ -33,8 +33,11 @@ log = get_logger(__name__)
 # CSP candidates
 # ============================================================
 
-def build_csp_candidates(mkt: Dict, mode: str) -> List[dict]:
+def build_csp_candidates(mkt: Dict, mode: str, regime: str = "BULL") -> List[dict]:
     defensive_set = set(CSP_DEFENSIVE_STOCKS)
+
+    # Resolve dynamic OTM floor for current regime.
+    dynamic_otm = float(strat.regime_val(CSP_NORMAL_MIN_OTM_PCT, regime, 0.06))
 
     if mode == "RISK_OFF":
         print(
@@ -42,18 +45,11 @@ def build_csp_candidates(mkt: Dict, mode: str) -> List[dict]:
             f" | Universe: DEFENSIVE ONLY ({len(defensive_set)} tickers)"
             f" | Strike base: {CSP_STRIKE_BASE_RISK_OFF} | Min OTM: {float(CSP_RISK_OFF_MIN_OTM_PCT_DEFENSIVE)*100:.0f}%"
         )
-    elif mode == "LOW_IV":
-        print(
-            f"\n🟡 CSP MODE: LOW_IV | VIX {float(mkt.get('vix_close') or 0):.2f} < 18"
-            f" | Universe: STANDARD ({len(CSP_STOCKS)} tickers)"
-            f" | Tighter yield floors | AGGRESSIVE blocked"
-            f" | Strike base: {CSP_STRIKE_BASE_NORMAL} | Min OTM: {float(CSP_NORMAL_MIN_OTM_PCT)*100:.0f}%"
-        )
     else:
         print(
-            f"\n🟦 CSP MODE: NORMAL | VIX {float(mkt.get('vix_close') or 0):.2f} <= {float(CSP_RISK_OFF_VIX):.1f}"
+            f"\n🟦 CSP MODE: NORMAL [{regime}] | VIX {float(mkt.get('vix_close') or 0):.2f}"
             f" | Universe: STANDARD ({len(CSP_STOCKS)} tickers)"
-            f" | Strike base: {CSP_STRIKE_BASE_NORMAL} | Min OTM: {float(CSP_NORMAL_MIN_OTM_PCT)*100:.0f}%"
+            f" | Strike base: {CSP_STRIKE_BASE_NORMAL} | Min OTM: {dynamic_otm*100:.0f}%"
         )
 
     candidates: List[dict] = []
@@ -64,8 +60,6 @@ def build_csp_candidates(mkt: Dict, mode: str) -> List[dict]:
             if not tkr_u:
                 continue
 
-            # Excluded tickers: growth/speculative names kept in STOCKS for swing
-            # trades but explicitly barred from the Wheel universe.
             if tkr_u in CSP_EXCLUDED_TICKERS:
                 continue
 
@@ -79,13 +73,13 @@ def build_csp_candidates(mkt: Dict, mode: str) -> List[dict]:
                 continue
             last = df.iloc[-1]
 
-            if mode in ("NORMAL", "LOW_IV"):
-                if not strat.is_csp_eligible(last, allow_below_200=False):
+            if mode == "NORMAL":
+                if not strat.is_csp_eligible(last, allow_below_200=False, regime=regime):
                     continue
-                min_otm  = float(CSP_NORMAL_MIN_OTM_PCT)
-                base_ma  = str(CSP_STRIKE_BASE_NORMAL)
+                min_otm = dynamic_otm
+                base_ma = str(CSP_STRIKE_BASE_NORMAL)
             else:
-                if not strat.is_csp_eligible(last, allow_below_200=True):
+                if not strat.is_csp_eligible(last, allow_below_200=True, regime=regime):
                     continue
                 min_otm = float(CSP_RISK_OFF_MIN_OTM_PCT_DEFENSIVE if defensive
                                 else CSP_RISK_OFF_MIN_OTM_PCT_RISKY)
@@ -94,14 +88,9 @@ def build_csp_candidates(mkt: Dict, mode: str) -> List[dict]:
             best       = None
             best_score = -1e9
 
-            # Per-ticker guards — run once here, not inside each ATR iteration.
-            # Ex-dividend: early assignment risk before ex-date.
             if strat.has_upcoming_ex_dividend(tkr_u):
                 continue
 
-            # Earnings: IV crush + gap risk if announcement falls within CSP window.
-            # Need an expiry estimate — use the first valid expiry in range for the check.
-            # evaluate_csp_candidate will select the exact expiry; this is just the guard.
             try:
                 import yfinance as yf
                 _t = yf.Ticker(tkr_u)
@@ -109,7 +98,7 @@ def build_csp_candidates(mkt: Dict, mode: str) -> List[dict]:
                 if _exp and strat.has_earnings_within_window(tkr_u, _exp):
                     continue
             except Exception:
-                pass  # fail-open — let evaluate_csp_candidate proceed
+                pass
 
             for atr_mult in CSP_ATR_MULTS:
                 c = strat.evaluate_csp_candidate(
@@ -118,10 +107,6 @@ def build_csp_candidates(mkt: Dict, mode: str) -> List[dict]:
                     min_otm_pct=min_otm,
                     base_ma=base_ma,
                 )
-                # Note: available_capital defaults to CSP_MAX_CASH_PER_TRADE inside
-                # evaluate_csp_candidate — sufficient to admit 1-contract candidates
-                # for any priced stock.  Actual per-account sizing happens in
-                # plan_weekly_csp_orders which knows the real remaining capital.
                 if not c:
                     continue
 

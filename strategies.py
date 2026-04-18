@@ -38,7 +38,7 @@ from config import (
     # stock rules
     STOCK_REQUIRE_NEXTDAY_VALIDATION,
     STOCK_RISK_PCT_INDIVIDUAL,
-    STOCK_MAX_POSITION_PCT_INDIVIDUAL,
+    STOCK_MAX_POSITION_PCT,
     STOCK_TARGET_R_MULTIPLE,
     STOCK_BREAKEVEN_AFTER_R,
     STOCK_USE_BREAKEVEN_TRAIL,
@@ -53,11 +53,13 @@ from config import (
     CSP_MIN_OI, CSP_MIN_OI_ETF, CSP_MIN_VOLUME, CSP_MIN_BID, CSP_MIN_IV,
     CSP_MAX_STOCK_PRICE, CSP_EXCLUDED_TICKERS,
     CSP_SMA200_MIN_SLOPE,
+    CSP_RISK_OFF_VIX,
     CSP_STRIKE_MODE,
     CSP_STRIKE_BASE_NORMAL,
+    CSP_NORMAL_MIN_OTM_PCT,
+    CSP_MIN_ADX,
     CSP_MIN_PREMIUM_CONSERVATIVE, CSP_MIN_PREMIUM_BALANCED, CSP_MIN_PREMIUM_AGGRESSIVE,
     CSP_MIN_YIELD_CONSERVATIVE, CSP_MIN_YIELD_BALANCED, CSP_MIN_YIELD_AGGRESSIVE,
-    CSP_MIN_YIELD_CONSERVATIVE_LOW_IV, CSP_MIN_YIELD_BALANCED_LOW_IV,
     CSP_MAX_AGGRESSIVE_TOTAL, CSP_MAX_AGGRESSIVE_PER_WEEK,
     CSP_MAX_POSITIONS_PER_SECTOR, CSP_TICKER_SECTOR,
     CSP_EARLY_ASSIGN_ITM_PCT, CSP_EARLY_ASSIGN_WARN_ONLY, CSP_EARLY_ASSIGN_MAX_DTE,
@@ -72,6 +74,13 @@ from config import (
     CC_TAKE_PROFIT_PCT, CC_TP_MAX_SPREAD_PCT,
     CC_DTE_BY_TIER,
 
+    # Stock regime-dynamic parameters
+    STOCK_MAX_POSITION_PCT,
+    STOCK_MIN_ADX,
+    STOCK_PULLBACK_RSI2_MAX,
+    STOCK_PULLBACK_EMA_BAND,
+    STOCK_BREAKOUT_VOL_MULT,
+
     # slippage / fill model
     STOCK_SLIPPAGE_PER_SHARE,
     OPT_SELL_FILL_PCT,
@@ -80,6 +89,18 @@ from config import (
 )
 
 log = get_logger(__name__)
+
+
+def regime_val(param: object, regime: str, fallback=None):
+    """Resolve a regime-dynamic parameter.
+
+    If param is a dict keyed by regime name, return param[regime].
+    If param is a scalar, return it directly (backward-compat).
+    Falls back to fallback if the key is missing.
+    """
+    if isinstance(param, dict):
+        return param.get(regime, param.get("BULL", fallback))
+    return param
 
 
 # ============================================================
@@ -258,52 +279,37 @@ def trading_allowed(mkt: Dict) -> bool:
 # Stock entry logic
 # ============================================================
 
-def is_eligible(stock_row: pd.Series) -> bool:
-    """Healthy-trend filter used for stock entries and CSP scan."""
+def is_eligible(stock_row: pd.Series, regime: str = "BULL") -> bool:
+    """Healthy-trend filter used for stock entries.
+
+    ADX floor is regime-dynamic: in strong bull markets ADX naturally compresses
+    after consolidation — a static floor of 20 would miss valid entries.
+    """
     try:
         close = float(stock_row["Close"])
         sma50 = float(stock_row["SMA_50"])
         ema21 = float(stock_row["EMA_21"])
-        adx = float(stock_row["ADX_14"])
+        adx   = float(stock_row["ADX_14"])
     except Exception as e:
         log.debug("is_eligible: indicator field missing or non-numeric: %s", e)
         return False
-    return bool(close > sma50 and ema21 > sma50 and adx > 20)
+    adx_floor = float(regime_val(STOCK_MIN_ADX, regime, 18.0))
+    return bool(close > sma50 and ema21 > sma50 and adx > adx_floor)
 
 
-def is_csp_eligible(stock_row: pd.Series, *, allow_below_200: bool = False) -> bool:
-    """Eligibility filter for CSP scanning.
-
-    NORMAL mode (allow_below_200=False):
-      Instead of the legacy binary "close > SMA200" check, we inspect the
-      *slope* of the SMA200 over the past 20 trading days (SMA200_SLOPE,
-      computed as pct_change(20) in add_indicators).
-
-      A rising SMA200 with price below it = pullback/correction in a healthy
-      uptrend.  These are acceptable CSP candidates — the business hasn't
-      broken down, the macro did.
-
-      A flat-or-falling SMA200 = the long-term trend has rolled over into a
-      structural downtrend.  These are excluded regardless of where price sits,
-      because assignment risk in a genuine downtrend is high and recovering
-      the cost basis through CCs can take many months.
-
-      Threshold is controlled by CSP_SMA200_MIN_SLOPE in config.py.
-      Default 0.0 = SMA200 must be non-negative (flat or rising).
-      Raise to e.g. 0.001 to require meaningfully positive slope.
-
-    RISK-OFF mode (allow_below_200=True):
-      Defensive-only universe with loose guards — close > SMA50 is the floor.
-      Used when VIX > CSP_RISK_OFF_VIX; slope check is relaxed here because
-      the universe is already restricted to defensive names.
-    """
+def is_csp_eligible(stock_row: pd.Series, *, allow_below_200: bool = False,
+                    regime: str = "BULL") -> bool:
+    """Eligibility filter for CSP scanning. All thresholds are regime-dynamic."""
     try:
-        close      = float(stock_row["Close"])
-        sma50      = float(stock_row.get("SMA_50", 0) or 0)
-        sma200     = float(stock_row.get("SMA_200", 0) or 0)
-        adx        = float(stock_row.get("ADX_14", 0) or 0)
+        close        = float(stock_row["Close"])
+        sma50        = float(stock_row.get("SMA_50", 0) or 0)
+        sma200       = float(stock_row.get("SMA_200", 0) or 0)
+        adx          = float(stock_row.get("ADX_14", 0) or 0)
         sma200_slope = stock_row.get("SMA200_SLOPE")
-        sma200_slope = float(sma200_slope) if sma200_slope is not None and not (isinstance(sma200_slope, float) and math.isnan(sma200_slope)) else None
+        sma200_slope = (float(sma200_slope)
+                        if sma200_slope is not None
+                        and not (isinstance(sma200_slope, float) and math.isnan(sma200_slope))
+                        else None)
     except Exception as e:
         log.debug("is_csp_eligible: indicator field missing or non-numeric: %s", e)
         return False
@@ -311,41 +317,37 @@ def is_csp_eligible(stock_row: pd.Series, *, allow_below_200: bool = False) -> b
     if sma50 <= 0:
         return False
 
-    # Price ceiling: reject stocks trading above CSP_MAX_STOCK_PRICE.
-    # Belt-and-suspenders catch for any high-priced name not in CSP_EXCLUDED_TICKERS.
-    # High-priced momentum stocks tend to have elevated IV that reflects genuine
-    # tail risk rather than selling edge.  Also prevents $10K+ per-contract
-    # concentration from a single position.  Set CSP_MAX_STOCK_PRICE = 0 to disable.
     if CSP_MAX_STOCK_PRICE and close > float(CSP_MAX_STOCK_PRICE):
-        log.debug("is_csp_eligible: price %.2f > max %.2f — skipping", close, float(CSP_MAX_STOCK_PRICE))
+        log.info("is_csp_eligible REJECT price: close=%.2f > max=%.2f", close, float(CSP_MAX_STOCK_PRICE))
         return False
 
     if not allow_below_200:
-        # Require SMA200 to be calculable (needs ~200 days of data)
         if sma200 <= 0:
             return False
 
-        # Core slope check: SMA200 must be flat or rising over the past 20 days.
-        # If slope data is unavailable (e.g. <220 bars of history), fall back to
-        # the legacy close > SMA200 check so we don't silently pass everything.
-        min_slope = float(CSP_SMA200_MIN_SLOPE) if CSP_SMA200_MIN_SLOPE is not None else 0.0
+        min_slope = float(regime_val(CSP_SMA200_MIN_SLOPE, regime, -0.002))
         if sma200_slope is not None:
             if sma200_slope < min_slope:
-                log.debug(
-                    "is_csp_eligible: SMA200 slope %.4f < min %.4f — structural downtrend, skipping",
-                    sma200_slope, min_slope,
+                log.info(
+                    "is_csp_eligible REJECT slope: slope=%.4f < min=%.4f (close=%.2f sma200=%.2f)",
+                    sma200_slope, min_slope, close, sma200,
                 )
                 return False
         else:
-            # Fallback: not enough history to compute slope — use legacy binary check
             if close < sma200:
+                log.info(
+                    "is_csp_eligible REJECT sma200 fallback: close=%.2f < sma200=%.2f",
+                    close, sma200,
+                )
                 return False
 
-        if adx and adx < 15:
+        adx_floor = float(regime_val(CSP_MIN_ADX, regime, 15.0))
+        if adx and adx < adx_floor:
+            log.info("is_csp_eligible REJECT adx: adx=%.1f < %.1f (close=%.2f)", adx, adx_floor, close)
             return False
         return True
 
-    # risk-off: keep it very restrained — close must be above SMA50 at minimum
+    # risk-off: close must be above SMA50 at minimum
     if close < sma50:
         return False
     if adx and adx < 10:
@@ -353,40 +355,34 @@ def is_csp_eligible(stock_row: pd.Series, *, allow_below_200: bool = False) -> b
     return True
 
 
-def pullback_signal(stock_row: pd.Series) -> bool:
-    # Very short-term oversold + close near EMA21.
-    # RSI(2) < 5 is the primary edge condition — extreme 2-day selling exhaustion
-    # in a stock that was already in a healthy trend (enforced by is_eligible).
-    # EMA21 proximity confirms the pullback is to a meaningful support level
-    # rather than a breakdown.  Band widened from 0.5% to 2%: requiring the
-    # close to be within 0.5% of EMA21 simultaneously with RSI2 < 5 was nearly
-    # impossible in practice (a stock oversold enough for RSI2 < 5 has typically
-    # moved 1-3% away from EMA21, not 0.5%).  2% still requires proximity to
-    # the EMA while allowing the signal to actually fire on real pullbacks.
-    # No change to RSI2 threshold, stop/target logic, or position sizing.
+def pullback_signal(stock_row: pd.Series, regime: str = "BULL") -> bool:
+    """RSI(2) oversold + close near EMA21. Both thresholds are regime-dynamic."""
     try:
-        rsi2 = float(stock_row["RSI_2"])
+        rsi2  = float(stock_row["RSI_2"])
         ema21 = float(stock_row["EMA_21"])
         close = float(stock_row["Close"])
     except Exception as e:
         log.debug("pullback_signal: indicator field missing or non-numeric: %s", e)
         return False
-    rsi_ok   = rsi2 < 5
-    near_ema = abs(close - ema21) / max(ema21, 1e-9) < 0.02
+    rsi_max  = float(regime_val(STOCK_PULLBACK_RSI2_MAX,  regime, 5.0))
+    ema_band = float(regime_val(STOCK_PULLBACK_EMA_BAND,  regime, 0.02))
+    rsi_ok   = rsi2 < rsi_max
+    near_ema = abs(close - ema21) / max(ema21, 1e-9) < ema_band
     return bool(rsi_ok and near_ema)
 
 
-def breakout_signal(stock_row: pd.Series) -> bool:
-    # 20D breakout + volume expansion
+def breakout_signal(stock_row: pd.Series, regime: str = "BULL") -> bool:
+    """20-day high breakout + volume expansion. Volume multiplier is regime-dynamic."""
     try:
-        close = float(stock_row["Close"])
-        high20 = float(stock_row["HIGH_20"])
-        vol = float(stock_row["Volume"])
+        close   = float(stock_row["Close"])
+        high20  = float(stock_row["HIGH_20"])
+        vol     = float(stock_row["Volume"])
         vol_sma = float(stock_row["VOL_SMA_10"])
     except Exception as e:
         log.debug("breakout_signal: indicator field missing or non-numeric: %s", e)
         return False
-    return bool(close > high20 and vol > 1.5 * vol_sma)
+    vol_mult = float(regime_val(STOCK_BREAKOUT_VOL_MULT, regime, 1.5))
+    return bool(close > high20 and vol > vol_mult * vol_sma)
 
 
 def nextday_valid_for_entry(signal: str, last: pd.Series) -> bool:
@@ -827,6 +823,7 @@ def plan_stock_trade(
     existing_open_tickers: set,
     acct_current_mv: float,
     retirement_breakeven_only: bool,
+    regime: str = "BULL",
 ) -> Optional[dict]:
     """Build a paper trade plan (entry/stop/target/shares).
 
@@ -927,7 +924,8 @@ def plan_stock_trade(
     if acct_size <= 0:
         return None
 
-    max_pos_value = acct_size * float(STOCK_MAX_POSITION_PCT_INDIVIDUAL)
+    max_pos_pct   = float(regime_val(STOCK_MAX_POSITION_PCT, regime, 0.15))
+    max_pos_value = acct_size * max_pos_pct
     risk_cap      = acct_size * float(STOCK_RISK_PCT_INDIVIDUAL)
 
     risk_shares      = int(risk_cap / risk_ps)
@@ -955,7 +953,7 @@ def plan_stock_trade(
         "notes": (
             f"{signal} plan | "
             f"risk_cap=${risk_cap:,.0f}, "
-            f"max_pos=${max_pos_value:,.0f}"
+            f"max_pos=${max_pos_value:,.0f} ({max_pos_pct*100:.0f}% of slice, regime={regime})"
         ),
     }
 
@@ -1643,30 +1641,31 @@ def evaluate_csp_candidate(
 
 
 def csp_regime(vix_close: float) -> str:
-    if vix_close < 18:
-        return "LOW_IV"
-    if vix_close <= 25:
+    # Simplified — LOW_IV removed, HIGH_IV merged into RISK_OFF.
+    # Full parameter tuning uses market_regime() in market.py.
+    if vix_close <= float(CSP_RISK_OFF_VIX):
         return "NORMAL"
-    return "HIGH_IV"
+    return "RISK_OFF"
 
 
-def classify_csp_tier(idea: dict) -> str:
+def classify_csp_tier(idea: dict, regime: str = "BULL") -> str:
+    """Classify a CSP idea using regime-dynamic yield floors."""
     prem = float(idea["est_premium"])
-    y = float(idea["yield_pct"])
-    if prem >= CSP_MIN_PREMIUM_AGGRESSIVE and y >= CSP_MIN_YIELD_AGGRESSIVE:
+    y    = float(idea["yield_pct"])
+    if prem >= CSP_MIN_PREMIUM_AGGRESSIVE and y >= float(regime_val(CSP_MIN_YIELD_AGGRESSIVE, regime, 0.018)):
         return "AGGRESSIVE"
-    if prem >= CSP_MIN_PREMIUM_BALANCED and y >= CSP_MIN_YIELD_BALANCED:
+    if prem >= CSP_MIN_PREMIUM_BALANCED and y >= float(regime_val(CSP_MIN_YIELD_BALANCED, regime, 0.013)):
         return "BALANCED"
-    if prem >= CSP_MIN_PREMIUM_CONSERVATIVE and y >= CSP_MIN_YIELD_CONSERVATIVE:
+    if prem >= CSP_MIN_PREMIUM_CONSERVATIVE and y >= float(regime_val(CSP_MIN_YIELD_CONSERVATIVE, regime, 0.008)):
         return "CONSERVATIVE"
     return "REJECT"
 
 
 def score_csp_idea(idea: dict) -> float:
     prem = float(idea["est_premium"])
-    y = float(idea["yield_pct"])
-    iv = float(idea["iv"])
-    dte = float(idea["dte"])
+    y    = float(idea["yield_pct"])
+    iv   = float(idea["iv"])
+    dte  = float(idea["dte"])
     s = 0.0
     s += min(prem / 250.0, 2.0)
     s += min(y / 0.04, 2.0)
@@ -1676,30 +1675,14 @@ def score_csp_idea(idea: dict) -> float:
 
 
 def allowed_tiers_for_regime(reg: str) -> set:
-    if reg == "LOW_IV":
-        return {"CONSERVATIVE", "BALANCED"}
+    # All three tiers always allowed — no regime blocks AGGRESSIVE outright.
+    # The yield floor in classify_csp_tier naturally gates thin-premium ideas.
     return {"CONSERVATIVE", "BALANCED", "AGGRESSIVE"}
 
 
 def classify_csp_tier_for_regime(idea: dict, reg: str) -> str:
-    """Classify a CSP idea into a tier using regime-appropriate yield floors.
-
-    LOW_IV (VIX < 18): raises minimum yields so we don't sell thin premium
-    for the same downside risk. AGGRESSIVE blocked via allowed_tiers_for_regime.
-    NORMAL / HIGH_IV: standard thresholds.
-    """
-    prem = float(idea["est_premium"])
-    y    = float(idea["yield_pct"])
-
-    if reg == "LOW_IV":
-        if prem >= CSP_MIN_PREMIUM_BALANCED and y >= CSP_MIN_YIELD_BALANCED_LOW_IV:
-            return "BALANCED"
-        if prem >= CSP_MIN_PREMIUM_CONSERVATIVE and y >= CSP_MIN_YIELD_CONSERVATIVE_LOW_IV:
-            return "CONSERVATIVE"
-        return "REJECT"
-
-    # NORMAL / HIGH_IV: use standard thresholds
-    return classify_csp_tier(idea)
+    """Classify using regime-dynamic floors. reg is passed through to classify_csp_tier."""
+    return classify_csp_tier(idea, regime=reg)
 
 
 def get_ticker_sector(ticker: str) -> str:
@@ -1718,10 +1701,11 @@ def plan_weekly_csp_orders(
     aggressive_week: int,
     open_sector_counts: Dict[str, int] = {},
     live_vix: Optional[float] = None,
+    regime: str = "BULL",
 ) -> Dict[str, object]:
     from config import VIX_INTRADAY_SPIKE_THRESHOLD
     week_id = iso_week_id(today)
-    reg     = csp_regime(vix_close)
+    reg     = regime   # use the market regime passed from screener
     allowed = allowed_tiers_for_regime(reg)
 
     # Intraday VIX spike guard: if live VIX has moved sharply above the prior-day
@@ -1797,12 +1781,13 @@ def plan_weekly_csp_orders(
             if aggressive_week >= CSP_MAX_AGGRESSIVE_PER_WEEK:
                 continue
 
-        # Sector concentration check — applied globally across accounts.
+        # Sector concentration check — per-account, regime-dynamic cap.
         sector = get_ticker_sector(tkr)
-        if sector != "OTHER" and sector_counts.get(sector, 0) >= CSP_MAX_POSITIONS_PER_SECTOR:
+        sector_cap = int(regime_val(CSP_MAX_POSITIONS_PER_SECTOR, reg, 3))
+        if sector != "OTHER" and sector_counts.get(sector, 0) >= sector_cap:
             log.debug(
-                "CSP %s skipped: sector %s already at limit (%d)",
-                tkr, sector, CSP_MAX_POSITIONS_PER_SECTOR,
+                "CSP %s skipped: sector %s already at limit (%d) for regime %s",
+                tkr, sector, sector_cap, reg,
             )
             continue
 
@@ -1922,7 +1907,7 @@ def add_csp_position_from_selected(today: str, week_id: str, idea: dict) -> Tupl
     return (pos_id, True)
 
 
-def process_csp_take_profits(today: dt.date) -> Dict[str, List[str]]:
+def process_csp_take_profits(today: dt.date, regime: str = "BULL") -> Dict[str, List[str]]:
     """
     Close OPEN CSPs that have decayed to <= 50% of original premium (configurable).
 
@@ -1969,9 +1954,10 @@ def process_csp_take_profits(today: dt.date) -> Dict[str, List[str]]:
         if orig_premium <= 0 or strike <= 0 or contracts < 1 or not ticker:
             continue
 
-        # Target: current total value of the position must be <= take-profit threshold.
-        # orig_premium is total dollars; threshold is per-contract mid * 100 * contracts.
-        tp_threshold = orig_premium * float(CSP_TAKE_PROFIT_PCT)
+        # Regime-dynamic take-profit threshold.
+        # In bull markets hold longer to collect more premium; in risk-off close faster.
+        tp_pct = float(regime_val(CSP_TAKE_PROFIT_PCT, regime, 0.60))
+        tp_threshold = orig_premium * tp_pct
 
         try:
             t = yf.Ticker(ticker)
@@ -2022,7 +2008,7 @@ def process_csp_take_profits(today: dt.date) -> Dict[str, List[str]]:
         r["close_date"] = today.isoformat()
         r["close_type"] = "CLOSED_TAKE_PROFIT"
         r["notes"]      = (
-            f"TP at {float(CSP_TAKE_PROFIT_PCT)*100:.0f}%: "
+            f"TP at {tp_pct*100:.0f}%: "
             f"orig ${orig_premium:.0f} → current ${current_value:.0f} | profit ${profit:.0f}"
         )
         changed = True
@@ -2050,7 +2036,7 @@ def process_csp_take_profits(today: dt.date) -> Dict[str, List[str]]:
 # CC take-profit scan (mirrors CSP TP logic)
 # ============================================================
 
-def scan_cc_take_profits(today: dt.date) -> Dict[str, List[dict]]:
+def scan_cc_take_profits(today: dt.date, regime: str = "BULL") -> Dict[str, List[dict]]:
     """Close open CCs that have decayed to <= 50% of their opening premium.
 
     Closing early frees the lot's CC slot so a new covered call can be
@@ -2091,7 +2077,8 @@ def scan_cc_take_profits(today: dt.date) -> Dict[str, List[dict]]:
         if orig_premium <= 0 or strike <= 0 or contracts < 1 or not ticker:
             continue
 
-        tp_threshold = orig_premium * float(CC_TAKE_PROFIT_PCT)
+        cc_tp_pct    = float(regime_val(CC_TAKE_PROFIT_PCT, regime, 0.60))
+        tp_threshold = orig_premium * cc_tp_pct
 
         try:
             t         = yf.Ticker(ticker)
@@ -2139,7 +2126,7 @@ def scan_cc_take_profits(today: dt.date) -> Dict[str, List[dict]]:
         r["close_date"] = today.isoformat()
         r["close_type"] = "CLOSED_TAKE_PROFIT"
         r["notes"]      = (
-            f"CC TP at {float(CC_TAKE_PROFIT_PCT)*100:.0f}%: "
+            f"CC TP at {cc_tp_pct*100:.0f}%: "
             f"orig ${orig_premium:.0f} → now ${current_value:.0f} | profit ${profit:.0f}"
         )
         changed = True

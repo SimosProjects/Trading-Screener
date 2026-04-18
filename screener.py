@@ -35,7 +35,7 @@ from config import (
 import strategies as strat
 import wheel as _wheel_mod
 from data_cache import DataCache
-from market import fetch_market_context, allow_swing_trades, allow_retirement_tactical, csp_mode
+from market import fetch_market_context, allow_swing_trades, allow_retirement_tactical, csp_mode, market_regime
 from screener_display import (
     print_market_context,
     print_open_holdings,
@@ -180,10 +180,11 @@ def run_screener() -> None:
     trading_on = allow_swing_trades(mkt)
     retire_on  = allow_retirement_tactical(mkt)
     csp_regime = csp_mode(mkt)
+    regime     = market_regime(mkt)   # drives all dynamic parameters
 
     print_market_context(mkt, trading_on, retire_on)
     if ENABLE_CSP:
-        print(f"\n🧾 CSP engine: ENABLED | Regime: {csp_regime}")
+        print(f"\n🧾 CSP engine: ENABLED | Regime: {csp_regime} | Market: {regime}")
     else:
         print("\n🧾 CSP engine: DISABLED")
 
@@ -222,8 +223,8 @@ def run_screener() -> None:
     # Warn-and-continue — never block a run on stale data.
     _run_integrity_check(today)
 
-    csp_tp_out    = strat.process_csp_take_profits(today)
-    cc_tp_out     = strat.scan_cc_take_profits(today)
+    csp_tp_out    = strat.process_csp_take_profits(today, regime=regime)
+    cc_tp_out     = strat.scan_cc_take_profits(today, regime=regime)
     csp_out       = strat.process_csp_expirations(today)
     cc_out        = process_cc_expirations(today)
     early_asn_out = strat.scan_early_assignments(today)
@@ -282,11 +283,12 @@ def run_screener() -> None:
             )
 
     # ── 7. Stock scan + execution ─────────────────────────────────
-    entries, watch = scan_stock_entries_and_watchlist()
+    entries, watch = scan_stock_entries_and_watchlist(regime=regime)
 
     if entries:
         stock_opened, planned_stocks = plan_and_execute_stocks(
-            today, entries, mkt, trading_on, retire_on, acct_mv, ret_by_key
+            today, entries, mkt, trading_on, retire_on, acct_mv, ret_by_key,
+            regime=regime,
         )
         if not stock_opened:
             print_watchlist(watch)
@@ -296,7 +298,7 @@ def run_screener() -> None:
 
     # ── 8. CSP planning + execution ───────────────────────────────
     new_csp_orders: List[dict] = []
-    if ENABLE_CSP and csp_regime in ("NORMAL", "RISK_OFF", "LOW_IV"):
+    if ENABLE_CSP and csp_regime in ("NORMAL", "RISK_OFF"):
 
         # Fetch live intraday VIX for the spike guard (single fast_info call).
         live_vix: float | None = None
@@ -308,7 +310,7 @@ def run_screener() -> None:
             log.warning("Could not fetch live VIX for spike guard: %s", e)
 
         # Build the candidate list once — same universe regardless of account.
-        candidates = build_csp_candidates(mkt, csp_regime)
+        candidates = build_csp_candidates(mkt, csp_regime, regime=regime)
 
         # Global dedup: block any ticker that already has an open CSP or CC
         # in ANY account.  load_open_* functions are account-blind by design —
@@ -393,6 +395,7 @@ def run_screener() -> None:
                 aggressive_week=int(exp.get("aggressive_week", 0)),
                 open_sector_counts=_sector_counts_for_account(acct),
                 live_vix=live_vix,
+                regime=regime,
             )
 
             orders = plan.get("selected", [])

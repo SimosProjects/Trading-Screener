@@ -17,6 +17,9 @@ import strategies as strat
 from utils import get_logger
 from config import (
     CSP_RISK_OFF_VIX,
+    REGIME_VIX_STRONG_BULL,
+    REGIME_VIX_BULL,
+    REGIME_VIX_NEUTRAL,
 )
 
 log = get_logger(__name__)
@@ -65,14 +68,22 @@ def allow_retirement_tactical(mkt: Dict) -> bool:
     )
 
 
-def csp_mode(mkt: Dict) -> str:
+def market_regime(mkt: Dict) -> str:
     """
-    Return 'NORMAL', 'LOW_IV', or 'RISK_OFF' based on SPY trend + VIX level.
+    Classify the current market environment into one of four regimes.
+    This single classifier drives all dynamic parameters in the screener —
+    OTM floors, sector caps, signal thresholds, take-profit levels, etc.
 
-    LOW_IV  : VIX < 18 — premiums thin; tighter yield floors, AGGRESSIVE blocked.
-    NORMAL  : VIX 18–25, SPY above 200 — standard full operation.
-    RISK_OFF: VIX > 25 or SPY below 200 — defensive names only, farther OTM.
-    Defaults to RISK_OFF when market data is unavailable (fail-safe).
+    STRONG_BULL : VIX < REGIME_VIX_STRONG_BULL (18) AND SPY above all 3 MAs
+                  Low vol, confirmed uptrend — loosen filters, collect more premium.
+    BULL        : VIX < REGIME_VIX_BULL (22) AND SPY above 200 + 50
+                  Normal healthy market — standard parameters.
+    NEUTRAL     : VIX < REGIME_VIX_NEUTRAL (25) AND SPY above 200
+                  Elevated uncertainty — tighten slightly, more cushion.
+    RISK_OFF    : VIX >= 25 OR SPY below 200 SMA
+                  Defensive mode — wide OTM, defensive universe, fast TP.
+
+    Defaults to RISK_OFF on missing data (fail-safe).
     """
     try:
         vix = float(mkt.get("vix_close") or 99.0)
@@ -80,8 +91,23 @@ def csp_mode(mkt: Dict) -> str:
         vix = 99.0
 
     spy_above_200 = bool(mkt.get("spy_above_200"))
-    if (not spy_above_200) or (vix > float(CSP_RISK_OFF_VIX)):
+    spy_above_50  = bool(mkt.get("spy_above_50"))
+    spy_above_21  = bool(mkt.get("spy_above_21"))
+
+    if not spy_above_200 or vix >= float(REGIME_VIX_NEUTRAL):
         return "RISK_OFF"
-    if vix < 18.0:
-        return "LOW_IV"
-    return "NORMAL"
+    if vix < float(REGIME_VIX_STRONG_BULL) and spy_above_50 and spy_above_21:
+        return "STRONG_BULL"
+    if vix < float(REGIME_VIX_BULL) and spy_above_50:
+        return "BULL"
+    return "NEUTRAL"
+
+
+def csp_mode(mkt: Dict) -> str:
+    """
+    Return 'NORMAL' or 'RISK_OFF' for the CSP engine gate.
+    Full parameter tuning uses market_regime() — this just controls
+    whether CSP scanning runs at all.
+    """
+    reg = market_regime(mkt)
+    return "RISK_OFF" if reg == "RISK_OFF" else "NORMAL"

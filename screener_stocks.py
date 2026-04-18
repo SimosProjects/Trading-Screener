@@ -36,9 +36,12 @@ ALLOW_DUPLICATE_TICKERS_ACROSS_ACCOUNTS = True
 # Signal scan
 # ============================================================
 
-def scan_stock_entries_and_watchlist() -> Tuple[List[dict], List[dict]]:
+def scan_stock_entries_and_watchlist(regime: str = "BULL") -> Tuple[List[dict], List[dict]]:
     """
     Scan STOCKS for pullback/breakout entry signals and watchlist candidates.
+
+    All signal thresholds are regime-dynamic — passed through to strategies
+    so the same market-regime classifier drives both CSP and stock parameters.
 
     Returns (entries, watchlist).  Each entry carries '_last' (the indicator
     row) for use by the planning step.
@@ -51,11 +54,11 @@ def scan_stock_entries_and_watchlist() -> Tuple[List[dict], List[dict]]:
             df   = strat.add_indicators(strat.download_ohlcv(tkr))
             last = df.iloc[-1]
 
-            if not strat.is_eligible(last):
+            if not strat.is_eligible(last, regime=regime):
                 continue
 
-            pb = strat.pullback_signal(last)
-            bo = strat.breakout_signal(last)
+            pb = strat.pullback_signal(last, regime=regime)
+            bo = strat.breakout_signal(last, regime=regime)
 
             if pb or bo:
                 signal = "PULLBACK" if pb else "BREAKOUT"
@@ -120,6 +123,7 @@ def plan_and_execute_stocks(
     retire_on: bool,
     acct_mv: Dict[str, float],
     ret_by_key: dict,
+    regime: str = "BULL",
 ) -> Tuple[List[str], List[dict]]:
     """
     Plan and execute stock trades across all accounts.
@@ -206,6 +210,7 @@ def plan_and_execute_stocks(
                 existing_open_tickers=existing_set,
                 acct_current_mv=float(acct_mv.get(acct, 0.0)),
                 retirement_breakeven_only=be_only,
+                regime=regime,
             )
             if not plan:
                 continue
