@@ -16,7 +16,9 @@ permissions:
 jobs:
   run-screener:
     runs-on: ubuntu-latest
-    timeout-minutes: 30   # hard cap — prevents a hung yfinance call from burning minutes
+    # Timeout accounts for: normal run (~3 min) + retry waits (~90s) + chunked
+    # fallback (~5 min) + options chain fetches (~5 min) + buffer.
+    timeout-minutes: 45
 
     env:
       DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
@@ -32,7 +34,7 @@ jobs:
         uses: actions/setup-python@v5.4.0
         with:
           python-version: '3.9'
-          cache: 'pip'   # caches the pip install between runs to speed up workflow
+          cache: 'pip'
 
       - name: Install dependencies
         run: pip install -r requirements.txt
@@ -68,6 +70,13 @@ jobs:
           else:
               print(f"WARNING: GITHUB_OUTPUT not set — skip={skip_val} not written.")
           EOF
+
+      - name: Pre-run delay
+        if: steps.market_check.outputs.skip == 'false'
+        # A short sleep before hitting yfinance reduces the chance of rate limits
+        # caused by rapid re-runs (e.g. manual test triggers fired back to back).
+        # Has no effect on the scheduled daily run since it only fires once per day.
+        run: sleep 20
 
       - name: Run screener
         if: steps.market_check.outputs.skip == 'false'
