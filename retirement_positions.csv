@@ -1,2 +1,2 @@
 account,ticker,shares,entry_price,entry_date,current_price,pct_change,breakeven_target,flag_breakeven_only,notes
-IRA,ORCL,91,163.44,2026-04-28,166.64,1.96,,0,"RETIRE BUY-HOLD | pos_value=$15,000 stop=35% below entry"
+IRA,ORCL,91,163.44,2026-04-28,165.88,1.50,,0,"RETIRE BUY-HOLD | pos_value=$15,000 stop=35% below entry"
