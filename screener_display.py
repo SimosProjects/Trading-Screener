@@ -1,9 +1,7 @@
 """screener_display.py
 
-All terminal output and Discord alert formatting.
-
-Print functions are extracted verbatim from screener.py so the output
-format is byte-for-byte identical.  No trading logic lives here.
+Terminal output and Discord alert formatting.
+No trading logic lives here — pure display and notification.
 """
 
 from __future__ import annotations
@@ -32,12 +30,16 @@ from wheel import compute_wheel_exposure, compute_week_remaining
 
 log = get_logger(__name__)
 
+# Short label used in Discord to keep lines compact.
+_ACCT_LABEL = {INDIVIDUAL: "INDV", IRA: "IRA", ROTH: "ROTH"}
+
 
 # ============================================================
 # Discord
 # ============================================================
 
 def send_discord(msg: str) -> None:
+    """Post msg to the configured Discord webhook. Silently skips if no URL is set."""
     if not WEBHOOK_URL or not WEBHOOK_URL.strip():
         return
     url = WEBHOOK_URL.strip()
@@ -45,9 +47,33 @@ def send_discord(msg: str) -> None:
         return
     try:
         import requests
-        requests.post(url, json={"content": msg[:1900]}, timeout=10)
+        requests.post(url, json={"content": msg[:1990]}, timeout=10)
     except Exception as e:
         log.warning("Discord send failed: %s", e)
+
+
+def _spy_ma_flags(mkt: Dict) -> str:
+    """Return a compact MA status string, e.g. '✅200/50/21' or '❌200'."""
+    flags = []
+    if mkt.get("spy_above_200"):
+        flags.append("200")
+    if mkt.get("spy_above_50"):
+        flags.append("50")
+    if mkt.get("spy_above_21"):
+        flags.append("21")
+    if not flags:
+        return "❌ below all MAs"
+    return "✅" + "/".join(flags)
+
+
+def _vix_emoji(mkt: Dict) -> str:
+    """Return a single emoji reflecting VIX level."""
+    vix = float(mkt.get("vix_close") or 99.0)
+    if vix < 18:
+        return "🟢"
+    if vix < 25:
+        return "🟡"
+    return "🔴"
 
 
 def build_discord_alert(
@@ -69,55 +95,299 @@ def build_discord_alert(
     early_asn: List[str] = [],
     csp_roll: List[dict] = [],
 ) -> str:
+    """
+    Build the full Discord alert string for one screener run.
+
+    Sections (in order):
+      - Header: date + single-line market summary
+      - Trading status + CSP regime
+      - Open stock holdings (all accounts)
+      - Open CSP positions
+      - Open CC positions
+      - CC roll alerts (non-interactive flag only)
+      - Maintenance events (TPs, expirations, assignments, stock opens/closes)
+      - New CSP ideas
+      - New CC ideas
+      - Wheel exposure + stock caps (condensed)
+
+    Watchlist is intentionally excluded to keep the message compact.
+    Target: under 1,990 chars on a typical day.
+    """
+    today = dt.date.today()
     lines: List[str] = []
-    lines.append(f"📅 {dt.date.today().isoformat()} Screener")
+
+    # --- Header ---
+    lines.append(f"📅 {today.isoformat()} Screener")
+
+    spy_flags = _spy_ma_flags(mkt)
+    qqq_flag  = "✅50" if mkt.get("qqq_above_50") else "❌50"
+    vix_emoji = _vix_emoji(mkt)
     lines.append(
-        f"Market: {'ON' if trading_on else 'OFF'} | SPY {mkt['spy_close']:.2f} | "
-        f"QQQ {mkt['qqq_close']:.2f} | VIX {mkt['vix_close']:.2f}"
+        f"SPY {mkt['spy_close']:.2f} {spy_flags} | "
+        f"QQQ {mkt['qqq_close']:.2f} {qqq_flag} | "
+        f"VIX {mkt['vix_close']:.2f} {vix_emoji}"
     )
 
-    if csp_tp or cc_tp or csp_exp or csp_asn or cc_exp or cc_call or stock_opens or stock_closes or ret_stopped or early_asn:
-        lines.append("— Maintenance —")
-        if ret_stopped:  lines.append(f"🛑 Retirement stops: {', '.join(ret_stopped[:8])}{'…' if len(ret_stopped)>8 else ''}")
-        if early_asn:    lines.append(f"⚠️ Early assigned: {', '.join(early_asn[:8])}{'…' if len(early_asn)>8 else ''}")
-        if csp_tp:       lines.append(f"✅ CSP closed (TP): {', '.join(csp_tp[:8])}{'…' if len(csp_tp)>8 else ''}")
-        if cc_tp:        lines.append(f"✅ CC closed (TP): {', '.join(cc_tp[:8])}{'…' if len(cc_tp)>8 else ''}")
-        if csp_exp:      lines.append(f"CSP expired: {', '.join(csp_exp[:8])}{'…' if len(csp_exp)>8 else ''}")
-        if csp_asn:      lines.append(f"CSP assigned: {', '.join(csp_asn[:8])}{'…' if len(csp_asn)>8 else ''}")
-        if cc_exp:       lines.append(f"CC expired: {', '.join(cc_exp[:8])}{'…' if len(cc_exp)>8 else ''}")
-        if cc_call:      lines.append(f"Called away: {', '.join(cc_call[:8])}{'…' if len(cc_call)>8 else ''}")
-        if stock_closes: lines.append(f"Stocks closed: {', '.join(stock_closes[:10])}{'…' if len(stock_closes)>10 else ''}")
-        if stock_opens:  lines.append(f"Stocks opened: {', '.join(stock_opens[:10])}{'…' if len(stock_opens)>10 else ''}")
+    # --- Trading status ---
+    t_flag  = "🟢" if trading_on else "🔴"
+    lines.append(f"{t_flag} Trading {'ON' if trading_on else 'OFF'}")
 
-    if csp_roll:
-        lines.append("— CSP Roll Candidates —")
-        for r in csp_roll[:6]:
-            lines.append(
-                f"🔄 [{r['account']}] {r['ticker']} {r['strike']:.0f}P {r['expiry']} "
-                f"| {r['pct_itm']:.1f}% ITM | {r['dte']}d | px {r['current_price']:.2f}"
+    # --- Open holdings ---
+    try:
+        # Pull holdings directly so we don't need the caller to pass them in.
+        # Mirrors the same grouping logic used by print_open_holdings.
+        stock_rows = strat.load_csv_rows(strat.STOCK_POSITIONS_FILE)
+        open_rows  = [r for r in stock_rows if (r.get("status") or "").upper() == "OPEN"]
+
+        # Also pull assigned wheel lots as holdings.
+        import sys as _sys
+        _whl = _sys.modules.get("wheel")
+        lot_rows = _whl.get_open_lots() if _whl else []
+
+        holdings: List[dict] = []
+
+        # Batch price fetch for all open positions — CSV current_price is only
+        # updated on stop/target exits, so it's stale for positions just sitting open.
+        all_tkrs = list({
+            (r.get("ticker") or "").strip().upper() for r in open_rows
+            if (r.get("ticker") or "").strip()
+        } | {
+            (lot.get("ticker") or "").strip().upper() for lot in lot_rows
+            if (lot.get("ticker") or "").strip()
+        })
+        px_live = strat.last_close_prices(all_tkrs) if all_tkrs else {}
+
+        for r in open_rows:
+            tkr   = (r.get("ticker") or "").strip().upper()
+            acct  = (r.get("account") or INDIVIDUAL).strip().upper()
+            sh    = float(r.get("shares") or 0)
+            entry = float(r.get("entry_price") or r.get("cost_basis") or 0)
+            cur   = px_live.get(tkr, 0.0)
+            pnl   = (cur - entry) * sh if cur > 0 else 0.0
+            pct   = (cur - entry) / entry * 100 if (entry > 0 and cur > 0) else 0.0
+            holdings.append({"acct": acct, "tkr": tkr, "sh": sh, "entry": entry,
+                              "cur": cur, "pnl": pnl, "pct": pct, "src": "STOCK"})
+
+        for lot in lot_rows:
+            tkr   = (lot.get("ticker") or "").strip().upper()
+            acct  = (lot.get("account") or INDIVIDUAL).strip().upper()
+            sh    = float(lot.get("shares") or 0)
+            cb    = float(lot.get("cost_basis") or 0)
+            entry = cb / sh if sh > 0 else 0.0
+            cur   = px_live.get(tkr, 0.0)
+            pnl   = (cur - entry) * sh if cur > 0 else 0.0
+            pct   = (cur - entry) / entry * 100 if (entry > 0 and cur > 0) else 0.0
+            holdings.append({"acct": acct, "tkr": tkr, "sh": sh, "entry": entry,
+                              "cur": cur, "pnl": pnl, "pct": pct, "src": "WHEEL"})
+
+        if holdings:
+            lines.append("📌 HOLDINGS")
+            by_acct: Dict[str, list] = {}
+            for h in holdings:
+                by_acct.setdefault(h["acct"], []).append(h)
+            for acct in (INDIVIDUAL, IRA, ROTH):
+                rows = by_acct.get(acct)
+                if not rows:
+                    continue
+                acct_mv  = sum(r["cur"] * r["sh"] for r in rows if r["cur"] > 0)
+                acct_pnl = sum(r["pnl"] for r in rows)
+                sign     = "+" if acct_pnl >= 0 else ""
+                lines.append(
+                    f"{_ACCT_LABEL[acct]} MV ${acct_mv:,.0f} P/L {sign}${acct_pnl:,.0f}"
+                )
+                for r in rows:
+                    w_tag = "[W]" if r["src"] == "WHEEL" else ""
+                    if r["cur"] <= 0:
+                        # Price unavailable — show entry only, skip P/L.
+                        lines.append(
+                            f"  {r['tkr']:<5} {r['sh']:.0f}sh "
+                            f"@{r['entry']:.2f}→n/a {w_tag}"
+                        )
+                    else:
+                        sign2 = "+" if r["pnl"] >= 0 else ""
+                        lines.append(
+                            f"  {r['tkr']:<5} {r['sh']:.0f}sh "
+                            f"@{r['entry']:.2f}→{r['cur']:.2f} "
+                            f"{sign2}${r['pnl']:,.0f} ({sign2}{r['pct']:.1f}%) {w_tag}"
+                        )
+    except Exception as e:
+        log.warning("Discord holdings block failed: %s", e)
+
+    # --- Open CSPs ---
+    try:
+        csp_rows  = strat.load_csv_rows(CSP_POSITIONS_FILE)
+        open_csps = [
+            r for r in csp_rows
+            if (r.get("status") or "").upper() == "OPEN"
+            and not (
+                (r.get("expiry") or "").strip()
+                and dt.date.fromisoformat((r.get("expiry") or "").strip()) < today
             )
+        ]
+        if open_csps:
+            lines.append("🧾 CSPs")
+            for r in open_csps[:12]:
+                acct   = _ACCT_LABEL.get((r.get("account") or INDIVIDUAL).strip().upper(), "?")
+                tkr    = (r.get("ticker") or "").strip().upper()
+                strike = r.get("strike") or ""
+                exp    = (r.get("expiry") or "").replace("2026-", "").replace("2025-", "")
+                prem   = r.get("premium") or r.get("est_premium") or ""
+                try:
+                    prem_f = f"${float(prem):,.0f}" if prem else ""
+                except Exception:
+                    prem_f = str(prem)
+                dte_str = ""
+                try:
+                    if r.get("expiry"):
+                        dte = (dt.date.fromisoformat(r["expiry"]) - today).days
+                        dte_str = f"{dte}d"
+                except Exception:
+                    pass
+                lines.append(f"  [{acct}] {tkr} {strike}P {exp} {prem_f} {dte_str}")
+    except Exception as e:
+        log.warning("Discord CSP block failed: %s", e)
 
+    # --- Open CCs ---
+    try:
+        cc_rows  = strat.load_csv_rows(CC_POSITIONS_FILE)
+        open_ccs = [r for r in cc_rows if (r.get("status") or "").upper() == "OPEN"]
+        if open_ccs:
+            lines.append("📞 CCs")
+            for r in open_ccs[:12]:
+                acct      = _ACCT_LABEL.get((r.get("account") or INDIVIDUAL).strip().upper(), "?")
+                tkr       = (r.get("ticker") or "").strip().upper()
+                strike    = r.get("strike") or ""
+                exp       = (r.get("expiry") or "").replace("2026-", "").replace("2025-", "")
+                prem      = r.get("premium") or ""
+                contracts = r.get("contracts") or ""
+                try:
+                    prem_f = f"${float(prem):,.0f}" if prem else ""
+                except Exception:
+                    prem_f = str(prem)
+                # DTE
+                dte_str = ""
+                try:
+                    if r.get("expiry"):
+                        dte = (dt.date.fromisoformat(r["expiry"]) - today).days
+                        dte_str = f"{dte}d"
+                except Exception:
+                    pass
+                # ITM/OTM — best-effort using strategies last close
+                itm_str = ""
+                try:
+                    px_map = strat.last_close_prices([tkr])
+                    cur    = px_map.get(tkr, 0.0)
+                    s      = float(strike) if strike else 0.0
+                    if cur > 0 and s > 0:
+                        pct = (cur - s) / s * 100.0
+                        itm_str = (f"🔴{pct:+.1f}%" if cur >= s else f"🟢{pct:+.1f}%")
+                except Exception:
+                    pass
+                lines.append(
+                    f"  [{acct}] {tkr} {strike}C {exp} {prem_f} {contracts}x {dte_str} {itm_str}"
+                )
+    except Exception as e:
+        log.warning("Discord CC block failed: %s", e)
+
+    # --- CC roll alerts (non-interactive) ---
+    try:
+        cc_rows_all = strat.load_csv_rows(CC_POSITIONS_FILE)
+        roll_flags  = []
+        for r in cc_rows_all:
+            if (r.get("status") or "").upper() != "OPEN":
+                continue
+            tkr = (r.get("ticker") or "").strip().upper()
+            try:
+                strike = float(r.get("strike") or 0)
+                if strike <= 0:
+                    continue
+                px_map = strat.last_close_prices([tkr])
+                cur    = px_map.get(tkr, 0.0)
+                if cur <= 0:
+                    continue
+                if cur / strike >= float(CC_ROLL_SIGNAL_THRESHOLD):
+                    pct = (cur - strike) / strike * 100.0
+                    flag = "🔴 ITM" if pct > 0 else "🟡 near"
+                    roll_flags.append(f"  ⚠️ {flag} {tkr} {strike:.0f}C {pct:+.1f}% — review at terminal")
+            except Exception:
+                continue
+        for line in roll_flags:
+            lines.append(line)
+    except Exception as e:
+        log.warning("Discord CC roll block failed: %s", e)
+
+    # --- Maintenance events ---
+    maint: List[str] = []
+    if ret_stopped:  maint.append(f"🛑 Ret stops: {', '.join(ret_stopped[:6])}")
+    if early_asn:    maint.append(f"⚠️ Early asn: {', '.join(early_asn[:6])}")
+    if csp_asn:      maint.append(f"📥 CSP asn: {', '.join(csp_asn[:6])}")
+    if csp_tp:       maint.append(f"✅ CSP TP: {', '.join(csp_tp[:6])}")
+    if csp_exp:      maint.append(f"CSP exp: {', '.join(csp_exp[:6])}")
+    if cc_tp:        maint.append(f"✅ CC TP: {', '.join(cc_tp[:6])}")
+    if cc_exp:       maint.append(f"CC exp: {', '.join(cc_exp[:6])}")
+    if cc_call:      maint.append(f"📤 Called away: {', '.join(cc_call[:6])}")
+    if stock_closes:
+        closed_fmt = []
+        for s in stock_closes[:6]:
+            if ":" in s:
+                acct_raw, tkr = s.split(":", 1)
+                closed_fmt.append(f"{tkr} [{_ACCT_LABEL.get(acct_raw.strip().upper(), acct_raw)}]")
+            else:
+                closed_fmt.append(s)
+        maint.append(f"📉 Closed: {', '.join(closed_fmt)}")
+    if stock_opens:
+        opened_fmt = []
+        for s in stock_opens[:6]:
+            if ":" in s:
+                acct_raw, tkr = s.split(":", 1)
+                opened_fmt.append(f"{tkr} [{_ACCT_LABEL.get(acct_raw.strip().upper(), acct_raw)}]")
+            else:
+                opened_fmt.append(s)
+        maint.append(f"📈 Opened: {', '.join(opened_fmt)}")
+    if maint:
+        lines.append("— Events —")
+        lines.extend(maint)
+
+    # --- New CSPs ---
     if new_csps:
-        lines.append("— New CSP ideas —")
+        lines.append("🆕 CSPs")
         for x in new_csps[:10]:
-            acct_tag = f"[{x['account']}] " if x.get("account") else ""
-            lines.append(f"{acct_tag}{x['ticker']} {x['strike']:.0f}P {x['expiry']} ~${x['est_premium']:.0f}")
+            acct = _ACCT_LABEL.get((x.get("account") or INDIVIDUAL).strip().upper(), "?")
+            exp  = (x.get("expiry") or "").replace("2026-", "").replace("2025-", "")
+            lines.append(
+                f"  [{acct}] {x['ticker']} {x['strike']:.0f}P {exp} "
+                f"~${x['est_premium']:.0f} ${x['cash_reserved']:,.0f}"
+            )
+    else:
+        lines.append("🆕 CSPs: none")
 
+    # --- New CCs ---
     if new_ccs:
-        lines.append("— New CC ideas —")
+        lines.append("📞 New CCs")
         for x in new_ccs[:10]:
-            acct_tag = f"[{x['account']}] " if x.get("account") else ""
-            lines.append(f"{acct_tag}{x['ticker']} {x['strike']:.0f}C {x['expiry']} ~${x['credit_mid']*100:.0f}")
+            acct = _ACCT_LABEL.get((x.get("account") or INDIVIDUAL).strip().upper(), "?")
+            exp  = (x.get("expiry") or "").replace("2026-", "").replace("2025-", "")
+            lines.append(
+                f"  [{acct}] {x['ticker']} {x['strike']:.0f}C {exp} "
+                f"~${float(x.get('credit_mid', 0)) * 100:.0f}"
+            )
+    else:
+        lines.append("📞 New CCs: none")
 
-    if planned_stocks:
-        lines.append("— Stock entries (planned) —")
-        for p in planned_stocks[:10]:
-            lines.append(f"{p['ticker']} {p['signal']} {p['account']} @ {p['entry_price']:.2f}")
-
-    if watch and not planned_stocks:
-        lines.append("— Watchlist —")
-        for w in watch[:12]:
-            lines.append(f"{w['ticker']} ({w['note']}) @ {w['close']:.2f}")
+    # --- Wheel exposure + stock caps (condensed, one line per account) ---
+    lines.append("💼 Exposure")
+    try:
+        for acct in (INDIVIDUAL, IRA, ROTH):
+            label = _ACCT_LABEL[acct]
+            exp   = compute_wheel_exposure(today, acct)
+            rem   = compute_week_remaining(today, acct)
+            cap   = float(RETIREMENT_STOCK_CAPS.get(acct, INDIVIDUAL_STOCK_CAP))
+            lines.append(
+                f"  {label} Whl ${exp['total_exposure']:,.0f}/${exp['cap']:,.0f} "
+                f"wk rem ${rem:,.0f} | Stk cap ${cap:,.0f}"
+            )
+    except Exception as e:
+        log.warning("Discord exposure block failed: %s", e)
 
     return "\n".join(lines)
 
@@ -127,6 +397,7 @@ def build_discord_alert(
 # ============================================================
 
 def print_market_context(mkt: Dict, trading_on: bool, retire_on: bool) -> None:
+    """Print the full market context block to the terminal."""
     print("\n==============================")
     print(f"📅 RUN DATE: {dt.date.today().isoformat()}")
     print("==============================\n")
@@ -156,6 +427,7 @@ def print_market_context(mkt: Dict, trading_on: bool, retire_on: bool) -> None:
 # ============================================================
 
 def print_open_holdings(holdings: List[dict]) -> None:
+    """Print a grouped P/L table of all open stock and wheel lot positions."""
     if not holdings:
         print("\n📌 OPEN STOCK HOLDINGS: none\n")
         return
@@ -169,8 +441,8 @@ def print_open_holdings(holdings: List[dict]) -> None:
         by_acct.setdefault(h["account"], []).append(h)
 
     for acct, rows in by_acct.items():
-        acct_pnl    = sum(r["pnl"] for r in rows)
-        acct_mv     = sum((r["cur"] * r["shares"]) for r in rows if r["cur"] > 0)
+        acct_pnl = sum(r["pnl"] for r in rows)
+        acct_mv  = sum((r["cur"] * r["shares"]) for r in rows if r["cur"] > 0)
         print(f"  {acct}  |  MV ${acct_mv:,.0f}  |  P/L ${acct_pnl:,.0f}")
         for r in rows:
             print(
@@ -190,8 +462,9 @@ def print_open_holdings(holdings: List[dict]) -> None:
 # ============================================================
 
 def print_open_csps(today: dt.date) -> None:
+    """Print all non-expired open CSP positions."""
     try:
-        csp_rows = strat.load_csv_rows(CSP_POSITIONS_FILE)
+        csp_rows  = strat.load_csv_rows(CSP_POSITIONS_FILE)
         open_csps = []
         for r in csp_rows:
             if (r.get("status") or "").upper() != "OPEN":
@@ -223,26 +496,22 @@ def print_open_csps(today: dt.date) -> None:
 # ============================================================
 
 def print_open_ccs(today: dt.date, px: Dict[str, float]) -> None:
-    """Print a summary table of all open covered calls with live ITM/OTM status."""
+    """Print all open covered calls with live ITM/OTM status."""
     try:
-        cc_rows = strat.load_csv_rows(CC_POSITIONS_FILE)
-        open_ccs = [
-            r for r in cc_rows
-            if (r.get("status") or "").upper() == "OPEN"
-        ]
+        cc_rows  = strat.load_csv_rows(CC_POSITIONS_FILE)
+        open_ccs = [r for r in cc_rows if (r.get("status") or "").upper() == "OPEN"]
         if not open_ccs:
             return
 
         print("\n📞 OPEN CC POSITIONS")
         for r in open_ccs:
-            tkr      = (r.get("ticker")   or "").strip().upper()
-            acct     = (r.get("account")  or "").strip().upper()
-            exp      = (r.get("expiry")   or "").strip()
-            strike   = r.get("strike")    or ""
-            prem     = r.get("premium")   or ""
-            contracts = r.get("contracts") or ""
+            tkr       = (r.get("ticker")    or "").strip().upper()
+            acct      = (r.get("account")   or "").strip().upper()
+            exp       = (r.get("expiry")    or "").strip()
+            strike    = r.get("strike")     or ""
+            prem      = r.get("premium")    or ""
+            contracts = r.get("contracts")  or ""
 
-            # Days to expiry
             dte_str = ""
             try:
                 if exp:
@@ -251,18 +520,13 @@ def print_open_ccs(today: dt.date, px: Dict[str, float]) -> None:
             except Exception:
                 pass
 
-            # ITM / OTM status vs current price
             status_str = ""
             cur = px.get(tkr)
             try:
                 if cur and cur > 0 and strike:
-                    s = float(strike)
-                    if s > 0:
-                        pct = (cur - s) / s * 100.0
-                        if cur >= s:
-                            status_str = f"🔴 ITM {pct:+.1f}%"
-                        else:
-                            status_str = f"🟢 OTM {pct:+.1f}%"
+                    s   = float(strike)
+                    pct = (cur - s) / s * 100.0 if s > 0 else 0.0
+                    status_str = (f"🔴 ITM {pct:+.1f}%" if cur >= s else f"🟢 OTM {pct:+.1f}%")
             except Exception:
                 pass
 
@@ -274,32 +538,27 @@ def print_open_ccs(today: dt.date, px: Dict[str, float]) -> None:
     except Exception as e:
         log.warning("print_open_ccs failed: %s", e)
 
+
 def print_open_cc_roll_candidates(px: Dict[str, float], today: "dt.date | None" = None) -> None:
     """
-    Flag open CCs where the stock has recovered close to or through the strike,
-    then prompt the user to act on each one interactively.
+    Flag open CCs near or through their strike and prompt for action.
 
-    Options presented per candidate:
-      1  Roll up & out  — buy-to-close, sell higher strike on later expiry
-                          (strike chosen by ATR-tier logic, same as fresh CC open)
-      2  Roll out       — buy-to-close, re-sell SAME strike on later expiry
-      3  Close only     — buy-to-close, no replacement (lot stays open, new CC
-                          can be planned on next run)
-      4  Skip           — do nothing for this candidate this run
+    Choices per candidate:
+      1  Roll up & out  — close and reopen at a higher strike / later expiry
+      2  Roll out only  — close and reopen at the same strike on a later expiry
+      3  Close CC only  — close the call, keep shares; a fresh CC is planned next run
+      4  Close CC + exit shares — full unwind
+      5  Skip
 
-    Debit rolls are blocked by policy — if the net of closing+opening would cost
-    money the system explains why and treats the candidate as skipped.
-
-    The function is intentionally defensive: any failure in the interactive path
-    logs a warning and falls through to the next candidate rather than crashing
-    the screener run.
+    Debit rolls are blocked. Any failure in the interactive path logs a warning
+    and falls through to the next candidate so the run is never blocked.
     """
     import datetime as _dt
     if today is None:
         today = _dt.date.today()
 
     try:
-        cc_rows = strat.load_csv_rows(CC_POSITIONS_FILE)
+        cc_rows    = strat.load_csv_rows(CC_POSITIONS_FILE)
         candidates = []
         for r in cc_rows:
             if (r.get("status") or "").upper() != "OPEN":
@@ -342,12 +601,12 @@ def print_open_cc_roll_candidates(px: Dict[str, float], today: "dt.date | None" 
             tkr    = cand["tkr"]
             strike = cand["strike"]
             cur    = cand["cur"]
-            pct    = cand["pct"]        # negative means ITM
+            pct    = cand["pct"]    # negative = ITM
             exp    = cand["exp"]
             r      = cand["row"]
 
             flag      = "🔴 ITM " if pct < 0 else "🟡 near"
-            direction = "ITM"         if pct < 0 else "OTM"
+            direction = "ITM"      if pct < 0 else "OTM"
 
             print(f"\n  {flag} {tkr:<6} {strike:.0f}C {exp} | Now {cur:.2f} ({abs(pct):.1f}% {direction})")
             print(f"    1  Roll up & out  (new strike via ATR tier, later expiry)")
@@ -356,9 +615,7 @@ def print_open_cc_roll_candidates(px: Dict[str, float], today: "dt.date | None" 
             print(f"    4  Close CC + exit shares  (unwind entire position, book P&L)")
             print(f"    5  Skip           (do nothing)")
 
-            # Read user choice with a 30-second timeout.
-            # If no input arrives (background run, piped, or user away) the
-            # default is always Skip — the screener never hangs.
+            # 30-second stdin timeout — defaults to Skip so unattended runs never hang.
             choice = "5"
             try:
                 import sys as _sys
@@ -389,7 +646,7 @@ def print_open_cc_roll_candidates(px: Dict[str, float], today: "dt.date | None" 
                 continue
 
             if choice == "3":
-                # Close CC only — mark CC closed, leave shares, fresh CC next run
+                # Close CC, leave shares open for a fresh CC next run.
                 print(f"    Closing CC for {tkr} {exp} {strike:.0f}C …", end=" ", flush=True)
                 try:
                     rows_all = strat.load_csv_rows(CC_POSITIONS_FILE)
@@ -407,7 +664,7 @@ def print_open_cc_roll_candidates(px: Dict[str, float], today: "dt.date | None" 
                         strat.write_csv_rows(CC_POSITIONS_FILE, rows_all,
                                              strat.CC_POSITIONS_COLUMNS)
                         import sys
-                        _whl = sys.modules.get("wheel")
+                        _whl   = sys.modules.get("wheel")
                         src_lot = (r.get("source_lot_id") or "").strip()
                         if _whl and src_lot:
                             lots = _whl._read_rows(_whl.WHEEL_LOTS_FILE)
@@ -426,7 +683,7 @@ def print_open_cc_roll_candidates(px: Dict[str, float], today: "dt.date | None" 
                 continue
 
             if choice == "4":
-                # Close CC + sell shares — full position exit
+                # Close CC and sell the underlying shares — full position exit.
                 print(f"    Closing CC and exiting {tkr} shares …", end=" ", flush=True)
                 try:
                     result = strat.execute_cc_close_and_exit(today, r)
@@ -439,8 +696,8 @@ def print_open_cc_roll_candidates(px: Dict[str, float], today: "dt.date | None" 
                     print(f"❌  Error: {e}")
                 continue
 
-            # Choice 1 or 2 — execute a roll
-            roll_up = (choice == "1")
+            # Choice 1 or 2 — roll.
+            roll_up   = (choice == "1")
             roll_label = "up & out" if roll_up else "out only"
             print(f"    Rolling {tkr} {roll_label} …", end=" ", flush=True)
             try:
@@ -459,11 +716,10 @@ def print_open_cc_roll_candidates(px: Dict[str, float], today: "dt.date | None" 
 
 
 def print_csp_roll_candidates(candidates: List[dict]) -> None:
-    """Display CSP roll candidates flagged by scan_csp_roll_candidates.
+    """
+    Print CSP roll candidates: open CSPs that are >=10% ITM with >10 DTE.
 
-    These are open CSPs that are >=10% ITM with >10 DTE remaining — enough
-    time to buy-to-close and re-open at a lower strike / further expiry for
-    a potential net credit.  Display-only — no automated action.
+    Display-only — no automated action taken here.
     """
     if not candidates:
         return
@@ -490,18 +746,19 @@ def print_final_exposure_summary(
     mv_stock: Dict[str, float],
     wheel_mv: float,
 ) -> None:
+    """Print wheel exposure, retirement MV, and stock cap utilization."""
     print("\n💼 WHEEL EXPOSURE (all accounts)")
     for acct in (INDIVIDUAL, IRA, ROTH):
         exp = compute_wheel_exposure(today, acct)
         rem = compute_week_remaining(today, acct)
-        print(f"  {acct:<10} "
-              f"${exp['total_exposure']:>8,.0f} / ${exp['cap']:>8,.0f}  "
-              f"| wk target ${exp['weekly_target']:>7,.0f}  "
-              f"| wk rem ${rem:>7,.0f}")
+        print(
+            f"  {acct:<10} "
+            f"${exp['total_exposure']:>8,.0f} / ${exp['cap']:>8,.0f}  "
+            f"| wk target ${exp['weekly_target']:>7,.0f}  "
+            f"| wk rem ${rem:>7,.0f}"
+        )
 
-    # Retirement MV
-    mv_ret = strat.retirement_market_value_by_account(ret_by_key)
-
+    mv_ret       = strat.retirement_market_value_by_account(ret_by_key)
     total_ret_mv = sum(mv_ret.get(a, 0.0) for a in (IRA, ROTH))
     total_ret_mv += sum(mv_stock.get(a, 0.0) for a in (IRA, ROTH))
 
@@ -512,14 +769,14 @@ def print_final_exposure_summary(
             if mv > 0:
                 print(f"  {acct}: ${mv:,.0f}")
 
-        # Estimated annual dividends per holding
+        # Estimated annual dividend income per retirement holding.
         try:
-            ret_rows = strat.load_retirement_positions()
+            ret_rows      = strat.load_retirement_positions()
             total_est_div = 0.0
-            div_lines = []
+            div_lines     = []
             for r in ret_rows:
-                tkr   = (r.get("ticker") or "").strip().upper()
-                acct  = (r.get("account") or "").strip().upper()
+                tkr  = (r.get("ticker")  or "").strip().upper()
+                acct = (r.get("account") or "").strip().upper()
                 if acct not in (IRA, ROTH) or not tkr:
                     continue
                 try:
@@ -529,7 +786,9 @@ def print_final_exposure_summary(
                     if sh > 0 and px > 0 and yld > 0:
                         est_div = sh * px * yld
                         total_est_div += est_div
-                        div_lines.append(f"    {acct} {tkr}: ~${est_div:,.0f}/yr ({yld*100:.1f}% yield)")
+                        div_lines.append(
+                            f"    {acct} {tkr}: ~${est_div:,.0f}/yr ({yld*100:.1f}% yield)"
+                        )
                 except Exception:
                     pass
             if div_lines:
@@ -538,6 +797,7 @@ def print_final_exposure_summary(
                     print(dl)
         except Exception as e:
             log.warning("Retirement dividend display failed: %s", e)
+
     if ret_flagged:
         print(f"  ⚠️ Breakeven-only flagged: {', '.join(ret_flagged)}")
 
@@ -549,7 +809,7 @@ def print_final_exposure_summary(
     )
     for acct in (IRA, ROTH):
         acct_stock_mv = float(mv_ret.get(acct, 0.0)) + float(mv_stock.get(acct, 0.0))
-        cap = float(RETIREMENT_STOCK_CAPS.get(acct, 0))
+        cap           = float(RETIREMENT_STOCK_CAPS.get(acct, 0))
         print(
             f"  {acct:<12} MV ${acct_stock_mv:>8,.0f} / ${cap:>8,.0f}"
             f"  | Remaining ${max(cap - acct_stock_mv, 0.0):>8,.0f}"
