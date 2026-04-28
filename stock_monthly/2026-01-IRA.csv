@@ -1,0 +1,4 @@
+date,account,ticker,shares,entry_price,exit_price,close_type,pnl_abs,pnl_pct
+2026-01-06,IRA,MCHP,230,63.72,74.87,TARGET,2564.50,17.50
+2026-01-30,IRA,GOOGL,45,322.00,338.22,TARGET,729.90,5.04
+,,TOTAL,,,,,3294.40,

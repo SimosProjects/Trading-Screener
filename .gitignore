@@ -27,6 +27,11 @@ ENV/
 Thumbs.db
 
 # -----------------------
+# Secrets
+# -----------------------
+.env
+
+# -----------------------
 # Logs / cache / temp
 # -----------------------
 *.log
@@ -40,12 +45,14 @@ Thumbs.db
 .ipynb_checkpoints/
 
 # -----------------------
-# Data outputs
+# Personal / local only
 # -----------------------
-*.csv
 Plan/
+backups/
 
-# Optional: also ignore other common data artifacts
+# -----------------------
+# Data artifacts (non-CSV)
+# -----------------------
 *.parquet
 *.feather
 *.pkl

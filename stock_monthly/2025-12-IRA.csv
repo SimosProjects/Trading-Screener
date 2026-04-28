@@ -1,0 +1,3 @@
+date,account,ticker,shares,entry_price,exit_price,close_type,pnl_abs,pnl_pct
+2025-12-26,IRA,MS,84,172.96,181.65,TARGET,729.96,5.02
+,,TOTAL,,,,,729.96,

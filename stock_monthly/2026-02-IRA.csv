@@ -1,0 +1,3 @@
+date,account,ticker,shares,entry_price,exit_price,close_type,pnl_abs,pnl_pct
+2026-02-03,IRA,COST,15,938.58,989.00,TARGET,756.30,5.37
+,,TOTAL,,,,,756.30,

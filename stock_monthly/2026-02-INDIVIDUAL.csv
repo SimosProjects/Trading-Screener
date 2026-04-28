@@ -1,0 +1,4 @@
+date,account,ticker,shares,entry_price,exit_price,close_type,pnl_abs,pnl_pct
+2026-02-02,INDIVIDUAL,WMT,32,116.81,124.06,TARGET,232.00,6.21
+2026-02-03,INDIVIDUAL,COST,3,937.50,989.00,TARGET,154.50,5.49
+,,TOTAL,,,,,386.50,

@@ -1,0 +1,4 @@
+date,account,ticker,event_type,amount,net,notes
+2026-02-27,IRA,C,CSP_OPEN,+185.00,,102.00P exp 2026-03-27
+2026-02-27,ROTH,WMT,CSP_OPEN,+124.50,,120.00P exp 2026-03-27
+,,NET_PREMIUM,,+309.50,,
