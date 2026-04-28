@@ -1,0 +1,83 @@
+name: Daily Screener
+
+on:
+  schedule:
+    # 14:45 UTC = 10:45 AM EDT (summer) / 9:45 AM EST (winter)
+    # Runs Mon–Fri; NYSE holiday check inside the run_screener step handles
+    # actual market holidays so no trades fire on days the market is closed.
+    - cron: '45 14 * * 1-5'
+
+  # Allow a manual trigger from the Actions tab for testing.
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed to commit CSV changes back to the repo
+
+jobs:
+  run-screener:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30   # hard cap — prevents a hung yfinance call from burning minutes
+
+    env:
+      DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+      TZ: America/New_York   # ensures any date logic in Python sees ET
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python 3.9
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+          cache: 'pip'   # caches the pip install between runs to speed up workflow
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Check NYSE trading day
+        id: market_check
+        run: |
+          python - << 'EOF'
+          import sys
+          import datetime as dt
+          import exchange_calendars as xcals
+
+          today   = dt.date.today()
+          cal     = xcals.get_calendar("XNYS")
+          is_open = cal.is_session(today.isoformat())
+
+          if not is_open:
+              print(f"Market closed today ({today}) — skipping screener run.")
+              # Write a step output so the next step can skip cleanly.
+              with open("$GITHUB_OUTPUT", "a") as f:
+                  f.write("skip=true\n")
+          else:
+              print(f"Market open today ({today}) — proceeding.")
+              with open("$GITHUB_OUTPUT", "a") as f:
+                  f.write("skip=false\n")
+          EOF
+
+      - name: Run screener
+        if: steps.market_check.outputs.skip == 'false'
+        run: python screener.py
+
+      - name: Commit updated CSVs
+        if: steps.market_check.outputs.skip == 'false'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Stage only CSV files and the monthly report directories.
+          git add "*.csv" "wheel_monthly/" "stock_monthly/" || true
+
+          # Only commit if something actually changed — avoids empty commits
+          # on days where no positions move.
+          if git diff --cached --quiet; then
+            echo "No CSV changes to commit."
+          else
+            git commit -m "screener: auto-update data $(date +'%Y-%m-%d')"
+            git push
+          fi
