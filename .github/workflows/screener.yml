@@ -24,12 +24,12 @@ jobs:
 
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4.2.2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Python 3.9
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v5.4.0
         with:
           python-version: '3.9'
           cache: 'pip'   # caches the pip install between runs to speed up workflow
@@ -39,11 +39,17 @@ jobs:
 
       - name: Check NYSE trading day
         id: market_check
+        # GITHUB_OUTPUT is a shell env var pointing to a temp file Actions reads
+        # for step outputs. We pass it explicitly into Python since it won't
+        # expand inside a heredoc string literal.
         run: |
-          python - << 'EOF'
+          python - "$GITHUB_OUTPUT" << 'EOF'
           import sys
+          import os
           import datetime as dt
           import exchange_calendars as xcals
+
+          output_file = sys.argv[1] if len(sys.argv) > 1 else ""
 
           today   = dt.date.today()
           cal     = xcals.get_calendar("XNYS")
@@ -51,13 +57,16 @@ jobs:
 
           if not is_open:
               print(f"Market closed today ({today}) — skipping screener run.")
-              # Write a step output so the next step can skip cleanly.
-              with open("$GITHUB_OUTPUT", "a") as f:
-                  f.write("skip=true\n")
+              skip_val = "true"
           else:
               print(f"Market open today ({today}) — proceeding.")
-              with open("$GITHUB_OUTPUT", "a") as f:
-                  f.write("skip=false\n")
+              skip_val = "false"
+
+          if output_file:
+              with open(output_file, "a") as f:
+                  f.write(f"skip={skip_val}\n")
+          else:
+              print(f"WARNING: GITHUB_OUTPUT not set — skip={skip_val} not written.")
           EOF
 
       - name: Run screener
