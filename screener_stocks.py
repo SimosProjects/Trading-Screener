@@ -1,15 +1,13 @@
 """screener_stocks.py
 
 Stock scan (pullback / breakout signals) and paper trade execution.
-
-Extracted from screener.py.  Returns structured results;
-all printing stays in screener_display.py.
+All printing stays in screener_display.py.
 """
 
 from __future__ import annotations
 
 import datetime as dt
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Set, Tuple
 
 import strategies as strat
 from utils import get_logger
@@ -25,7 +23,7 @@ from config import (
 
 log = get_logger(__name__)
 
-# ── Behaviour toggles (edit here to change cross-account dedup rules) ──
+# ── Behaviour toggles ─────────────────────────────────────────────────────────
 # Prevents the same ticker appearing in both IRA and ROTH simultaneously.
 PREVENT_DUPLICATE_RETIREMENT_TICKERS = True
 # When False: also blocks the same ticker across INDIVIDUAL vs retirement.
@@ -40,10 +38,10 @@ def scan_stock_entries_and_watchlist(regime: str = "BULL") -> Tuple[List[dict], 
     """
     Scan STOCKS for pullback/breakout entry signals and watchlist candidates.
 
-    All signal thresholds are regime-dynamic — passed through to strategies
-    so the same market-regime classifier drives both CSP and stock parameters.
+    Signal thresholds are regime-dynamic — passed through to strategies so the
+    same market-regime classifier drives both CSP and stock parameters.
 
-    Returns (entries, watchlist).  Each entry carries '_last' (the indicator
+    Returns (entries, watchlist). Each entry carries '_last' (the indicator
     row) for use by the planning step.
     """
     entries: List[dict] = []
@@ -150,14 +148,30 @@ def plan_and_execute_stocks(
     open_any        = set().union(*open_by_acct.values())
     open_retirement = set().union(open_by_acct.get(IRA, set()), open_by_acct.get(ROTH, set()))
 
+    # Pull tickers already held in retirement_positions.csv into the dedup sets.
+    # Without this, buy-and-hold positions re-enter the signal universe every day
+    # since retirement_positions.csv is separate from stock_positions.csv.
+    try:
+        ret_pos_rows = strat.load_retirement_positions()
+        for r in ret_pos_rows:
+            acct = (r.get("account") or "").strip().upper()
+            tkr  = (r.get("ticker")  or "").strip().upper()
+            if acct in open_by_acct and tkr:
+                open_by_acct[acct].add(tkr)
+                open_retirement.add(tkr)
+                open_any.add(tkr)
+    except Exception as e:
+        log.warning("plan_and_execute_stocks: could not load retirement positions for dedup: %s", e)
+
     # Count existing open positions per retirement account for the per-account cap.
+    # Includes both stock_positions.csv and retirement_positions.csv holdings.
     ret_open_count: Dict[str, int] = {
         IRA:  len(open_by_acct.get(IRA,  set())),
         ROTH: len(open_by_acct.get(ROTH, set())),
     }
 
     print("\n📈 STOCK ENTRIES (planned)")
-    indiv_planned  = 0          # INDIVIDUAL cap: 3 new trades per run
+    indiv_planned  = 0
     stock_opened:   List[str]  = []
     planned_stocks: List[dict] = []
 
@@ -173,8 +187,6 @@ def plan_and_execute_stocks(
         if trading_on and indiv_planned < 3:
             acct_order.append(INDIVIDUAL)
         if retire_on:
-            # Only add retirement accounts that have room and where this ticker
-            # is in the eligible universe.
             if tkr in retirement_set:
                 for acct in (IRA, ROTH):
                     if ret_open_count.get(acct, 0) < RETIREMENT_MAX_STOCK_POSITIONS:
@@ -229,9 +241,7 @@ def plan_and_execute_stocks(
             open_retirement.add(tkr)
             ret_open_count[picked_acct] = ret_open_count.get(picked_acct, 0) + 1
 
-            # Soft cross-sector diversification check.
-            # If we already hold one name in this account and the new name is in
-            # the same sector, warn — but proceed. Human makes the final call.
+            # Soft sector concentration warning — no hard block, human decides.
             if RETIREMENT_DIVERSIFY_SECTORS and ret_open_count[picked_acct] >= 2:
                 existing_sectors = {
                     CSP_TICKER_SECTOR.get(t.upper(), "OTHER")
@@ -252,7 +262,6 @@ def plan_and_execute_stocks(
             + float(picked_plan["entry_price"]) * int(picked_plan["shares"])
         )
 
-        # Display differs by strategy type.
         if picked_acct in (IRA, ROTH):
             print(
                 f"  {picked_acct:<10} {tkr:<6} BUY-HOLD   "
@@ -279,7 +288,7 @@ def plan_and_execute_stocks(
 
 
 # ============================================================
-# Watchlist print (used when no entries, or market is off)
+# Watchlist display
 # ============================================================
 
 def print_watchlist(watch: List[dict]) -> None:
