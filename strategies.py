@@ -975,11 +975,12 @@ def execute_stock_plan(today: dt.date, plan: dict) -> str:
         ticker = (plan.get("ticker") or "").strip().upper()
         rows   = load_retirement_positions()
 
-        # Idempotent: same account + ticker + entry_date = already recorded
+        # Idempotent: if this account already holds this ticker, don't add again.
+        # entry_date is intentionally excluded — retirement positions are long-hold
+        # and re-enter the signal universe every day until manually closed.
         if any(
             (r.get("account") or "").strip().upper() == account
             and (r.get("ticker") or "").strip().upper() == ticker
-            and (r.get("entry_date") or "") == entry_date
             for r in rows
         ):
             return f"{account}-{ticker}-{entry_date}"
