@@ -1,3 +1,4 @@
 date,account,ticker,shares,entry_price,exit_price,close_type,pnl_abs,pnl_pct
 2026-04-24,INDIVIDUAL,MCHP,100,70.0750,74.00,CC_CALLED_AWAY,392.50,5.60
-,,TOTAL,,,,,392.50,
+2026-04-29,INDIVIDUAL,CDNS,12,336.54,318.33,STOP,-218.52,-5.41
+,,TOTAL,,,,,173.98,
