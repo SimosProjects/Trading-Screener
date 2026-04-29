@@ -1,12 +1,6 @@
 name: Daily Screener
 
 on:
-  schedule:
-    # 14:45 UTC = 10:45 AM EDT (summer) / 9:45 AM EST (winter)
-    # Runs Mon–Fri; NYSE holiday check inside the run_screener step handles
-    # actual market holidays so no trades fire on days the market is closed.
-    - cron: '45 14 * * 1-5'
-
   # Allow a manual trigger from the Actions tab for testing.
   workflow_dispatch:
 
