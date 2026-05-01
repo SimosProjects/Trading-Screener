@@ -1,0 +1,4 @@
+date,account,ticker,event_type,amount,net,notes
+2026-05-01,INDIVIDUAL,BAC,CSP_CLOSE_TP,-72.00,79.50,TP buyback — net $80
+2026-05-01,INDIVIDUAL,C,CSP_CLOSE_TP,-111.00,57.50,TP buyback — net $58
+,,NET_PREMIUM,,-183.00,,
