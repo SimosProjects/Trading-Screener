@@ -25,6 +25,7 @@ from typing import Dict, List
 import yfinance as yf
 
 from utils import get_logger, iso_week_id as _iso_week_id
+from discord_trades import alert_stock_open, alert_stock_closes
 from config import (
     ENABLE_CSP,
     INDIVIDUAL, IRA, ROTH,
@@ -212,6 +213,7 @@ def run_screener() -> None:
     ret_stops    = strat.close_retirement_stops(today)
     strat.rebuild_stock_monthly_from_trades()
     stock_closed = closes.get("stops", []) + closes.get("targets", [])
+    alert_stock_closes(today)
 
     if ret_stops.get("stopped"):
         print("\n🛑 RETIREMENT STOPS TRIGGERED")
@@ -290,6 +292,7 @@ def run_screener() -> None:
             today, entries, mkt, trading_on, retire_on, acct_mv, ret_by_key,
             regime=regime,
         )
+        alert_stock_open(stock_opened)
         if not stock_opened:
             print_watchlist(watch)
     else:
