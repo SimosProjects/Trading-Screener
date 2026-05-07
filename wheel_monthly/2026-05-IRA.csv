@@ -1,4 +1,5 @@
 date,account,ticker,event_type,amount,net,notes
 2026-05-04,IRA,CVX,CSP_OPEN,+196.50,,180.00P exp 2026-05-29
 2026-05-04,ROTH,XLE,CSP_OPEN,+172.50,,56.00P exp 2026-05-29 x3
-,,NET_PREMIUM,,+369.00,,
+2026-05-08,IRA,XLV,CSP_CLOSE_TP,-58.00,57.00,TP buyback — net $57
+,,NET_PREMIUM,,+311.00,,
