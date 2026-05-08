@@ -317,29 +317,39 @@ def is_csp_eligible(stock_row: pd.Series, *, allow_below_200: bool = False,
     if sma50 <= 0:
         return False
 
-    if CSP_MAX_STOCK_PRICE and close > float(CSP_MAX_STOCK_PRICE):
-        log.info("is_csp_eligible REJECT price: close=%.2f > max=%.2f", close, float(CSP_MAX_STOCK_PRICE))
+    price_ceiling = float(regime_val(CSP_MAX_STOCK_PRICE, regime, 350.0))
+    if price_ceiling and close > price_ceiling:
+        log.info("is_csp_eligible REJECT price: close=%.2f > max=%.2f", close, price_ceiling)
         return False
 
     if not allow_below_200:
         if sma200 <= 0:
             return False
 
-        min_slope = float(regime_val(CSP_SMA200_MIN_SLOPE, regime, -0.002))
-        if sma200_slope is not None:
-            if sma200_slope < min_slope:
-                log.info(
-                    "is_csp_eligible REJECT slope: slope=%.4f < min=%.4f (close=%.2f sma200=%.2f)",
-                    sma200_slope, min_slope, close, sma200,
-                )
-                return False
-        else:
-            if close < sma200:
-                log.info(
-                    "is_csp_eligible REJECT sma200 fallback: close=%.2f < sma200=%.2f",
-                    close, sma200,
-                )
-                return False
+    min_slope = regime_val(CSP_SMA200_MIN_SLOPE, regime, -0.002)
+    if min_slope is None:
+        # STRONG_BULL: price-relative check instead of slope.
+        # SMA200 lags recovery — require close within 5% of SMA200 (above or below).
+        if close < sma200 * 0.95:
+            log.info(
+                "is_csp_eligible REJECT price-vs-sma200: close=%.2f < sma200*0.95=%.2f",
+                close, sma200 * 0.95,
+            )
+            return False
+    elif sma200_slope is not None:
+        if sma200_slope < float(min_slope):
+            log.info(
+                "is_csp_eligible REJECT slope: slope=%.4f < min=%.4f (close=%.2f sma200=%.2f)",
+                sma200_slope, float(min_slope), close, sma200,
+            )
+            return False
+    else:
+        if close < sma200:
+            log.info(
+                "is_csp_eligible REJECT sma200 fallback: close=%.2f < sma200=%.2f",
+                close, sma200,
+            )
+            return False
 
         adx_floor = float(regime_val(CSP_MIN_ADX, regime, 15.0))
         if adx and adx < adx_floor:

@@ -533,7 +533,7 @@ CSP_MIN_PREMIUM_BALANCED = 175
 CSP_MIN_PREMIUM_AGGRESSIVE = 250
 
 CSP_SMA200_MIN_SLOPE: Dict[str, float] = {
-    "STRONG_BULL": 0.0,     # require flat-or-rising — market recovered, stricter
+    "STRONG_BULL": None,    # no slope requirement — strong uptrend, no correction yet
     "BULL":        -0.001,  # allow very slight softening
     "NEUTRAL":     -0.002,  # correction-phase tolerance (previous static value)
     "RISK_OFF":    -0.003,  # most tolerant — defensive universe already restricted
