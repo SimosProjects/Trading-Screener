@@ -1,7 +1,13 @@
 """screener_stocks.py
 
-Stock scan (pullback / breakout signals) and paper trade execution.
+Stock scan (pullback / breakout / EMA8 signals) and paper trade execution.
 All printing stays in screener_display.py.
+
+CHANGES vs original:
+  - Added EMA8_PULLBACK signal (primary for MOMENTUM/STRONG_BULL regimes)
+  - Added per-ticker rejection logging so you can see exactly why names fail
+  - Added STOCK_MAX_OPEN_POSITIONS regime-dynamic cap on simultaneous trades
+  - plan_and_execute_stocks respects the new signal type for retirement path
 """
 
 from __future__ import annotations
@@ -19,14 +25,12 @@ from config import (
     RETIREMENT_STOP_LOSS_PCT,
     RETIREMENT_DIVERSIFY_SECTORS,
     CSP_TICKER_SECTOR,
+    STOCK_MAX_OPEN_POSITIONS,
 )
 
 log = get_logger(__name__)
 
-# ── Behaviour toggles ─────────────────────────────────────────────────────────
-# Prevents the same ticker appearing in both IRA and ROTH simultaneously.
 PREVENT_DUPLICATE_RETIREMENT_TICKERS = True
-# When False: also blocks the same ticker across INDIVIDUAL vs retirement.
 ALLOW_DUPLICATE_TICKERS_ACROSS_ACCOUNTS = True
 
 
@@ -36,64 +40,153 @@ ALLOW_DUPLICATE_TICKERS_ACROSS_ACCOUNTS = True
 
 def scan_stock_entries_and_watchlist(regime: str = "BULL") -> Tuple[List[dict], List[dict]]:
     """
-    Scan STOCKS for pullback/breakout entry signals and watchlist candidates.
+    Scan STOCKS for entry signals and watchlist candidates.
 
-    Signal thresholds are regime-dynamic — passed through to strategies so the
-    same market-regime classifier drives both CSP and stock parameters.
+    Three signal types (checked in priority order):
+      1. EMA8_PULLBACK — primary in trending/momentum markets
+      2. PULLBACK      — RSI(2) oversold near EMA21
+      3. BREAKOUT      — new 20D high with volume
 
-    Returns (entries, watchlist). Each entry carries '_last' (the indicator
-    row) for use by the planning step.
+    Logs rejection reasons per ticker so you can see exactly what's failing.
     """
     entries: List[dict] = []
     watch:   List[dict] = []
 
+    rejects: Dict[str, str] = {}   # ticker -> reason string for logging
+
     for tkr in STOCKS:
         try:
             df   = strat.add_indicators(strat.download_ohlcv(tkr))
+            if df is None or df.empty:
+                rejects[tkr] = "no data"
+                continue
             last = df.iloc[-1]
 
+            # ── Eligibility gate ────────────────────────────────────────────
             if not strat.is_eligible(last, regime=regime):
+                try:
+                    close = float(last["Close"])
+                    sma50 = float(last["SMA_50"])
+                    ema21 = float(last["EMA_21"])
+                    adx   = float(last["ADX_14"])
+                    if close <= sma50:
+                        rejects[tkr] = f"close {close:.2f} <= SMA50 {sma50:.2f}"
+                    elif ema21 <= sma50:
+                        rejects[tkr] = f"EMA21 {ema21:.2f} <= SMA50 {sma50:.2f} (trend not stacked)"
+                    else:
+                        rejects[tkr] = f"ADX {adx:.1f} below floor"
+                except Exception:
+                    rejects[tkr] = "is_eligible failed"
                 continue
 
-            pb = strat.pullback_signal(last, regime=regime)
-            bo = strat.breakout_signal(last, regime=regime)
+            # ── Signal detection (priority order) ───────────────────────────
+            ema8_pb = strat.ema8_pullback_signal(last, regime=regime)
+            pb      = strat.pullback_signal(last, regime=regime)
+            bo      = strat.breakout_signal(last, regime=regime)
 
-            if pb or bo:
-                signal = "PULLBACK" if pb else "BREAKOUT"
+            if ema8_pb or pb or bo:
+                if ema8_pb:
+                    signal = "EMA8_PULLBACK"
+                elif pb:
+                    signal = "PULLBACK"
+                else:
+                    signal = "BREAKOUT"
+
                 entries.append({
                     "ticker": tkr,
                     "signal": signal,
                     "close":  float(last["Close"]),
                     "rsi2":   float(last["RSI_2"]),
+                    "rsi14":  float(last.get("RSI_14", 50)),
                     "_last":  last,
                 })
                 continue
 
-            # Watchlist: near EMA21, near 20D high, or deeply oversold RSI(2).
-            close  = float(last["Close"])
-            ema21  = float(last["EMA_21"])
-            rsi2   = float(last["RSI_2"])
-            high20 = float(last["HIGH_20"])
+            # ── No signal: log why and add to watchlist if close ─────────────
+            try:
+                close  = float(last["Close"])
+                ema8   = float(last.get("EMA_8", close))
+                ema21  = float(last["EMA_21"])
+                rsi2   = float(last["RSI_2"])
+                rsi14  = float(last.get("RSI_14", 50))
+                high20 = float(last["HIGH_20"])
+                vol    = float(last["Volume"])
+                vol_sma = float(last.get("VOL_SMA_10", 0) or 0)
 
-            near_ema      = abs(close - ema21) / max(ema21, 1e-9) <= 0.012
-            near_breakout = (high20 > 0) and (close / high20 >= 0.985)
-            oversold      = rsi2 <= 10
+                # Explain why no signal fired
+                from config import (
+                    STOCK_EMA8_BAND, STOCK_EMA8_PULLBACK_RSI14_MIN,
+                    STOCK_EMA8_PULLBACK_RSI14_MAX, STOCK_PULLBACK_RSI2_MAX,
+                    STOCK_PULLBACK_EMA_BAND, STOCK_BREAKOUT_VOL_MULT,
+                )
+                ema8_band  = float(strat.regime_val(STOCK_EMA8_BAND, regime, 0.018))
+                rsi2_max   = float(strat.regime_val(STOCK_PULLBACK_RSI2_MAX, regime, 8.0))
+                ema21_band = float(strat.regime_val(STOCK_PULLBACK_EMA_BAND, regime, 0.025))
+                vol_mult   = float(strat.regime_val(STOCK_BREAKOUT_VOL_MULT, regime, 1.2))
+                rsi14_min  = float(strat.regime_val(STOCK_EMA8_PULLBACK_RSI14_MIN, regime, 40.0))
+                rsi14_max  = float(strat.regime_val(STOCK_EMA8_PULLBACK_RSI14_MAX, regime, 70.0))
 
-            if near_ema or near_breakout or oversold:
-                watch.append({
-                    "ticker": tkr,
-                    "close":  close,
-                    "rsi2":   rsi2,
-                    "note":   ("near EMA21" if near_ema
-                               else ("near 20D high" if near_breakout
-                                     else "RSI2 oversold")),
-                })
+                pct_from_ema8 = abs(close - ema8) / max(ema8, 1e-9)
+                reasons = []
+                if pct_from_ema8 > ema8_band:
+                    reasons.append(f"EMA8: {pct_from_ema8*100:.1f}% away (need <{ema8_band*100:.1f}%)")
+                if not (rsi14_min <= rsi14 <= rsi14_max):
+                    reasons.append(f"RSI14={rsi14:.1f} (need {rsi14_min:.0f}-{rsi14_max:.0f} for EMA8)")
+                if rsi2 >= rsi2_max:
+                    reasons.append(f"RSI2={rsi2:.1f} (need <{rsi2_max:.1f} for pullback)")
+                if close < high20:
+                    vol_ok = vol_sma > 0 and vol >= vol_mult * vol_sma
+                    if not vol_ok:
+                        reasons.append(f"no breakout (below 20D high {high20:.2f}) + low vol")
+                    else:
+                        reasons.append(f"below 20D high {high20:.2f}")
+                else:
+                    vol_ok = vol_sma > 0 and vol >= vol_mult * vol_sma
+                    if not vol_ok:
+                        reasons.append(f"breakout vol too low ({vol:.0f} < {vol_mult:.1f}x {vol_sma:.0f})")
+
+                rejects[tkr] = "; ".join(reasons) if reasons else "no signal fired"
+
+                # Watchlist: near EMA8, near EMA21, near 20D high, or oversold
+                near_ema8     = pct_from_ema8 <= ema8_band * 1.5
+                near_ema21    = abs(close - ema21) / max(ema21, 1e-9) <= 0.015
+                near_breakout = high20 > 0 and close / high20 >= 0.985
+                oversold      = rsi2 <= 10
+
+                if near_ema8 or near_ema21 or near_breakout or oversold:
+                    if near_ema8:
+                        note = "near EMA8"
+                    elif near_ema21:
+                        note = "near EMA21"
+                    elif near_breakout:
+                        note = "near 20D high"
+                    else:
+                        note = "RSI2 oversold"
+                    watch.append({
+                        "ticker": tkr,
+                        "close":  close,
+                        "rsi2":   rsi2,
+                        "note":   note,
+                    })
+            except Exception as e:
+                log.warning("stock watchlist eval failed for %s: %s", tkr, e)
+
         except Exception as e:
             log.warning("stock scan failed for %s: %s", tkr, e)
             continue
 
-    entries = _dedupe(sorted(entries, key=lambda x: (x["signal"], x["rsi2"])))
-    watch   = _dedupe(sorted(watch,   key=lambda x: (x["note"],   x["rsi2"])))
+    # Log rejection summary at INFO level so it appears in the run output
+    if rejects:
+        log.info("Stock scan rejections (%d of %d tickers):", len(rejects), len(STOCKS))
+        for tkr, reason in sorted(rejects.items()):
+            log.info("  REJECT %s: %s", tkr, reason)
+
+    entries = _dedupe(sorted(entries, key=lambda x: (
+        # Priority: EMA8_PULLBACK first, then PULLBACK, then BREAKOUT
+        {"EMA8_PULLBACK": 0, "PULLBACK": 1, "BREAKOUT": 2}.get(x["signal"], 3),
+        x["rsi2"]
+    )))
+    watch = _dedupe(sorted(watch, key=lambda x: (x["note"], x["rsi2"])))
     return entries, watch
 
 
@@ -126,11 +219,8 @@ def plan_and_execute_stocks(
     """
     Plan and execute stock trades across all accounts.
 
-    INDIVIDUAL: swing trades — up to 3 per run, any signal, full STOCKS universe.
-    IRA/ROTH:   buy-and-hold — up to RETIREMENT_MAX_STOCK_POSITIONS open at once,
-                pullback only, RETIREMENT_STOCKS universe, separate per-account counter.
-
-    Modifies acct_mv in-place so each subsequent trade sees updated utilisation.
+    INDIVIDUAL: swing trades — regime-dynamic max open positions, all 3 signals.
+    IRA/ROTH:   buy-and-hold — pullback/EMA8_PULLBACK only, RETIREMENT_STOCKS only.
     """
     if not entries:
         return [], []
@@ -148,9 +238,6 @@ def plan_and_execute_stocks(
     open_any        = set().union(*open_by_acct.values())
     open_retirement = set().union(open_by_acct.get(IRA, set()), open_by_acct.get(ROTH, set()))
 
-    # Pull tickers already held in retirement_positions.csv into the dedup sets.
-    # Without this, buy-and-hold positions re-enter the signal universe every day
-    # since retirement_positions.csv is separate from stock_positions.csv.
     try:
         ret_pos_rows = strat.load_retirement_positions()
         for r in ret_pos_rows:
@@ -161,18 +248,22 @@ def plan_and_execute_stocks(
                 open_retirement.add(tkr)
                 open_any.add(tkr)
     except Exception as e:
-        log.warning("plan_and_execute_stocks: could not load retirement positions for dedup: %s", e)
+        log.warning("plan_and_execute_stocks: could not load retirement positions: %s", e)
 
-    # Count existing open positions per retirement account for the per-account cap.
-    # Includes both stock_positions.csv and retirement_positions.csv holdings.
     ret_open_count: Dict[str, int] = {
         IRA:  len(open_by_acct.get(IRA,  set())),
         ROTH: len(open_by_acct.get(ROTH, set())),
     }
 
+    # Regime-dynamic cap on simultaneous INDIVIDUAL swing positions
+    max_indiv_open = int(strat.regime_val(STOCK_MAX_OPEN_POSITIONS, regime, 3))
+    current_indiv_open = len(open_by_acct.get(INDIVIDUAL, set()))
+
     print("\n📈 STOCK ENTRIES (planned)")
-    indiv_planned  = 0
-    stock_opened:   List[str]  = []
+    print(f"   Regime: {regime} | Max open: {max_indiv_open} | Currently open: {current_indiv_open}")
+
+    indiv_planned: int   = 0
+    stock_opened:  List[str]  = []
     planned_stocks: List[dict] = []
 
     retirement_set = set(RETIREMENT_STOCKS)
@@ -182,17 +273,21 @@ def plan_and_execute_stocks(
         sig  = e["signal"]
         last = e["_last"]
 
-        # Build the ordered list of accounts to try for this entry.
+        # Check if INDIVIDUAL already at max open positions
+        indiv_at_cap = (current_indiv_open + indiv_planned) >= max_indiv_open
+
         acct_order: List[str] = []
-        if trading_on and indiv_planned < 3:
+        if trading_on and not indiv_at_cap:
             acct_order.append(INDIVIDUAL)
         if retire_on:
-            if tkr in retirement_set:
+            if tkr in retirement_set and sig in ("PULLBACK", "EMA8_PULLBACK"):
                 for acct in (IRA, ROTH):
                     if ret_open_count.get(acct, 0) < RETIREMENT_MAX_STOCK_POSITIONS:
                         acct_order.append(acct)
 
         if not acct_order:
+            if indiv_at_cap:
+                log.info("  SKIP %s: INDIVIDUAL at max open positions (%d)", tkr, max_indiv_open)
             continue
 
         picked_plan = None
@@ -204,13 +299,11 @@ def plan_and_execute_stocks(
                 and ret_by_key[f"{acct}:{tkr}"].get("flag_breakeven_only") == "1"
             )
 
-            # Dedup logic per account type.
             if acct == INDIVIDUAL:
                 existing_set = open_by_acct.get(INDIVIDUAL, set())
                 if not ALLOW_DUPLICATE_TICKERS_ACROSS_ACCOUNTS:
                     existing_set = open_any
             else:
-                # Retirement: block same ticker across both IRA and ROTH.
                 existing_set = open_retirement if PREVENT_DUPLICATE_RETIREMENT_TICKERS else open_by_acct.get(acct, set())
 
             plan = strat.plan_stock_trade(
@@ -237,11 +330,11 @@ def plan_and_execute_stocks(
         stock_opened.append(f"{picked_acct}:{tkr}")
         open_by_acct[picked_acct].add(tkr)
         open_any.add(tkr)
+
         if picked_acct in (IRA, ROTH):
             open_retirement.add(tkr)
             ret_open_count[picked_acct] = ret_open_count.get(picked_acct, 0) + 1
 
-            # Soft sector concentration warning — no hard block, human decides.
             if RETIREMENT_DIVERSIFY_SECTORS and ret_open_count[picked_acct] >= 2:
                 existing_sectors = {
                     CSP_TICKER_SECTOR.get(t.upper(), "OTHER")
@@ -251,8 +344,7 @@ def plan_and_execute_stocks(
                 new_sector = CSP_TICKER_SECTOR.get(tkr.upper(), "OTHER")
                 if new_sector != "OTHER" and new_sector in existing_sectors:
                     print(
-                        f"  ⚠️  SECTOR CONCENTRATION: [{picked_acct}] {tkr} ({new_sector}) joins "
-                        f"another {new_sector} holding — consider diversifying across sectors."
+                        f"  ⚠️  SECTOR CONCENTRATION: [{picked_acct}] {tkr} ({new_sector}) — consider diversifying."
                     )
         else:
             indiv_planned += 1
@@ -262,6 +354,9 @@ def plan_and_execute_stocks(
             + float(picked_plan["entry_price"]) * int(picked_plan["shares"])
         )
 
+        risk = (picked_plan["entry_price"] - picked_plan["stop_price"]) * int(picked_plan["shares"])
+        pos_val = picked_plan["entry_price"] * int(picked_plan["shares"])
+
         if picked_acct in (IRA, ROTH):
             print(
                 f"  {picked_acct:<10} {tkr:<6} BUY-HOLD   "
@@ -270,11 +365,13 @@ def plan_and_execute_stocks(
                 f"Stop {picked_plan['stop_price']:.2f} ({int(RETIREMENT_STOP_LOSS_PCT*100)}% below)"
             )
         else:
-            risk = (picked_plan["entry_price"] - picked_plan["stop_price"]) * int(picked_plan["shares"])
             print(
-                f"  {picked_acct:<10} {tkr:<6} {sig:<9} "
-                f"Entry {picked_plan['entry_price']:.2f} | Shares {picked_plan['shares']:<5} "
-                f"Stop {picked_plan['stop_price']:.2f} | Target {picked_plan['target_price']:.2f} | Risk ${risk:,.0f}"
+                f"  {picked_acct:<10} {tkr:<6} {sig:<14} "
+                f"Entry {picked_plan['entry_price']:.2f} | "
+                f"Shares {picked_plan['shares']:<5} (${pos_val:,.0f}) | "
+                f"Stop {picked_plan['stop_price']:.2f} | "
+                f"Target {picked_plan['target_price']:.2f} | "
+                f"Risk ${risk:,.0f}"
             )
 
         planned_stocks.append({
@@ -293,5 +390,8 @@ def plan_and_execute_stocks(
 
 def print_watchlist(watch: List[dict]) -> None:
     print("\n📋 WATCHLIST")
+    if not watch:
+        print("  (none)")
+        return
     for w in watch[:20]:
-        print(f"  {w['ticker']:<6} {w['note']:<13} Close {w['close']:.2f} | RSI2 {w['rsi2']:.1f}")
+        print(f"  {w['ticker']:<6} {w['note']:<14} Close {w['close']:.2f} | RSI2 {w['rsi2']:.1f}")
