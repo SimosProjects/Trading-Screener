@@ -34,6 +34,7 @@ from config import (
     RETIREMENT_POSITION_SIZE_PCT,
     RETIREMENT_MAX_STOCK_POSITIONS,
     RETIREMENT_STOCKS,
+    RETIREMENT_TARGET_R_MULTIPLE,
 
     # stock rules
     STOCK_REQUIRE_NEXTDAY_VALIDATION,
@@ -860,8 +861,9 @@ def plan_stock_trade(
         if shares < 1:
             return None
 
-        stop   = close * (1.0 - float(RETIREMENT_STOP_LOSS_PCT))
-        target = 0.0
+        stop     = close * (1.0 - float(RETIREMENT_STOP_LOSS_PCT))
+        risk_ps  = close - stop
+        target   = close + RETIREMENT_TARGET_R_MULTIPLE * risk_ps
 
         return {
             "account":           account,
