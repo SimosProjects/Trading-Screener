@@ -25,7 +25,6 @@ from config import (
     RETIREMENT_STOP_LOSS_PCT,
     RETIREMENT_DIVERSIFY_SECTORS,
     CSP_TICKER_SECTOR,
-    STOCK_MAX_OPEN_POSITIONS,
 )
 
 log = get_logger(__name__)
@@ -175,11 +174,18 @@ def scan_stock_entries_and_watchlist(regime: str = "BULL") -> Tuple[List[dict], 
             log.warning("stock scan failed for %s: %s", tkr, e)
             continue
 
-    # Log rejection summary at INFO level so it appears in the run output
+    # Log rejections at DEBUG (too noisy for daily terminal output).
+    # Print a single summary line so you can see the scan worked.
+    n_rejected = len(rejects)
+    n_signals  = len(entries)
+    n_watch    = len(watch)
     if rejects:
-        log.info("Stock scan rejections (%d of %d tickers):", len(rejects), len(STOCKS))
         for tkr, reason in sorted(rejects.items()):
-            log.info("  REJECT %s: %s", tkr, reason)
+            log.debug("  REJECT %s: %s", tkr, reason)
+    log.info(
+        "Stock scan: %d signals, %d watchlist, %d rejected (of %d tickers)",
+        n_signals, n_watch, n_rejected, len(STOCKS),
+    )
 
     entries = _dedupe(sorted(entries, key=lambda x: (
         # Priority: EMA8_PULLBACK first, then PULLBACK, then BREAKOUT
@@ -219,7 +225,8 @@ def plan_and_execute_stocks(
     """
     Plan and execute stock trades across all accounts.
 
-    INDIVIDUAL: swing trades — regime-dynamic max open positions, all 3 signals.
+    INDIVIDUAL: swing trades — no position count cap; every signal gets a plan.
+                You decide which to take. Risk-based sizing keeps each trade safe.
     IRA/ROTH:   buy-and-hold — pullback/EMA8_PULLBACK only, RETIREMENT_STOCKS only.
     """
     if not entries:
@@ -255,17 +262,13 @@ def plan_and_execute_stocks(
         ROTH: len(open_by_acct.get(ROTH, set())),
     }
 
-    # Regime-dynamic cap on simultaneous INDIVIDUAL swing positions
-    max_indiv_open = int(strat.regime_val(STOCK_MAX_OPEN_POSITIONS, regime, 3))
-    current_indiv_open = len(open_by_acct.get(INDIVIDUAL, set()))
+    print(f"\n📈 STOCK ENTRIES  (regime: {regime})")
+    print(f"   {'Ticker':<6}  {'Signal':<14}  {'Entry':>7}  {'Stop':>7}  {'Target':>7}  "
+          f"{'Shares':>6}  {'Value':>7}  {'Risk':>6}")
+    print(f"   {'─'*6}  {'─'*14}  {'─'*7}  {'─'*7}  {'─'*7}  {'─'*6}  {'─'*7}  {'─'*6}")
 
-    print("\n📈 STOCK ENTRIES (planned)")
-    print(f"   Regime: {regime} | Max open: {max_indiv_open} | Currently open: {current_indiv_open}")
-
-    indiv_planned: int   = 0
-    stock_opened:  List[str]  = []
+    stock_opened:   List[str]  = []
     planned_stocks: List[dict] = []
-
     retirement_set = set(RETIREMENT_STOCKS)
 
     for e in entries:
@@ -273,11 +276,8 @@ def plan_and_execute_stocks(
         sig  = e["signal"]
         last = e["_last"]
 
-        # Check if INDIVIDUAL already at max open positions
-        indiv_at_cap = (current_indiv_open + indiv_planned) >= max_indiv_open
-
         acct_order: List[str] = []
-        if trading_on and not indiv_at_cap:
+        if trading_on:
             acct_order.append(INDIVIDUAL)
         if retire_on:
             if tkr in retirement_set and sig in ("PULLBACK", "EMA8_PULLBACK"):
@@ -286,8 +286,6 @@ def plan_and_execute_stocks(
                         acct_order.append(acct)
 
         if not acct_order:
-            if indiv_at_cap:
-                log.info("  SKIP %s: INDIVIDUAL at max open positions (%d)", tkr, max_indiv_open)
             continue
 
         picked_plan = None
@@ -343,42 +341,50 @@ def plan_and_execute_stocks(
                 }
                 new_sector = CSP_TICKER_SECTOR.get(tkr.upper(), "OTHER")
                 if new_sector != "OTHER" and new_sector in existing_sectors:
-                    print(
-                        f"  ⚠️  SECTOR CONCENTRATION: [{picked_acct}] {tkr} ({new_sector}) — consider diversifying."
-                    )
+                    log.warning("Sector concentration: [%s] %s (%s) — consider diversifying.",
+                                picked_acct, tkr, new_sector)
         else:
-            indiv_planned += 1
+            acct_mv[picked_acct] = (
+                float(acct_mv.get(picked_acct, 0.0))
+                + float(picked_plan["entry_price"]) * int(picked_plan["shares"])
+            )
 
-        acct_mv[picked_acct] = (
-            float(acct_mv.get(picked_acct, 0.0))
-            + float(picked_plan["entry_price"]) * int(picked_plan["shares"])
-        )
-
-        risk = (picked_plan["entry_price"] - picked_plan["stop_price"]) * int(picked_plan["shares"])
-        pos_val = picked_plan["entry_price"] * int(picked_plan["shares"])
+        risk_dollars = (picked_plan["entry_price"] - picked_plan["stop_price"]) * int(picked_plan["shares"])
+        pos_value    = picked_plan["entry_price"] * int(picked_plan["shares"])
 
         if picked_acct in (IRA, ROTH):
             print(
-                f"  {picked_acct:<10} {tkr:<6} BUY-HOLD   "
-                f"Entry {picked_plan['entry_price']:.2f} | "
-                f"Shares {picked_plan['shares']:<4} | "
-                f"Stop {picked_plan['stop_price']:.2f} ({int(RETIREMENT_STOP_LOSS_PCT*100)}% below)"
+                f"   {tkr:<6}  {'BUY-HOLD':<14}  "
+                f"{picked_plan['entry_price']:>7.2f}  "
+                f"{picked_plan['stop_price']:>7.2f}  "
+                f"{'—':>7}  "
+                f"{picked_plan['shares']:>6}  "
+                f"${pos_value:>6,.0f}  "
+                f"{'35% stop'}"
             )
         else:
+            upside_pct = (picked_plan['target_price'] - picked_plan['entry_price']) / picked_plan['entry_price'] * 100
             print(
-                f"  {picked_acct:<10} {tkr:<6} {sig:<14} "
-                f"Entry {picked_plan['entry_price']:.2f} | "
-                f"Shares {picked_plan['shares']:<5} (${pos_val:,.0f}) | "
-                f"Stop {picked_plan['stop_price']:.2f} | "
-                f"Target {picked_plan['target_price']:.2f} | "
-                f"Risk ${risk:,.0f}"
+                f"   {tkr:<6}  {sig:<14}  "
+                f"{picked_plan['entry_price']:>7.2f}  "
+                f"{picked_plan['stop_price']:>7.2f}  "
+                f"{picked_plan['target_price']:>7.2f}  "
+                f"{picked_plan['shares']:>6}  "
+                f"${pos_value:>6,.0f}  "
+                f"${risk_dollars:>5,.0f}"
+                f"  (+{upside_pct:.1f}% tgt)"
             )
 
         planned_stocks.append({
-            "ticker":      tkr,
-            "signal":      sig,
-            "account":     picked_acct,
-            "entry_price": float(picked_plan["entry_price"]),
+            "ticker":       tkr,
+            "signal":       sig,
+            "account":      picked_acct,
+            "entry_price":  float(picked_plan["entry_price"]),
+            "stop_price":   float(picked_plan["stop_price"]),
+            "target_price": float(picked_plan["target_price"]),
+            "shares":       int(picked_plan["shares"]),
+            "pos_value":    float(pos_value),
+            "risk_dollars": float(risk_dollars),
         })
 
     return stock_opened, planned_stocks

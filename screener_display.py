@@ -309,18 +309,33 @@ def build_discord_alert(
             else:
                 closed_fmt.append(s)
         maint.append(f"📉 Closed: {', '.join(closed_fmt)}")
-    if stock_opens:
-        opened_fmt = []
-        for s in stock_opens[:6]:
-            if ":" in s:
-                acct_raw, tkr = s.split(":", 1)
-                opened_fmt.append(f"{tkr} [{_ACCT_LABEL.get(acct_raw.strip().upper(), acct_raw)}]")
-            else:
-                opened_fmt.append(s)
-        maint.append(f"📈 Opened: {', '.join(opened_fmt)}")
     if maint:
         lines.append("— Events —")
         lines.extend(maint)
+
+    # --- New stock trades (detailed, separate from maint) ---
+    if planned_stocks:
+        lines.append("📈 NEW TRADES")
+        for p in planned_stocks[:12]:
+            acct     = _ACCT_LABEL.get((p.get("account") or INDIVIDUAL).strip().upper(), "?")
+            tkr      = p.get("ticker", "?")
+            sig      = p.get("signal", "")
+            entry    = float(p.get("entry_price", 0))
+            stop     = float(p.get("stop_price", 0))
+            tgt      = float(p.get("target_price", 0))
+            shares   = int(p.get("shares", 0))
+            pos_val  = float(p.get("pos_value", 0))
+            risk     = float(p.get("risk_dollars", 0))
+            upside   = (tgt - entry) / entry * 100 if entry > 0 and tgt > 0 else 0.0
+            stop_pct = (entry - stop) / entry * 100 if entry > 0 and stop > 0 else 0.0
+            sig_short = {"EMA8_PULLBACK": "EMA8pb", "PULLBACK": "PB", "BREAKOUT": "BO"}.get(sig, sig)
+            lines.append(
+                f"  [{acct}] {tkr} {sig_short} | "
+                f"{shares}sh @${entry:.2f} = ${pos_val:,.0f} | "
+                f"stop ${stop:.2f} (-{stop_pct:.1f}%) | "
+                f"tgt ${tgt:.2f} (+{upside:.1f}%) | "
+                f"risk ${risk:,.0f}"
+            )
 
     # --- New CSPs ---
     if new_csps:

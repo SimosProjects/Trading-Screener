@@ -38,8 +38,8 @@ from config import (
 
     # stock rules
     STOCK_REQUIRE_NEXTDAY_VALIDATION,
-    STOCK_MAX_POSITION_PCT,
-    STOCK_MAX_OPEN_POSITIONS,
+    STOCK_RISK_PER_TRADE,
+    STOCK_MAX_POSITION_VALUE,
     STOCK_TARGET_R_MULTIPLE,
     STOCK_BREAKEVEN_AFTER_R,
     STOCK_USE_BREAKEVEN_TRAIL,
@@ -856,42 +856,76 @@ def plan_stock_trade(
     if not nextday_valid_for_entry(signal, last):
         return None
 
+    # Pull extra indicators for technical targets
+    try:
+        sma50  = float(last.get("SMA_50", 0) or 0)
+        high52w = float(last.get("HIGH_52W", 0) or 0)
+    except Exception:
+        sma50 = 0.0; high52w = 0.0
+
+    # ── Stops ────────────────────────────────────────────────────────────────
     if signal == "EMA8_PULLBACK":
         stop    = ema8 - (STOCK_STOP_ATR_EMA8 * atr) if atr > 0 else ema8 * 0.97
         risk_ps = max(close - stop, 0.01)
-        target  = close + STOCK_TARGET_R_MULTIPLE * risk_ps
     elif signal == "PULLBACK":
         stop    = ema21 - (STOCK_STOP_ATR_PULLBACK * atr) if atr > 0 else ema21 * 0.97
         risk_ps = max(close - stop, 0.01)
-        target  = max(high20, close + STOCK_TARGET_R_MULTIPLE * risk_ps)
     else:  # BREAKOUT
         stop    = high20 - (STOCK_STOP_ATR_BREAKOUT * atr) if atr > 0 else high20 * 0.96
         risk_ps = max(close - stop, 0.01)
-        target  = close + STOCK_TARGET_R_MULTIPLE * risk_ps
 
-    acct_size = float(INDIVIDUAL_STOCK_CAP)
-    if acct_size <= 0:
-        return None
+    # ── Technically-grounded targets ─────────────────────────────────────────
+    # Base target: 2R minimum — never set a target that doesn't pay for the risk.
+    base_target = close + STOCK_TARGET_R_MULTIPLE * risk_ps
 
-    max_pos_pct      = float(regime_val(STOCK_MAX_POSITION_PCT, regime, 0.20))
-    max_pos_value    = acct_size * max_pos_pct
-    remaining_value  = max(acct_size - float(acct_current_mv or 0.0), 0.0)
-    value_cap_shares = int(max_pos_value / close)
-    remaining_shares = int(remaining_value / close)
+    if signal == "EMA8_PULLBACK":
+        # Thesis: riding the trend; 20D high is the last swing resistance
+        # the stock pulled back from — natural first take-profit level.
+        target = max(high20, base_target)
 
-    if value_cap_shares < 1 or remaining_shares < 1:
-        return None
+    elif signal == "PULLBACK":
+        # Thesis: oversold bounce off EMA21 back toward prior highs.
+        # Same as above — 20D high is the obvious target.
+        target = max(high20, base_target)
 
-    shares       = min(value_cap_shares, remaining_shares)
+    else:  # BREAKOUT
+        # Thesis: price breaking above 20D high = momentum continuation.
+        # Next resistance: SMA50 if it's above price (first moving average
+        # to test), otherwise the 52W high (clear air to annual highs),
+        # otherwise pure 2R (already at/above 52W high — use R-multiple).
+        if sma50 > close:
+            next_res = sma50
+        elif high52w > close:
+            next_res = high52w
+        else:
+            next_res = 0.0
+        target = max(next_res, base_target) if next_res > close else base_target
+
+    # ── Risk-based position sizing ────────────────────────────────────────────
+    # shares = dollars_to_risk / risk_per_share
+    # Volatile names (wide ATR stop) get fewer shares automatically.
+    # STOCK_MAX_POSITION_VALUE caps the notional so a freakishly tight stop
+    # doesn't produce an oversized position.
+    risk_shares  = int(STOCK_RISK_PER_TRADE / risk_ps) if risk_ps > 0 else 1
+    value_shares = int(STOCK_MAX_POSITION_VALUE / close) if close > 0 else 1
+    shares       = max(min(risk_shares, value_shares), 1)
     risk_dollars = risk_ps * shares
+    pos_value    = close * shares
+    upside_pct   = (target - close) / close * 100
+    stop_pct     = (close - stop) / close * 100
 
     return {
         "account": account, "ticker": ticker, "signal": signal,
-        "entry_price": float(close), "stop_price": float(stop),
-        "target_price": float(target), "shares": int(shares),
-        "risk_per_share": float(risk_ps), "r_multiple_target": float(STOCK_TARGET_R_MULTIPLE),
-        "notes": (f"{signal} | max_pos=${max_pos_value:,.0f} ({max_pos_pct*100:.0f}% of ${acct_size:,.0f}) "
-                  f"| risk=${risk_dollars:,.0f} ({risk_ps:.2f}/sh) | regime={regime}"),
+        "entry_price":       float(close),
+        "stop_price":        float(stop),
+        "target_price":      float(target),
+        "shares":            int(shares),
+        "risk_per_share":    float(risk_ps),
+        "r_multiple_target": float(STOCK_TARGET_R_MULTIPLE),
+        "notes": (f"{signal} | {shares}sh @${close:.2f} = ${pos_value:,.0f} "
+                  f"| stop ${stop:.2f} (-{stop_pct:.1f}%) "
+                  f"| tgt ${target:.2f} (+{upside_pct:.1f}%) "
+                  f"| risk ${risk_dollars:,.0f} (${risk_ps:.2f}/sh) | regime={regime}"),
     }
 
 

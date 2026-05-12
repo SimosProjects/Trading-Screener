@@ -106,10 +106,10 @@ RETIREMENT_STOCK_CAPS: Dict[str, int] = {
     ROTH: int(ACCOUNT_SIZES[ROTH] * RETIREMENT_STOCK_CAP_PCT),
 }
 
-RETIREMENT_MAX_EQUITY_UTIL_PCT  = 0.98
+RETIREMENT_MAX_EQUITY_UTIL_PCT   = 0.98
 RETIREMENT_BREAKEVEN_ONLY_DD_PCT = 0.10
 RETIREMENT_STOP_LOSS_PCT         = 0.35
-RETIREMENT_TARGET_R_MULTIPLE     = 1.5
+RETIREMENT_TARGET_R_MULTIPLE     = 1.5   # target = entry + 1.5 × risk_per_share
 
 # ---- Retirement buy-and-hold ----
 RETIREMENT_POSITION_SIZE_PCT   = 0.50
@@ -145,28 +145,30 @@ RETIREMENT_STOCK_YIELDS: Dict[str, float] = {
 # EOD-based signals; entries filled at next open.
 STOCK_REQUIRE_NEXTDAY_VALIDATION = True
 
-# ── Position sizing ──────────────────────────────────────────────────────────
-# No fixed risk %; sizing is purely proportional to account slice and regime.
-# Max position = INDIVIDUAL_STOCK_CAP * STOCK_MAX_POSITION_PCT.
-# You decide whether a name is too expensive — no artificial price cap.
+# ── Position sizing — risk-based ─────────────────────────────────────────────
+# Shares = floor(STOCK_RISK_PER_TRADE / risk_per_share)
+# This means volatile names get fewer shares automatically, tight setups get more.
+# Example: $500 risk, ATR stop = $5/sh → 100 shares.
+#          $500 risk, ATR stop = $1/sh → 500 shares.
 #
-# With $36K stock slice and 25% max = $9K max per swing trade.
-# At $200/sh that's 45 shares — meaningful exposure.
-STOCK_MAX_POSITION_PCT: Dict[str, float] = {
-    "MOMENTUM":    0.30,   # 30% of slice = ~$10.8K — high-octane market, size up
-    "STRONG_BULL": 0.25,   # 25% = ~$9K
-    "BULL":        0.20,   # 20% = ~$7.2K
-    "NEUTRAL":     0.15,   # 15% = ~$5.4K — tighten in uncertain conditions
-    "RISK_OFF":    0.10,   # 10% = ~$3.6K — capital preservation mode
-}
+# No position count cap — every signal that fires gets alerted. You decide
+# whether to take it. The algo's job is to find technically sound setups;
+# your job is to filter by conviction.
+#
+# STOCK_MAX_POSITION_VALUE is a hard ceiling per trade so a freak tight-stop
+# name (e.g. $0.10/sh risk) doesn't produce 5000-share positions.
+STOCK_RISK_PER_TRADE     = 750.0    # max dollars to lose if stopped out
+STOCK_MAX_POSITION_VALUE = 10_000.0 # hard ceiling on notional value per trade
 
-# Max simultaneous open swing positions (prevents overconcentration).
+# ── Backward-compat stubs ────────────────────────────────────────────────────
+# Older versions of strategies.py imported these; kept so mixed-state deploys
+# don't error. New sizing is purely risk-based (STOCK_RISK_PER_TRADE above).
+STOCK_MAX_POSITION_PCT: Dict[str, float] = {
+    "MOMENTUM": 0.30, "STRONG_BULL": 0.25, "BULL": 0.20,
+    "NEUTRAL": 0.15,  "RISK_OFF": 0.10,
+}
 STOCK_MAX_OPEN_POSITIONS: Dict[str, int] = {
-    "MOMENTUM":    5,
-    "STRONG_BULL": 4,
-    "BULL":        3,
-    "NEUTRAL":     2,
-    "RISK_OFF":    1,
+    "MOMENTUM": 5, "STRONG_BULL": 4, "BULL": 3, "NEUTRAL": 2, "RISK_OFF": 1,
 }
 
 # Targets / exits

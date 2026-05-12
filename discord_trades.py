@@ -128,7 +128,7 @@ def alert_stock_open(stock_opened: List[str]) -> None:
             msg += f" PT {target:.2f}"
 
         _send(msg)
-        log.info("discord_trades: %s", msg)
+        log.debug("discord_trades: %s", msg)
 
 
 def alert_stock_closes(today: dt.date) -> None:
@@ -188,4 +188,4 @@ def alert_stock_closes(today: dt.date) -> None:
 
         msg = f"STC {tkr} @ {exit_price:.2f}"
         _send(msg)
-        log.info("discord_trades: %s", msg)
+        log.debug("discord_trades: %s", msg)
