@@ -263,9 +263,9 @@ def plan_and_execute_stocks(
     }
 
     print(f"\n📈 STOCK ENTRIES  (regime: {regime})")
-    print(f"   {'Ticker':<6}  {'Signal':<14}  {'Entry':>7}  {'Stop':>7}  {'Target':>7}  "
+    print(f"   {'Ticker':<6}  {'Signal':<14}  {'Entry':>7}  {'Stop':>13}  {'Target':>7}  "
           f"{'Shares':>6}  {'Value':>7}  {'Risk':>6}")
-    print(f"   {'─'*6}  {'─'*14}  {'─'*7}  {'─'*7}  {'─'*7}  {'─'*6}  {'─'*7}  {'─'*6}")
+    print(f"   {'─'*6}  {'─'*14}  {'─'*7}  {'─'*13}  {'─'*7}  {'─'*6}  {'─'*7}  {'─'*6}")
 
     stock_opened:   List[str]  = []
     planned_stocks: List[dict] = []
@@ -364,10 +364,17 @@ def plan_and_execute_stocks(
             )
         else:
             upside_pct = (picked_plan['target_price'] - picked_plan['entry_price']) / picked_plan['entry_price'] * 100
+            stop_type  = picked_plan.get("stop_type", "FIXED")
+            trail_dist = picked_plan['entry_price'] - picked_plan['stop_price']
+            # Compact stop label: "263.39 T-1.97" for trailing, "263.39" for fixed
+            if stop_type == "TRAIL_EMA8":
+                stop_str = f"{picked_plan['stop_price']:>7.2f} T-{trail_dist:.2f}"
+            else:
+                stop_str = f"{picked_plan['stop_price']:>7.2f}      "
             print(
                 f"   {tkr:<6}  {sig:<14}  "
                 f"{picked_plan['entry_price']:>7.2f}  "
-                f"{picked_plan['stop_price']:>7.2f}  "
+                f"{stop_str}  "
                 f"{picked_plan['target_price']:>7.2f}  "
                 f"{picked_plan['shares']:>6}  "
                 f"${pos_value:>6,.0f}  "
@@ -385,6 +392,7 @@ def plan_and_execute_stocks(
             "shares":       int(picked_plan["shares"]),
             "pos_value":    float(pos_value),
             "risk_dollars": float(risk_dollars),
+            "stop_type":    picked_plan.get("stop_type", "FIXED"),
         })
 
     return stock_opened, planned_stocks
