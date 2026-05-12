@@ -9,6 +9,13 @@
 
 set -euo pipefail
 
+# Load local env vars if .env exists
+if [[ -f ".env" ]]; then
+    set -a
+    source .env
+    set +a
+fi
+
 # ── Colours for terminal output ──────────────────────────────────────────────
 RED='\033[0;31m'
 YELLOW='\033[1;33m'

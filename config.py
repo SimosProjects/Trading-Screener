@@ -28,8 +28,13 @@ REGIME_VIX_STRONG_BULL = 18.0   # VIX below this = calm/recovering market
 REGIME_VIX_BULL        = 22.0   # VIX below this = normal healthy market
 REGIME_VIX_NEUTRAL     = 25.0   # VIX below this = elevated but manageable
 
-# ---- Discord Webhook ---- #
-WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
+# ---- Discord Webhooks ---- #
+# Three channels — set each as a GitHub Actions / local env var.
+# Leave a channel's env var unset to skip posting to it.
+WEBHOOK_URL         = os.environ.get("DISCORD_WEBHOOK_URL", "")          # legacy / fallback
+WEBHOOK_MARKET_URL  = os.environ.get("DISCORD_MARKET_WEBHOOK_URL", "")   # #screener-market
+WEBHOOK_STOCKS_URL  = os.environ.get("DISCORD_STOCKS_WEBHOOK_URL", "")   # #screener-stocks
+WEBHOOK_OPTIONS_URL = os.environ.get("DISCORD_OPTIONS_WEBHOOK_URL", "")  # #screener-options
 
 # ---- Files ---- #
 STOCK_POSITIONS_FILE = "stock_positions.csv"

@@ -45,7 +45,12 @@ from screener_display import (
     print_open_cc_roll_candidates,
     print_csp_roll_candidates,
     print_final_exposure_summary,
-    build_discord_alert,
+    build_market_alert,
+    build_stocks_alert,
+    build_options_alert,
+    send_market_alert,
+    send_stocks_alert,
+    send_options_alert,
     send_discord,
 )
 from screener_positions import (
@@ -469,28 +474,44 @@ def run_screener() -> None:
     )
     print_final_exposure_summary(today, ret_by_key, ret_flagged, mv_stock_final, wheel_mv_final)
 
-    # ── 12. Discord alert ────────────────────────────────────────
-    alert = build_discord_alert(
+    # ── 12. Discord alerts (three channels) ─────────────────────────────────
+    # #screener-market — always posts
+    send_market_alert(build_market_alert(
         mkt=mkt,
         trading_on=trading_on,
+        retire_on=retire_on,
+        ret_by_key=ret_by_key,
+        mv_stock=mv_stock_final,
+        wheel_mv=wheel_mv_final,
+    ))
+
+    # #screener-stocks — only posts when there is something to show
+    stocks_msg = build_stocks_alert(
+        planned_stocks=planned_stocks,
+        stock_closes=stock_closed,
+        ret_stopped=ret_stops.get("stopped", []),
+        ret_targets=ret_stops.get("targets", []),
+        watch=watch,
+        regime=regime,
+    )
+    if stocks_msg:
+        send_stocks_alert(stocks_msg)
+
+    # #screener-options — only posts when there is something to show
+    options_msg = build_options_alert(
         new_csps=new_csp_orders,
         new_ccs=new_cc_orders,
-        planned_stocks=planned_stocks,
-        watch=watch,
         csp_tp=[c["summary"] for c in csp_tp_out.get("closed", [])],
         cc_tp=[c["summary"] for c in cc_tp_out.get("closed", [])],
         csp_exp=csp_out.get("expired", []),
         csp_asn=csp_out.get("assigned", []),
         cc_exp=cc_out.get("expired", []),
         cc_call=cc_out.get("called_away", []),
-        stock_opens=stock_opened,
-        stock_closes=stock_closed,
-        ret_stopped=ret_stops.get("stopped", []),
-        ret_targets=ret_stops.get("targets", []),
         early_asn=early_asn_out.get("assigned", []) + early_asn_out.get("warned", []),
         csp_roll=csp_roll_candidates,
     )
-    send_discord(alert)
+    if options_msg:
+        send_options_alert(options_msg)
 
     print("\n✅ Screener run complete.")
 

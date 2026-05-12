@@ -17,6 +17,9 @@ from config import (
     RETIREMENT_STOCK_CAPS,
     RETIREMENT_STOCK_YIELDS,
     WEBHOOK_URL,
+    WEBHOOK_MARKET_URL,
+    WEBHOOK_STOCKS_URL,
+    WEBHOOK_OPTIONS_URL,
     CSP_RISK_OFF_VIX,
     CSP_STRIKE_BASE_NORMAL, CSP_STRIKE_BASE_RISK_OFF,
     CSP_RISK_OFF_MIN_OTM_PCT_DEFENSIVE,
@@ -34,20 +37,24 @@ _ACCT_LABEL = {INDIVIDUAL: "INDV", IRA: "IRA", ROTH: "ROTH"}
 
 
 # ============================================================
-# Discord
+# Discord helpers
 # ============================================================
 
-def send_discord(msg: str) -> None:
-    if not WEBHOOK_URL or not WEBHOOK_URL.strip():
-        return
-    url = WEBHOOK_URL.strip()
-    if not url.startswith("http"):
+def _send(url: str, msg: str) -> None:
+    """Post msg to a Discord webhook URL. Silently skips if no URL is set."""
+    url = (url or "").strip()
+    if not url or not url.startswith("http"):
         return
     try:
         import requests
         requests.post(url, json={"content": msg[:1990]}, timeout=10)
     except Exception as e:
-        log.warning("Discord send failed: %s", e)
+        log.warning("Discord send failed (%s): %s", url[:40], e)
+
+
+def send_discord(msg: str) -> None:
+    """Legacy single-channel send — posts to WEBHOOK_URL if set."""
+    _send(WEBHOOK_URL, msg)
 
 
 def _spy_ma_flags(mkt: Dict) -> str:
@@ -70,6 +77,392 @@ def _vix_emoji(mkt: Dict) -> str:
     if vix < 25:
         return "🟡"
     return "🔴"
+
+
+# ============================================================
+# Three-channel Discord alert builders
+# ============================================================
+
+def build_market_alert(mkt: Dict, trading_on: bool, retire_on: bool,
+                       ret_by_key: dict, mv_stock: Dict[str, float],
+                       wheel_mv: float) -> str:
+    """
+    #screener-market — regime, holdings P/L, wheel exposure.
+    Posts every run regardless of trading activity.
+    """
+    today = dt.date.today()
+    lines: List[str] = []
+
+    # Header
+    spy_flags = _spy_ma_flags(mkt)
+    qqq_flag  = "✅50" if mkt.get("qqq_above_50") else "❌50"
+    vix_emoji = _vix_emoji(mkt)
+    regime_emoji = {"MOMENTUM": "🚀", "STRONG_BULL": "🐂", "BULL": "📈",
+                    "NEUTRAL": "😐", "RISK_OFF": "🛡️"}.get(
+                        mkt.get("regime", ""), "📊")
+    lines.append(f"📅 {today.isoformat()}  {regime_emoji} {mkt.get('regime', 'UNKNOWN')}")
+    lines.append(
+        f"SPY {mkt['spy_close']:.2f} {spy_flags} | "
+        f"QQQ {mkt['qqq_close']:.2f} {qqq_flag} | "
+        f"VIX {mkt['vix_close']:.2f} {vix_emoji}"
+    )
+    t_flag = "🟢" if trading_on else "🔴"
+    r_flag = "🟢" if retire_on else "🔴"
+    lines.append(f"{t_flag} Swing {'ON' if trading_on else 'OFF'}  {r_flag} Retire {'ON' if retire_on else 'OFF'}")
+
+    # Holdings P/L
+    try:
+        stock_rows = strat.load_csv_rows(strat.STOCK_POSITIONS_FILE)
+        open_rows  = [r for r in stock_rows if (r.get("status") or "").upper() == "OPEN"]
+        import sys as _sys
+        _whl     = _sys.modules.get("wheel")
+        lot_rows = _whl.get_open_lots() if _whl else []
+        ret_rows = strat.load_retirement_positions()
+
+        all_tkrs = list({
+            (r.get("ticker") or "").strip().upper()
+            for r in open_rows + lot_rows + ret_rows
+            if (r.get("ticker") or "").strip()
+        })
+        px_live = strat.live_prices(all_tkrs) if all_tkrs else {}
+
+        # Build per-account buckets
+        buckets: Dict[str, list] = {}
+        for r in open_rows:
+            tkr   = (r.get("ticker") or "").strip().upper()
+            acct  = (r.get("account") or INDIVIDUAL).strip().upper()
+            sh    = float(r.get("shares") or 0)
+            entry = float(r.get("entry_price") or 0)
+            cur   = px_live.get(tkr, 0.0)
+            stop  = float(r.get("stop_price") or 0)
+            stop_type = (r.get("stop_type") or "FIXED").upper()
+            trail_tag = " 🔄" if stop_type == "TRAIL_EMA8" else ""
+            pnl   = (cur - entry) * sh if cur > 0 else 0.0
+            pct   = (cur - entry) / entry * 100 if entry > 0 and cur > 0 else 0.0
+            buckets.setdefault(acct, []).append(
+                {"tkr": tkr, "sh": sh, "entry": entry, "cur": cur,
+                 "stop": stop, "pnl": pnl, "pct": pct,
+                 "src": "SWING", "trail": trail_tag})
+        for lot in lot_rows:
+            tkr   = (lot.get("ticker") or "").strip().upper()
+            acct  = (lot.get("account") or INDIVIDUAL).strip().upper()
+            sh    = float(lot.get("shares") or 0)
+            cb    = float(lot.get("cost_basis") or 0)
+            entry = cb / sh if sh > 0 else 0.0
+            cur   = px_live.get(tkr, 0.0)
+            pnl   = (cur * sh - cb) if cur > 0 and sh > 0 and cb > 0 else 0.0
+            pct   = (cur - entry) / entry * 100 if entry > 0 and cur > 0 else 0.0
+            buckets.setdefault(acct, []).append(
+                {"tkr": tkr, "sh": sh, "entry": entry, "cur": cur,
+                 "stop": 0.0, "pnl": pnl, "pct": pct, "src": "WHEEL", "trail": ""})
+        for r in ret_rows:
+            tkr   = (r.get("ticker") or "").strip().upper()
+            acct  = (r.get("account") or "").strip().upper()
+            sh    = float(r.get("shares") or 0)
+            entry = float(r.get("entry_price") or 0)
+            cur   = px_live.get(tkr, float(r.get("current_price") or 0))
+            pnl   = (cur - entry) * sh if cur > 0 else 0.0
+            pct   = (cur - entry) / entry * 100 if entry > 0 and cur > 0 else 0.0
+            buckets.setdefault(acct, []).append(
+                {"tkr": tkr, "sh": sh, "entry": entry, "cur": cur,
+                 "stop": 0.0, "pnl": pnl, "pct": pct, "src": "RETIRE", "trail": ""})
+
+        if buckets:
+            lines.append("📌 HOLDINGS")
+            for acct in (INDIVIDUAL, IRA, ROTH):
+                rows = buckets.get(acct)
+                if not rows:
+                    continue
+                acct_mv  = sum(r["cur"] * r["sh"] for r in rows if r["cur"] > 0)
+                acct_pnl = sum(r["pnl"] for r in rows)
+                sign     = "+" if acct_pnl >= 0 else ""
+                lines.append(f"{_ACCT_LABEL[acct]} MV ${acct_mv:,.0f} | P/L {sign}${acct_pnl:,.0f}")
+                for r in rows:
+                    tag  = f"[{r['src'][0]}]"   # [S]wing [W]heel [R]etire
+                    if r["cur"] <= 0:
+                        lines.append(f"  {r['tkr']:<5} {r['sh']:.0f}sh @{r['entry']:.2f} — n/a {tag}")
+                    else:
+                        sign2 = "+" if r["pnl"] >= 0 else ""
+                        stop_str = f" stop ${r['stop']:.2f}{r['trail']}" if r["stop"] > 0 else ""
+                        lines.append(
+                            f"  {r['tkr']:<5} {r['sh']:.0f}sh "
+                            f"@{r['entry']:.2f}→{r['cur']:.2f} "
+                            f"{sign2}${r['pnl']:,.0f} ({sign2}{r['pct']:.1f}%)"
+                            f"{stop_str} {tag}"
+                        )
+    except Exception as e:
+        log.warning("Market alert holdings block failed: %s", e)
+
+    # Wheel exposure
+    lines.append("💼 EXPOSURE")
+    try:
+        for acct in (INDIVIDUAL, IRA, ROTH):
+            label = _ACCT_LABEL[acct]
+            exp   = compute_wheel_exposure(today, acct)
+            rem   = compute_week_remaining(today, acct)
+            lines.append(
+                f"  {label} Whl ${exp['total_exposure']:,.0f}/${exp['cap']:,.0f} "
+                f"wk rem ${rem:,.0f}"
+            )
+    except Exception as e:
+        log.warning("Market alert exposure block failed: %s", e)
+
+    return "\n".join(lines)
+
+
+def build_stocks_alert(
+    planned_stocks: List[dict],
+    stock_closes: List[str],
+    ret_stopped: List[str],
+    ret_targets: List[str],
+    watch: List[dict],
+    regime: str = "",
+) -> str:
+    """
+    #screener-stocks — new trades, closes, watchlist.
+    Returns empty string if nothing to report.
+    """
+    today = dt.date.today()
+    lines: List[str] = []
+
+    has_content = bool(planned_stocks or stock_closes or ret_stopped or ret_targets)
+    if not has_content and not watch:
+        return ""
+
+    lines.append(f"📈 STOCKS — {today.isoformat()}" + (f"  [{regime}]" if regime else ""))
+
+    # Closes / stops first (most urgent)
+    if ret_stopped:
+        lines.append(f"🛑 Retirement stops: {', '.join(ret_stopped)}")
+    if ret_targets:
+        lines.append(f"✅ Retirement targets: {', '.join(ret_targets)}")
+    if stock_closes:
+        closed_fmt = []
+        for s in stock_closes:
+            if ":" in s:
+                acct_raw, tkr = s.split(":", 1)
+                closed_fmt.append(f"{tkr} [{_ACCT_LABEL.get(acct_raw.strip().upper(), acct_raw)}]")
+            else:
+                closed_fmt.append(s)
+        lines.append(f"📉 Closed: {', '.join(closed_fmt)}")
+
+    # New trades
+    if planned_stocks:
+        lines.append("🆕 NEW TRADES")
+        for p in planned_stocks:
+            acct      = _ACCT_LABEL.get((p.get("account") or INDIVIDUAL).strip().upper(), "?")
+            tkr       = p.get("ticker", "?")
+            sig       = p.get("signal", "")
+            entry     = float(p.get("entry_price", 0))
+            stop      = float(p.get("stop_price", 0))
+            tgt       = float(p.get("target_price", 0))
+            shares    = int(p.get("shares", 0))
+            pos_val   = float(p.get("pos_value", 0))
+            risk      = float(p.get("risk_dollars", 0))
+            stop_type = p.get("stop_type", "FIXED")
+            upside    = (tgt - entry) / entry * 100 if entry > 0 and tgt > 0 else 0.0
+            stop_pct  = (entry - stop) / entry * 100 if entry > 0 and stop > 0 else 0.0
+            sig_short = {"EMA8_PULLBACK": "EMA8pb", "PULLBACK": "PB", "BREAKOUT": "BO"}.get(sig, sig)
+            trail_tag = " 🔄trail" if stop_type == "TRAIL_EMA8" else ""
+            lines.append(
+                f"  [{acct}] {tkr} {sig_short}{trail_tag}\n"
+                f"    {shares}sh @${entry:.2f} = ${pos_val:,.0f} | "
+                f"stop ${stop:.2f} (-{stop_pct:.1f}%) | "
+                f"tgt ${tgt:.2f} (+{upside:.1f}%) | "
+                f"risk ${risk:,.0f}"
+            )
+
+    # Watchlist (condensed)
+    if watch:
+        watch_items = [f"{w['ticker']} {w['note']}" for w in watch[:8]]
+        lines.append(f"👀 Watch: {', '.join(watch_items)}")
+
+    return "\n".join(lines)
+
+
+def build_options_alert(
+    new_csps: List[dict],
+    new_ccs: List[dict],
+    csp_tp: List[str],
+    cc_tp: List[str],
+    csp_exp: List[str],
+    csp_asn: List[str],
+    cc_exp: List[str],
+    cc_call: List[str],
+    early_asn: List[str],
+    csp_roll: List[dict],
+) -> str:
+    """
+    #screener-options — CSP/CC positions, new orders, maintenance events.
+    Returns empty string if nothing to report.
+    """
+    today = dt.date.today()
+    lines: List[str] = []
+
+    maint_items = (csp_tp or cc_tp or csp_exp or csp_asn or
+                   cc_exp or cc_call or early_asn or csp_roll)
+    has_content = bool(new_csps or new_ccs or maint_items)
+    if not has_content:
+        return ""
+
+    lines.append(f"🧾 OPTIONS — {today.isoformat()}")
+
+    # Maintenance events
+    maint: List[str] = []
+    if early_asn:   maint.append(f"⚠️ Early asn: {', '.join(early_asn[:4])}")
+    if csp_asn:     maint.append(f"📥 Assigned: {', '.join(csp_asn[:4])}")
+    if csp_tp:      maint.append(f"✅ CSP TP: {', '.join(csp_tp[:4])}")
+    if cc_tp:       maint.append(f"✅ CC TP: {', '.join(cc_tp[:4])}")
+    if csp_exp:     maint.append(f"CSP exp: {', '.join(csp_exp[:4])}")
+    if cc_exp:      maint.append(f"CC exp: {', '.join(cc_exp[:4])}")
+    if cc_call:     maint.append(f"📤 Called away: {', '.join(cc_call[:4])}")
+    if maint:
+        lines.append("— Events —")
+        lines.extend(maint)
+
+    # Open CSPs
+    try:
+        csp_rows  = strat.load_csv_rows(CSP_POSITIONS_FILE)
+        open_csps = [
+            r for r in csp_rows
+            if (r.get("status") or "").upper() == "OPEN"
+            and not (
+                (r.get("expiry") or "").strip()
+                and dt.date.fromisoformat((r.get("expiry") or "").strip()) < today
+            )
+        ]
+        if open_csps:
+            lines.append("🧾 OPEN CSPs")
+            for r in open_csps[:10]:
+                acct   = _ACCT_LABEL.get((r.get("account") or INDIVIDUAL).strip().upper(), "?")
+                tkr    = (r.get("ticker") or "").strip().upper()
+                strike = r.get("strike") or ""
+                exp    = (r.get("expiry") or "").replace("2026-", "").replace("2025-", "")
+                prem   = r.get("premium") or r.get("est_premium") or ""
+                try:
+                    prem_f = f"${float(prem):,.0f}" if prem else ""
+                except Exception:
+                    prem_f = str(prem)
+                dte_str = ""
+                try:
+                    if r.get("expiry"):
+                        dte = (dt.date.fromisoformat(r["expiry"]) - today).days
+                        dte_str = f"{dte}d"
+                except Exception:
+                    pass
+                lines.append(f"  [{acct}] {tkr} {strike}P {exp} {prem_f} {dte_str}")
+    except Exception as e:
+        log.warning("Options alert CSP block failed: %s", e)
+
+    # Open CCs
+    try:
+        cc_rows  = strat.load_csv_rows(CC_POSITIONS_FILE)
+        open_ccs = [r for r in cc_rows if (r.get("status") or "").upper() == "OPEN"]
+        if open_ccs:
+            lines.append("📞 OPEN CCs")
+            for r in open_ccs[:10]:
+                acct      = _ACCT_LABEL.get((r.get("account") or INDIVIDUAL).strip().upper(), "?")
+                tkr       = (r.get("ticker") or "").strip().upper()
+                strike    = r.get("strike") or ""
+                exp       = (r.get("expiry") or "").replace("2026-", "").replace("2025-", "")
+                prem      = r.get("premium") or ""
+                contracts = r.get("contracts") or ""
+                try:
+                    prem_f = f"${float(prem):,.0f}" if prem else ""
+                except Exception:
+                    prem_f = str(prem)
+                dte_str = itm_str = ""
+                try:
+                    if r.get("expiry"):
+                        dte = (dt.date.fromisoformat(r["expiry"]) - today).days
+                        dte_str = f"{dte}d"
+                except Exception:
+                    pass
+                try:
+                    px_map = strat.live_prices([tkr])
+                    cur    = px_map.get(tkr, 0.0)
+                    s      = float(strike) if strike else 0.0
+                    if cur > 0 and s > 0:
+                        pct = (cur - s) / s * 100.0
+                        itm_str = f"🔴{pct:+.1f}%" if cur >= s else f"🟢{pct:+.1f}%"
+                except Exception:
+                    pass
+                lines.append(
+                    f"  [{acct}] {tkr} {strike}C {exp} {prem_f} {contracts}x {dte_str} {itm_str}"
+                )
+    except Exception as e:
+        log.warning("Options alert CC block failed: %s", e)
+
+    # Roll candidates
+    if csp_roll:
+        lines.append("🔄 CSP ROLLS")
+        for c in csp_roll[:4]:
+            lines.append(
+                f"  [{c['account']}] {c['ticker']} {c['strike']:.0f}P "
+                f"{c['expiry']} | {c['pct_itm']:.1f}% ITM | {c['dte']}d"
+            )
+
+    # New CSPs
+    if new_csps:
+        lines.append("🆕 NEW CSPs")
+        for x in new_csps[:8]:
+            acct = _ACCT_LABEL.get((x.get("account") or INDIVIDUAL).strip().upper(), "?")
+            exp  = (x.get("expiry") or "").replace("2026-", "").replace("2025-", "")
+            lines.append(
+                f"  [{acct}] {x['ticker']} {x['strike']:.0f}P {exp} "
+                f"~${x['est_premium']:.0f} | ${x['cash_reserved']:,.0f} cash"
+            )
+
+    # New CCs
+    if new_ccs:
+        lines.append("📞 NEW CCs")
+        for x in new_ccs[:8]:
+            acct = _ACCT_LABEL.get((x.get("account") or INDIVIDUAL).strip().upper(), "?")
+            exp  = (x.get("expiry") or "").replace("2026-", "").replace("2025-", "")
+            lines.append(
+                f"  [{acct}] {x['ticker']} {x['strike']:.0f}C {exp} "
+                f"~${float(x.get('credit_mid', 0)) * 100:.0f}"
+            )
+
+    return "\n".join(lines)
+
+
+def send_market_alert(msg: str) -> None:
+    _send(WEBHOOK_MARKET_URL or WEBHOOK_URL, msg)
+
+
+def send_stocks_alert(msg: str) -> None:
+    _send(WEBHOOK_STOCKS_URL or WEBHOOK_URL, msg)
+
+
+def send_options_alert(msg: str) -> None:
+    _send(WEBHOOK_OPTIONS_URL or WEBHOOK_URL, msg)
+
+
+# ── Legacy single-message builder (kept for backward compat) ─────────────────
+def build_discord_alert(
+    mkt: Dict,
+    trading_on: bool,
+    new_csps: List[dict],
+    new_ccs: List[dict],
+    planned_stocks: List[dict],
+    watch: List[dict],
+    csp_tp: List[str],
+    cc_tp: List[str],
+    csp_exp: List[str],
+    csp_asn: List[str],
+    cc_exp: List[str],
+    cc_call: List[str],
+    stock_opens: List[str],
+    stock_closes: List[str],
+    ret_stopped: List[str] = [],
+    ret_targets: List[str] = [],
+    early_asn: List[str] = [],
+    csp_roll: List[dict] = [],
+) -> str:
+    """Kept for backward compatibility — screener.py now calls the three
+    channel-specific builders directly."""
+    return build_market_alert(mkt, trading_on, True, {}, {}, 0.0)
 
 
 def build_discord_alert(

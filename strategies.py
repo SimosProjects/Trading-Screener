@@ -642,8 +642,8 @@ STOCK_POS_FIELDS = [
     "id", "account", "ticker", "signal", "plan_date", "entry_date",
     "entry_price", "shares", "adds", "last_add_date", "initial_entry_price",
     "initial_shares", "stop_price", "target_price", "risk_per_share",
-    "r_multiple_target", "status", "exit_date", "exit_price", "exit_reason",
-    "pnl_abs", "pnl_pct", "notes",
+    "r_multiple_target", "stop_type", "status", "exit_date", "exit_price",
+    "exit_reason", "pnl_abs", "pnl_pct", "notes",
 ]
 STOCK_TRADE_FIELDS = [
     "id", "account", "ticker", "entry_date", "entry_price", "shares",
@@ -809,7 +809,7 @@ def plan_stock_trade(
     if signal not in ("PULLBACK", "BREAKOUT", "EMA8_PULLBACK"):
         return None
 
-    log.info("plan_stock_trade: %s price=%.2f (live=%s daily=%.2f)",
+    log.debug("plan_stock_trade: %s price=%.2f (live=%s daily=%.2f)",
              ticker, close,
              f"{live_px:.2f}" if live_px else "n/a",
              float(last.get("Close", 0) or 0))
@@ -914,6 +914,11 @@ def plan_stock_trade(
     upside_pct   = (target - close) / close * 100
     stop_pct     = (close - stop) / close * 100
 
+    # ── Stop type ─────────────────────────────────────────────────────────────
+    # EMA8_PULLBACK: trailing stop follows EMA8 - 0.75×ATR as trend rises.
+    # PULLBACK / BREAKOUT: fixed stop — thesis has a specific invalidation level.
+    stop_type = "TRAIL_EMA8" if signal == "EMA8_PULLBACK" else "FIXED"
+
     return {
         "account": account, "ticker": ticker, "signal": signal,
         "entry_price":       float(close),
@@ -922,8 +927,9 @@ def plan_stock_trade(
         "shares":            int(shares),
         "risk_per_share":    float(risk_ps),
         "r_multiple_target": float(STOCK_TARGET_R_MULTIPLE),
+        "stop_type":         stop_type,
         "notes": (f"{signal} | {shares}sh @${close:.2f} = ${pos_value:,.0f} "
-                  f"| stop ${stop:.2f} (-{stop_pct:.1f}%) "
+                  f"| stop ${stop:.2f} (-{stop_pct:.1f}%) [{stop_type}] "
                   f"| tgt ${target:.2f} (+{upside_pct:.1f}%) "
                   f"| risk ${risk_dollars:,.0f} (${risk_ps:.2f}/sh) | regime={regime}"),
     }
@@ -969,6 +975,7 @@ def execute_stock_plan(today: dt.date, plan: dict) -> str:
         "target_price":      f"{float(plan['target_price']):.2f}",
         "risk_per_share":    f"{float(plan['risk_per_share']):.4f}",
         "r_multiple_target": f"{float(plan['r_multiple_target']):.2f}",
+        "stop_type":         plan.get("stop_type", "FIXED"),
         "status": "OPEN", "exit_date": "", "exit_price": "", "exit_reason": "",
         "pnl_abs": "", "pnl_pct": "", "notes": plan.get("notes", ""),
     })
@@ -1010,7 +1017,31 @@ def update_and_close_stock_positions(today: dt.date, mkt: Dict) -> Dict[str, Lis
         if sh <= 0 or entry <= 0:
             continue
 
-        if STOCK_USE_BREAKEVEN_TRAIL:
+        stop_type = (r.get("stop_type") or "FIXED").strip().upper()
+
+        if stop_type == "TRAIL_EMA8":
+            # Trailing stop: recalculate EMA8 - 0.75×ATR from fresh daily data.
+            # Stop only moves up — never down. This keeps you in the trend as
+            # long as price stays above the rising EMA8.
+            try:
+                df_trail = add_indicators(download_ohlcv(tkr))
+                if not df_trail.empty:
+                    last_trail = df_trail.iloc[-1]
+                    ema8_now   = float(last_trail.get("EMA_8", 0) or 0)
+                    atr_now    = float(last_trail.get("ATR_14", 0) or 0)
+                    if ema8_now > 0 and atr_now > 0:
+                        trail_stop = ema8_now - (STOCK_STOP_ATR_EMA8 * atr_now)
+                        if trail_stop > stop:
+                            log.info("TRAIL_EMA8 %s: stop %.2f → %.2f (EMA8=%.2f ATR=%.2f)",
+                                     tkr, stop, trail_stop, ema8_now, atr_now)
+                            stop = trail_stop
+                            r["stop_price"] = f"{stop:.2f}"
+                            changed = True
+            except Exception as e:
+                log.warning("TRAIL_EMA8 update failed for %s: %s", tkr, e)
+
+        elif STOCK_USE_BREAKEVEN_TRAIL:
+            # Fixed stop: just move to breakeven once 1R profit is reached.
             try:
                 risk_ps = float(r.get("risk_per_share") or 0.0)
                 if risk_ps > 0 and (px - entry) >= (STOCK_BREAKEVEN_AFTER_R * risk_ps):
