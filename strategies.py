@@ -453,7 +453,9 @@ def nextday_valid_for_entry(signal: str, last: pd.Series) -> bool:
 
 RETIREMENT_FIELDS = [
     "account", "ticker", "shares", "entry_price", "entry_date",
-    "current_price", "pct_change", "breakeven_target", "flag_breakeven_only", "notes",
+    "current_price", "pct_change", "breakeven_target", "flag_breakeven_only",
+    "target_price",
+    "notes",
 ]
 
 
@@ -542,15 +544,16 @@ def update_retirement_marks() -> Tuple[Dict[str, dict], List[str]]:
 
 
 def close_retirement_stops(today: dt.date) -> Dict[str, List[str]]:
-    """Close retirement positions that have hit the hard stop loss."""
+    """Close retirement positions that have hit their stop or target."""
     if not RETIREMENT_STOP_LOSS_PCT or float(RETIREMENT_STOP_LOSS_PCT) <= 0:
-        return {"stopped": []}
+        return {"stopped": [], "targets": []}
 
     rows = load_retirement_positions()
     if not rows:
-        return {"stopped": []}
+        return {"stopped": [], "targets": []}
 
-    stopped: List[str] = []
+    stopped:   List[str] = []
+    targets:   List[str] = []
     surviving: List[dict] = []
     changed = False
 
@@ -563,9 +566,10 @@ def close_retirement_stops(today: dt.date) -> Dict[str, List[str]]:
             continue
 
         try:
-            entry = float(r.get("entry_price") or 0.0)
-            cur   = float(r.get("current_price") or 0.0)
-            sh    = int(float(r.get("shares") or 0))
+            entry      = float(r.get("entry_price") or 0.0)
+            cur        = float(r.get("current_price") or 0.0)
+            sh         = int(float(r.get("shares") or 0))
+            target_px  = float(r.get("target_price") or 0.0)
         except Exception as e:
             log.warning("close_retirement_stops: bad numeric field for %s %s: %s", acct, tkr, e)
             surviving.append(r)
@@ -576,23 +580,38 @@ def close_retirement_stops(today: dt.date) -> Dict[str, List[str]]:
             continue
 
         stop_level = entry * (1.0 - float(RETIREMENT_STOP_LOSS_PCT))
-        if cur > stop_level:
+
+        # Determine exit reason — target takes priority over stop
+        exit_reason = None
+        if target_px > 0 and cur >= target_px:
+            exit_reason = "TARGET"
+        elif cur <= stop_level:
+            exit_reason = "STOP"
+
+        if not exit_reason:
             surviving.append(r)
             continue
 
         pnl_abs = (cur - entry) * sh
         pnl_pct = (cur - entry) / entry
 
-        log.warning(
-            "Retirement stop triggered: %s %s %d sh — entry %.2f, now %.2f "
-            "(%.1f%%), stop %.2f",
-            acct, tkr, sh, entry, cur, pnl_pct * 100, stop_level,
-        )
+        if exit_reason == "STOP":
+            log.warning(
+                "Retirement stop triggered: %s %s %d sh — entry %.2f, now %.2f "
+                "(%.1f%%), stop %.2f",
+                acct, tkr, sh, entry, cur, pnl_pct * 100, stop_level,
+            )
+        else:
+            log.info(
+                "Retirement target hit: %s %s %d sh — entry %.2f, now %.2f "
+                "(%.1f%%), target %.2f",
+                acct, tkr, sh, entry, cur, pnl_pct * 100, target_px,
+            )
 
         entry_date = (r.get("entry_date") or "")
 
         append_stock_trade({
-            "id":          f"{acct}-{tkr}-{today.isoformat()}-STOP",
+            "id":          f"{acct}-{tkr}-{today.isoformat()}-{exit_reason}",
             "account":     acct,
             "ticker":      tkr,
             "entry_date":  entry_date,
@@ -600,8 +619,8 @@ def close_retirement_stops(today: dt.date) -> Dict[str, List[str]]:
             "shares":      str(sh),
             "exit_date":   today.isoformat(),
             "exit_price":  f"{cur:.2f}",
-            "reason":      "STOP",
-            "close_type":  "STOP",
+            "reason":      exit_reason,
+            "close_type":  exit_reason,
             "pnl_abs":     f"{pnl_abs:.2f}",
             "pnl_pct":     f"{pnl_pct*100:.2f}",
         })
@@ -613,16 +632,20 @@ def close_retirement_stops(today: dt.date) -> Dict[str, List[str]]:
             "action":  "CLOSE",
             "price":   f"{cur:.2f}",
             "shares":  str(sh),
-            "reason":  f"RETIREMENT_STOP ({float(RETIREMENT_STOP_LOSS_PCT)*100:.0f}%)",
+            "reason":  exit_reason,
         })
 
-        stopped.append(f"{tkr} @{cur:.2f} ({pnl_pct*100:+.1f}%)")
+        summary = f"{tkr} @{cur:.2f} ({pnl_pct*100:+.1f}%)"
+        if exit_reason == "STOP":
+            stopped.append(summary)
+        else:
+            targets.append(summary)
         changed = True
 
     if changed:
         write_retirement_positions(surviving)
 
-    return {"stopped": stopped}
+    return {"stopped": stopped, "targets": targets}
 
 
 def retirement_market_value_by_account(ret_by_key: Dict[str, dict]) -> Dict[str, float]:
@@ -975,6 +998,7 @@ def execute_stock_plan(today: dt.date, plan: dict) -> str:
             "pct_change":          "0.00",
             "breakeven_target":    "",
             "flag_breakeven_only": "0",
+            "target_price":        f"{float(plan.get('target_price', 0.0)):.2f}",  # ← add this
             "notes":               plan.get("notes", "BUY-HOLD"),
         })
         write_retirement_positions(rows)

@@ -220,6 +220,11 @@ def run_screener() -> None:
         for s in ret_stops["stopped"]:
             print(f"  {s}")
 
+    if ret_stops.get("targets"):
+        print("\n✅ RETIREMENT TARGETS HIT")
+        for s in ret_stops["targets"]:
+            print(f"  {s}")
+
     # ── 6. Wheel maintenance ──────────────────────────────────────
     # Pre-run integrity check: warn if CSP/lot/CC state is inconsistent.
     # Warn-and-continue — never block a run on stale data.
@@ -525,6 +530,7 @@ def run_screener() -> None:
         stock_opens=stock_opened,
         stock_closes=stock_closed,
         ret_stopped=ret_stops.get("stopped", []),
+        ret_targets=ret_stops.get("targets", []),
         early_asn=early_asn_out.get("assigned", []) + early_asn_out.get("warned", []),
         csp_roll=csp_roll_candidates,
     )

@@ -92,6 +92,7 @@ def build_discord_alert(
     stock_opens: List[str],
     stock_closes: List[str],
     ret_stopped: List[str] = [],
+    ret_targets: List[str] = [],
     early_asn: List[str] = [],
     csp_roll: List[dict] = [],
 ) -> str:
@@ -319,6 +320,7 @@ def build_discord_alert(
     # --- Maintenance events ---
     maint: List[str] = []
     if ret_stopped:  maint.append(f"🛑 Ret stops: {', '.join(ret_stopped[:6])}")
+    if ret_targets:  maint.append(f"✅ Ret targets: {', '.join(ret_targets[:6])}")
     if early_asn:    maint.append(f"⚠️ Early asn: {', '.join(early_asn[:6])}")
     if csp_asn:      maint.append(f"📥 CSP asn: {', '.join(csp_asn[:6])}")
     if csp_tp:       maint.append(f"✅ CSP TP: {', '.join(csp_tp[:6])}")
