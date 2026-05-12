@@ -1,2 +1,5 @@
 account,ticker,shares,entry_price,entry_date,current_price,pct_change,breakeven_target,flag_breakeven_only,target_price,notes
-IRA,ORCL,91,163.44,2026-04-28,185.41,13.44,,0,,"RETIRE BUY-HOLD | pos_value=$15,000 stop=35% below entry"
+IRA,ORCL,91,163.44,2026-04-28,185.12,13.27,,0,,"RETIRE BUY-HOLD | pos_value=$15,000 stop=35% below entry"
+IRA,AMZN,49,264.54,2026-05-12,264.57,0.01,,0,403.42,"RETIRE | pos_value=$15,000 stop=35% below | target=1.5R ($403.42)"
+ROTH,GOOGL,38,386.29,2026-05-12,386.25,-0.01,,0,589.09,"RETIRE | pos_value=$15,000 stop=35% below | target=1.5R ($589.09)"
+ROTH,AVGO,35,421.80,2026-05-12,421.43,-0.09,,0,643.24,"RETIRE | pos_value=$15,000 stop=35% below | target=1.5R ($643.24)"
