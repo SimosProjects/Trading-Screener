@@ -76,41 +76,23 @@ log = get_logger(__name__)
 
 
 def _run_integrity_check(today: dt.date) -> None:
-    """Warn on CSP/lot/CC state inconsistencies.  Warn-and-continue — never aborts the run.
-
-    Checks:
-      1. Every ASSIGNED CSP has a matching lot in wheel_lots.csv.
-      2. Every lot with has_open_cc=1 has a matching OPEN CC in cc_positions.csv.
-
-    Check 2 uses TWO matching paths to avoid false positives on legacy rows
-    that pre-date the source_lot_id field:
-      Path A (new):    lot.lot_id  matches an OPEN cc.source_lot_id
-      Path B (legacy): lot.cc_id   matches an OPEN cc.id
-    A lot is considered correctly linked if EITHER path finds a match.
-    """
+    """Warn on CSP/lot/CC state inconsistencies.  Warn-and-continue — never aborts the run."""
     try:
         csp_rows = strat.load_csv_rows(strat.CSP_POSITIONS_FILE)
         cc_rows  = strat.load_csv_rows(strat.CC_POSITIONS_FILE)
 
-        # Use sys.modules to avoid the system 'wheel' package collision
         import sys as _sys
         _whl  = _sys.modules.get("wheel") or __import__("wheel")
-        # Use all lots (OPEN and CLOSED) so that a fully-exited position
-        # (CLOSED lot) still satisfies the ASSIGNED CSP integrity check.
-        # Using get_open_lots() here caused false-positive orphan warnings
-        # after a manual exit closed the lot.
         lots  = _whl._read_rows(_whl.WHEEL_LOTS_FILE)
 
         lot_by_csp_id = {(r.get("source_csp_id") or "").strip(): r for r in lots}
 
         open_cc_rows = [r for r in cc_rows if (r.get("status") or "").upper() == "OPEN"]
-        # Path A: lot_id → cc.source_lot_id  (new CCs with explicit linkage)
         open_by_source_lot = {
             (r.get("source_lot_id") or "").strip()
             for r in open_cc_rows
             if (r.get("source_lot_id") or "").strip()
         }
-        # Path B: lot.cc_id → cc.id  (legacy CCs written before source_lot_id existed)
         open_by_cc_id = {
             (r.get("id") or "").strip()
             for r in open_cc_rows
@@ -133,8 +115,8 @@ def _run_integrity_check(today: dt.date) -> None:
             lot_id = (lot.get("lot_id") or "").strip()
             cc_id  = (lot.get("cc_id")  or "").strip()
             linked = (
-                (lot_id and lot_id in open_by_source_lot)   # Path A
-                or (cc_id  and cc_id  in open_by_cc_id)     # Path B (legacy)
+                (lot_id and lot_id in open_by_source_lot)
+                or (cc_id  and cc_id  in open_by_cc_id)
             )
             if not linked:
                 log.warning(
@@ -150,9 +132,6 @@ def run_screener() -> None:
     today = dt.date.today()
 
     # ── 1. Warm data cache ────────────────────────────────────────
-    # SPY/QQQ/VIX plus every equity ticker the screener touches —
-    # including open retirement positions and wheel lots.
-    # Option chains are still fetched per-ticker (yfinance limitation).
     ret_tickers = [
         (r.get("ticker") or "").strip().upper()
         for r in strat.load_retirement_positions()
@@ -173,7 +152,7 @@ def run_screener() -> None:
     cache = DataCache(all_equity_tickers)
     cache.warm()
     strat.set_data_cache(cache)
-    strat.reset_chain_cache()   # fresh option chain cache for this run
+    strat.reset_chain_cache()
     _wheel_mod.set_data_cache(cache)
 
     # ── 2. Market context + regime ────────────────────────────────
@@ -181,7 +160,7 @@ def run_screener() -> None:
     trading_on = allow_swing_trades(mkt)
     retire_on  = allow_retirement_tactical(mkt)
     csp_regime = csp_mode(mkt)
-    regime     = market_regime(mkt)   # drives all dynamic parameters
+    regime     = market_regime(mkt)
 
     print_market_context(mkt, trading_on, retire_on)
     if ENABLE_CSP:
@@ -199,7 +178,10 @@ def run_screener() -> None:
 
     # ── 4. Build + print open holdings ───────────────────────────
     holding_tickers = collect_tickers_for_price_fetch(ret_by_key)
-    px = strat.last_close_prices(holding_tickers)
+    # live_prices: fast_info per ticker for small sets (open positions),
+    # batch daily close for large universe — single source of truth for
+    # all intraday price decisions.
+    px = strat.live_prices(holding_tickers)
 
     holdings, wheel_mv, mv_stock = build_holdings_and_mv(px)
     acct_mv = compute_acct_mv(ret_by_key, mv_stock, wheel_mv)
@@ -226,8 +208,6 @@ def run_screener() -> None:
             print(f"  {s}")
 
     # ── 6. Wheel maintenance ──────────────────────────────────────
-    # Pre-run integrity check: warn if CSP/lot/CC state is inconsistent.
-    # Warn-and-continue — never block a run on stale data.
     _run_integrity_check(today)
 
     csp_tp_out    = strat.process_csp_take_profits(today, regime=regime)
@@ -238,7 +218,6 @@ def run_screener() -> None:
     create_lots_from_new_assignments(today)
     link_new_ccs_to_lots(today)
 
-    # CSP roll candidates (display only — no state change)
     csp_roll_candidates = strat.scan_csp_roll_candidates(today)
 
     if early_asn_out.get("assigned"):
@@ -308,7 +287,6 @@ def run_screener() -> None:
     new_csp_orders: List[dict] = []
     if ENABLE_CSP and csp_regime in ("NORMAL", "RISK_OFF"):
 
-        # Fetch live intraday VIX for the spike guard (single fast_info call).
         live_vix: float | None = None
         try:
             live_vix = float(yf.Ticker("^VIX").fast_info.get("last_price") or 0) or None
@@ -317,12 +295,8 @@ def run_screener() -> None:
         except Exception as e:
             log.warning("Could not fetch live VIX for spike guard: %s", e)
 
-        # Build the candidate list once — same universe regardless of account.
         candidates = build_csp_candidates(mkt, csp_regime, regime=regime)
 
-        # Global dedup: block any ticker that already has an open CSP or CC
-        # in ANY account.  load_open_* functions are account-blind by design —
-        # we never want two accounts holding the same underlying simultaneously.
         open_csp_tickers = strat.load_open_csp_tickers(today)
         open_cc_tickers  = strat.load_open_cc_tickers()
         candidates = [
@@ -331,12 +305,6 @@ def run_screener() -> None:
             and (c.get("ticker") or "").strip().upper() not in open_cc_tickers
         ]
 
-        # Build per-account sector counts from existing open CSP positions.
-        # Sector concentration is enforced per-account (not globally) because
-        # IRA, ROTH, and INDIVIDUAL are separate legal entities with separate
-        # capital pools — a TECH position in IRA does not increase INDIVIDUAL's
-        # correlated assignment risk.
-        # open_csp_rows keyed by account for fast per-account lookup.
         _open_csp_rows = strat.load_csv_rows(strat.CSP_POSITIONS_FILE)
         _open_csp_by_acct: Dict[str, set] = {INDIVIDUAL: set(), IRA: set(), ROTH: set()}
         for _r in _open_csp_rows:
@@ -355,8 +323,6 @@ def run_screener() -> None:
                     counts[sec] = counts.get(sec, 0) + 1
             return counts
 
-        # Allocation priority: INDIVIDUAL first, then IRA vs ROTH by weekly
-        # utilisation (whichever has used less of its weekly target gets priority).
         exp_ira  = compute_wheel_exposure(today, IRA)
         exp_roth = compute_wheel_exposure(today, ROTH)
         rem_ira  = compute_week_remaining(today, IRA)
@@ -366,11 +332,8 @@ def run_screener() -> None:
         )
         account_order = [INDIVIDUAL] + retirement_order
 
-        # Tickers allocated this run — grows as each account claims candidates.
-        # Ensures no ticker appears in more than one account.
         used_tickers: set = set()
-
-        any_week_cap_hit = True  # flipped to False if at least one account has room
+        any_week_cap_hit = True
 
         for acct in account_order:
             exp            = compute_wheel_exposure(today, acct)
@@ -382,7 +345,6 @@ def run_screener() -> None:
 
             any_week_cap_hit = False
 
-            # Exclude tickers already allocated to a prior account this run.
             acct_candidates = [
                 c for c in candidates
                 if (c.get("ticker") or "").strip().upper() not in used_tickers
@@ -411,7 +373,6 @@ def run_screener() -> None:
                 print(f"\n🧾 CSP [{acct}]: No new entries today.")
                 continue
 
-            # Tag each order with its account and accumulate for execution.
             for o in orders:
                 o["account"] = acct
                 used_tickers.add((o.get("ticker") or "").strip().upper())
@@ -428,8 +389,6 @@ def run_screener() -> None:
         if any_week_cap_hit and not new_csp_orders:
             print("\n🧾 CSP scanning skipped (weekly cap reached for all accounts).")
 
-        # ── Execute all orders (account tag now present on each) ──────
-        # week_id is identical across accounts within a single ISO week.
         week_id = _iso_week_id(today)
         for o in new_csp_orders:
             csp_id, created = strat.add_csp_position_from_selected(
@@ -494,10 +453,7 @@ def run_screener() -> None:
     else:
         print("\n📞 CC: No calls triggered today.")
 
-    # Surface any open CCs where the stock has recovered close to the strike.
     print_open_cc_roll_candidates(px, today=today)
-
-    # Surface CSP roll candidates (ITM with enough DTE to act).
     print_csp_roll_candidates(csp_roll_candidates)
 
     # ── 10. Backfill + monthly rebuild ───────────────────────────
@@ -509,7 +465,7 @@ def run_screener() -> None:
     # ── 11. Final exposure + refresh marks ───────────────────────
     ret_by_key, ret_flagged = strat.update_retirement_marks()
     _, wheel_mv_final, mv_stock_final = build_holdings_and_mv(
-        strat.last_close_prices(collect_tickers_for_price_fetch(ret_by_key))
+        strat.live_prices(collect_tickers_for_price_fetch(ret_by_key))
     )
     print_final_exposure_summary(today, ret_by_key, ret_flagged, mv_stock_final, wheel_mv_final)
 

@@ -30,7 +30,6 @@ from wheel import compute_wheel_exposure, compute_week_remaining
 
 log = get_logger(__name__)
 
-# Short label used in Discord to keep lines compact.
 _ACCT_LABEL = {INDIVIDUAL: "INDV", IRA: "IRA", ROTH: "ROTH"}
 
 
@@ -39,7 +38,6 @@ _ACCT_LABEL = {INDIVIDUAL: "INDV", IRA: "IRA", ROTH: "ROTH"}
 # ============================================================
 
 def send_discord(msg: str) -> None:
-    """Post msg to the configured Discord webhook. Silently skips if no URL is set."""
     if not WEBHOOK_URL or not WEBHOOK_URL.strip():
         return
     url = WEBHOOK_URL.strip()
@@ -53,7 +51,6 @@ def send_discord(msg: str) -> None:
 
 
 def _spy_ma_flags(mkt: Dict) -> str:
-    """Return a compact MA status string, e.g. '✅200/50/21' or '❌200'."""
     flags = []
     if mkt.get("spy_above_200"):
         flags.append("200")
@@ -67,7 +64,6 @@ def _spy_ma_flags(mkt: Dict) -> str:
 
 
 def _vix_emoji(mkt: Dict) -> str:
-    """Return a single emoji reflecting VIX level."""
     vix = float(mkt.get("vix_close") or 99.0)
     if vix < 18:
         return "🟢"
@@ -96,24 +92,6 @@ def build_discord_alert(
     early_asn: List[str] = [],
     csp_roll: List[dict] = [],
 ) -> str:
-    """
-    Build the full Discord alert string for one screener run.
-
-    Sections (in order):
-      - Header: date + single-line market summary
-      - Trading status + CSP regime
-      - Open stock holdings (all accounts)
-      - Open CSP positions
-      - Open CC positions
-      - CC roll alerts (non-interactive flag only)
-      - Maintenance events (TPs, expirations, assignments, stock opens/closes)
-      - New CSP ideas
-      - New CC ideas
-      - Wheel exposure + stock caps (condensed)
-
-    Watchlist is intentionally excluded to keep the message compact.
-    Target: under 1,990 chars on a typical day.
-    """
     today = dt.date.today()
     lines: List[str] = []
 
@@ -129,26 +107,22 @@ def build_discord_alert(
         f"VIX {mkt['vix_close']:.2f} {vix_emoji}"
     )
 
-    # --- Trading status ---
     t_flag  = "🟢" if trading_on else "🔴"
     lines.append(f"{t_flag} Trading {'ON' if trading_on else 'OFF'}")
 
     # --- Open holdings ---
     try:
-        # Pull holdings directly so we don't need the caller to pass them in.
-        # Mirrors the same grouping logic used by print_open_holdings.
         stock_rows = strat.load_csv_rows(strat.STOCK_POSITIONS_FILE)
         open_rows  = [r for r in stock_rows if (r.get("status") or "").upper() == "OPEN"]
 
-        # Also pull assigned wheel lots as holdings.
         import sys as _sys
         _whl = _sys.modules.get("wheel")
         lot_rows = _whl.get_open_lots() if _whl else []
 
         holdings: List[dict] = []
 
-        # Batch price fetch for all open positions — CSV current_price is only
-        # updated on stop/target exits, so it's stale for positions just sitting open.
+        # Use live_prices for all open positions — fast_info gives ~15min
+        # delayed intraday price rather than yesterday's close.
         all_tkrs = list({
             (r.get("ticker") or "").strip().upper() for r in open_rows
             if (r.get("ticker") or "").strip()
@@ -156,7 +130,7 @@ def build_discord_alert(
             (lot.get("ticker") or "").strip().upper() for lot in lot_rows
             if (lot.get("ticker") or "").strip()
         })
-        px_live = strat.last_close_prices(all_tkrs) if all_tkrs else {}
+        px_live = strat.live_prices(all_tkrs) if all_tkrs else {}
 
         for r in open_rows:
             tkr   = (r.get("ticker") or "").strip().upper()
@@ -199,7 +173,6 @@ def build_discord_alert(
                 for r in rows:
                     w_tag = "[W]" if r["src"] == "WHEEL" else ""
                     if r["cur"] <= 0:
-                        # Price unavailable — show entry only, skip P/L.
                         lines.append(
                             f"  {r['tkr']:<5} {r['sh']:.0f}sh "
                             f"@{r['entry']:.2f}→n/a {w_tag}"
@@ -265,7 +238,6 @@ def build_discord_alert(
                     prem_f = f"${float(prem):,.0f}" if prem else ""
                 except Exception:
                     prem_f = str(prem)
-                # DTE
                 dte_str = ""
                 try:
                     if r.get("expiry"):
@@ -273,10 +245,10 @@ def build_discord_alert(
                         dte_str = f"{dte}d"
                 except Exception:
                     pass
-                # ITM/OTM — best-effort using strategies last close
+                # ITM/OTM — use live price for accuracy
                 itm_str = ""
                 try:
-                    px_map = strat.last_close_prices([tkr])
+                    px_map = strat.live_prices([tkr])
                     cur    = px_map.get(tkr, 0.0)
                     s      = float(strike) if strike else 0.0
                     if cur > 0 and s > 0:
@@ -290,7 +262,7 @@ def build_discord_alert(
     except Exception as e:
         log.warning("Discord CC block failed: %s", e)
 
-    # --- CC roll alerts (non-interactive) ---
+    # --- CC roll alerts ---
     try:
         cc_rows_all = strat.load_csv_rows(CC_POSITIONS_FILE)
         roll_flags  = []
@@ -302,7 +274,7 @@ def build_discord_alert(
                 strike = float(r.get("strike") or 0)
                 if strike <= 0:
                     continue
-                px_map = strat.last_close_prices([tkr])
+                px_map = strat.live_prices([tkr])
                 cur    = px_map.get(tkr, 0.0)
                 if cur <= 0:
                     continue
@@ -376,7 +348,7 @@ def build_discord_alert(
     else:
         lines.append("📞 New CCs: none")
 
-    # --- Wheel exposure + stock caps (condensed, one line per account) ---
+    # --- Wheel exposure + stock caps ---
     lines.append("💼 Exposure")
     try:
         for acct in (INDIVIDUAL, IRA, ROTH):
@@ -399,7 +371,6 @@ def build_discord_alert(
 # ============================================================
 
 def print_market_context(mkt: Dict, trading_on: bool, retire_on: bool) -> None:
-    """Print the full market context block to the terminal."""
     print("\n==============================")
     print(f"📅 RUN DATE: {dt.date.today().isoformat()}")
     print("==============================\n")
@@ -429,7 +400,6 @@ def print_market_context(mkt: Dict, trading_on: bool, retire_on: bool) -> None:
 # ============================================================
 
 def print_open_holdings(holdings: List[dict]) -> None:
-    """Print a grouped P/L table of all open stock and wheel lot positions."""
     if not holdings:
         print("\n📌 OPEN STOCK HOLDINGS: none\n")
         return
@@ -464,7 +434,6 @@ def print_open_holdings(holdings: List[dict]) -> None:
 # ============================================================
 
 def print_open_csps(today: dt.date) -> None:
-    """Print all non-expired open CSP positions."""
     try:
         csp_rows  = strat.load_csv_rows(CSP_POSITIONS_FILE)
         open_csps = []
@@ -544,16 +513,6 @@ def print_open_ccs(today: dt.date, px: Dict[str, float]) -> None:
 def print_open_cc_roll_candidates(px: Dict[str, float], today: "dt.date | None" = None) -> None:
     """
     Flag open CCs near or through their strike and prompt for action.
-
-    Choices per candidate:
-      1  Roll up & out  — close and reopen at a higher strike / later expiry
-      2  Roll out only  — close and reopen at the same strike on a later expiry
-      3  Close CC only  — close the call, keep shares; a fresh CC is planned next run
-      4  Close CC + exit shares — full unwind
-      5  Skip
-
-    Debit rolls are blocked. Any failure in the interactive path logs a warning
-    and falls through to the next candidate so the run is never blocked.
     """
     import datetime as _dt
     if today is None:
@@ -589,7 +548,7 @@ def print_open_cc_roll_candidates(px: Dict[str, float], today: "dt.date | None" 
                     "tkr":    tkr,
                     "strike": strike,
                     "cur":    cur,
-                    "pct":    pct_to_strike * 100,   # negative = ITM
+                    "pct":    pct_to_strike * 100,
                     "exp":    exp,
                 })
 
@@ -603,7 +562,7 @@ def print_open_cc_roll_candidates(px: Dict[str, float], today: "dt.date | None" 
             tkr    = cand["tkr"]
             strike = cand["strike"]
             cur    = cand["cur"]
-            pct    = cand["pct"]    # negative = ITM
+            pct    = cand["pct"]
             exp    = cand["exp"]
             r      = cand["row"]
 
@@ -617,7 +576,6 @@ def print_open_cc_roll_candidates(px: Dict[str, float], today: "dt.date | None" 
             print(f"    4  Close CC + exit shares  (unwind entire position, book P&L)")
             print(f"    5  Skip           (do nothing)")
 
-            # 30-second stdin timeout — defaults to Skip so unattended runs never hang.
             choice = "5"
             try:
                 import sys as _sys
@@ -648,7 +606,6 @@ def print_open_cc_roll_candidates(px: Dict[str, float], today: "dt.date | None" 
                 continue
 
             if choice == "3":
-                # Close CC, leave shares open for a fresh CC next run.
                 print(f"    Closing CC for {tkr} {exp} {strike:.0f}C …", end=" ", flush=True)
                 try:
                     rows_all = strat.load_csv_rows(CC_POSITIONS_FILE)
@@ -685,7 +642,6 @@ def print_open_cc_roll_candidates(px: Dict[str, float], today: "dt.date | None" 
                 continue
 
             if choice == "4":
-                # Close CC and sell the underlying shares — full position exit.
                 print(f"    Closing CC and exiting {tkr} shares …", end=" ", flush=True)
                 try:
                     result = strat.execute_cc_close_and_exit(today, r)
@@ -698,7 +654,6 @@ def print_open_cc_roll_candidates(px: Dict[str, float], today: "dt.date | None" 
                     print(f"❌  Error: {e}")
                 continue
 
-            # Choice 1 or 2 — roll.
             roll_up   = (choice == "1")
             roll_label = "up & out" if roll_up else "out only"
             print(f"    Rolling {tkr} {roll_label} …", end=" ", flush=True)
@@ -718,11 +673,6 @@ def print_open_cc_roll_candidates(px: Dict[str, float], today: "dt.date | None" 
 
 
 def print_csp_roll_candidates(candidates: List[dict]) -> None:
-    """
-    Print CSP roll candidates: open CSPs that are >=10% ITM with >10 DTE.
-
-    Display-only — no automated action taken here.
-    """
     if not candidates:
         return
     print(f"\n🔄 CSP ROLL CANDIDATES ({len(candidates)} position{'s' if len(candidates) != 1 else ''})")
@@ -748,7 +698,6 @@ def print_final_exposure_summary(
     mv_stock: Dict[str, float],
     wheel_mv: float,
 ) -> None:
-    """Print wheel exposure, retirement MV, and stock cap utilization."""
     print("\n💼 WHEEL EXPOSURE (all accounts)")
     for acct in (INDIVIDUAL, IRA, ROTH):
         exp = compute_wheel_exposure(today, acct)
@@ -771,7 +720,6 @@ def print_final_exposure_summary(
             if mv > 0:
                 print(f"  {acct}: ${mv:,.0f}")
 
-        # Estimated annual dividend income per retirement holding.
         try:
             ret_rows      = strat.load_retirement_positions()
             total_est_div = 0.0

@@ -127,10 +127,10 @@ def compute_acct_mv(
 
 def collect_tickers_for_price_fetch(ret_by_key: dict) -> List[str]:
     """
-    Build the full list of tickers we need current prices for.
+    Build the full list of tickers we need current prices for
 
-    Called before build_holdings_and_mv so the cache (or fallback fetch)
-    can be primed with the right universe.
+    Called before build_holdings_and_mv so live_prices() can fetch
+    the right universe in one pass.
     """
     stock_rows = strat.load_stock_positions()
     ret_rows   = strat.load_retirement_positions()
