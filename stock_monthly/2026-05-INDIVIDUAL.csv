@@ -1,3 +1,0 @@
-date,account,ticker,shares,entry_price,exit_price,close_type,pnl_abs,pnl_pct
-2026-05-01,INDIVIDUAL,RKLB,100,71.5750,69.00,CC_CALLED_AWAY,-257.50,-3.60
-,,TOTAL,,,,,-257.50,
