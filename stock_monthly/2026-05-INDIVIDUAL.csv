@@ -1,0 +1,5 @@
+date,account,ticker,shares,entry_price,exit_price,close_type,pnl_abs,pnl_pct
+2026-05-12,INDIVIDUAL,AVGO,23,424.72,411.83,STOP,-296.47,-3.03
+2026-05-12,INDIVIDUAL,TSM,25,395.90,392.51,STOP,-84.75,-0.86
+2026-05-12,INDIVIDUAL,ON,98,101.92,98.87,STOP,-298.90,-2.99
+,,TOTAL,,,,,-680.12,
