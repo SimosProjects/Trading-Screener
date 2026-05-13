@@ -1032,7 +1032,7 @@ def update_and_close_stock_positions(today: dt.date, mkt: Dict) -> Dict[str, Lis
                     if ema8_now > 0 and atr_now > 0:
                         trail_stop = ema8_now - (STOCK_STOP_ATR_EMA8 * atr_now)
                         if trail_stop > stop:
-                            log.info("TRAIL_EMA8 %s: stop %.2f → %.2f (EMA8=%.2f ATR=%.2f)",
+                            log.debug("TRAIL_EMA8 %s: stop %.2f → %.2f (EMA8=%.2f ATR=%.2f)",
                                      tkr, stop, trail_stop, ema8_now, atr_now)
                             stop = trail_stop
                             r["stop_price"] = f"{stop:.2f}"
@@ -1537,7 +1537,7 @@ def process_csp_take_profits(today: dt.date, regime: str = "BULL") -> Dict:
         bid, ask, mid = quote
         spread_pct = (ask - bid) / mid
         if spread_pct > float(CSP_TP_MAX_SPREAD_PCT):
-            log.info("CSP TP %s %s: spread %.0f%% too wide", ticker, exp_str, spread_pct*100)
+            log.debug("CSP TP %s %s: spread %.0f%% too wide", ticker, exp_str, spread_pct*100)
             continue
         current_value = mid * 100.0 * contracts
         if current_value > orig_premium * tp_pct:
@@ -1589,7 +1589,7 @@ def scan_cc_take_profits(today: dt.date, regime: str = "BULL") -> Dict:
         bid, ask, mid = quote
         spread_pct = (ask - bid) / mid
         if spread_pct > float(CC_TP_MAX_SPREAD_PCT):
-            log.info("CC TP %s %s: spread %.0f%% too wide", ticker, exp_str, spread_pct*100)
+            log.debug("CC TP %s %s: spread %.0f%% too wide", ticker, exp_str, spread_pct*100)
             continue
         current_value = mid * 100.0 * contracts
         if current_value > orig_premium * cc_tp_pct:

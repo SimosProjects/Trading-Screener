@@ -36,7 +36,7 @@ from config import (
 import strategies as strat
 import wheel as _wheel_mod
 from data_cache import DataCache
-from market import fetch_market_context, allow_swing_trades, allow_retirement_tactical, csp_mode, market_regime
+from market import fetch_market_context, allow_swing_trades, allow_retirement_tactical, csp_mode, market_regime, is_market_hours
 from screener_display import (
     print_market_context,
     print_open_holdings,
@@ -161,13 +161,16 @@ def run_screener() -> None:
     _wheel_mod.set_data_cache(cache)
 
     # ── 2. Market context + regime ────────────────────────────────
-    mkt        = fetch_market_context(cache)
-    trading_on = allow_swing_trades(mkt)
-    retire_on  = allow_retirement_tactical(mkt)
-    csp_regime = csp_mode(mkt)
-    regime     = market_regime(mkt)
+    mkt         = fetch_market_context(cache)
+    trading_on  = allow_swing_trades(mkt)
+    retire_on   = allow_retirement_tactical(mkt)
+    csp_regime  = csp_mode(mkt)
+    regime      = market_regime(mkt)
+    market_open = is_market_hours()
 
     print_market_context(mkt, trading_on, retire_on)
+    if not market_open:
+        print("\n⏰ AFTER HOURS — position maintenance only (no new entries)")
     if ENABLE_CSP:
         print(f"\n🧾 CSP engine: ENABLED | Regime: {csp_regime} | Market: {regime}")
     else:
@@ -274,9 +277,13 @@ def run_screener() -> None:
             )
 
     # ── 7. Stock scan + execution ─────────────────────────────────
-    entries, watch = scan_stock_entries_and_watchlist(regime=regime)
+    entries, watch = (scan_stock_entries_and_watchlist(regime=regime)
+                      if market_open else ([], []))
 
-    if entries:
+    if not market_open:
+        print("\n📈 STOCK SCAN: skipped (after hours)")
+        stock_opened, planned_stocks = [], []
+    elif entries:
         stock_opened, planned_stocks = plan_and_execute_stocks(
             today, entries, mkt, trading_on, retire_on, acct_mv, ret_by_key,
             regime=regime,
@@ -290,7 +297,9 @@ def run_screener() -> None:
 
     # ── 8. CSP planning + execution ───────────────────────────────
     new_csp_orders: List[dict] = []
-    if ENABLE_CSP and csp_regime in ("NORMAL", "RISK_OFF"):
+    if not market_open:
+        print("\n🧾 CSP SCAN: skipped (after hours)")
+    elif ENABLE_CSP and csp_regime in ("NORMAL", "RISK_OFF"):
 
         live_vix: float | None = None
         try:
@@ -443,23 +452,28 @@ def run_screener() -> None:
         print("\n🧾 CSP scanning skipped (market filter or ENABLE_CSP=False).")
 
     # ── 9. CC planning + execution ────────────────────────────────
-    new_cc_orders: List[dict] = plan_ccs_from_open_lots()
-
-    if new_cc_orders:
-        print("\n📞 NEW CC IDEAS (from lots) (paper execution)")
-        for o in new_cc_orders[:15]:
-            credit_est = float(o.get("credit_mid", 0.0)) * 100.0
-            print(f"  {o['ticker']:<6} {float(o['strike']):.0f}C {o['expiry']} | est credit ${credit_est:.0f} | {o.get('reason','')}")
-
-        for o in new_cc_orders:
-            strat.add_cc_position_from_candidate(today.isoformat(), o)
-
-        link_new_ccs_to_lots(today)
+    new_cc_orders: List[dict] = []
+    if not market_open:
+        print("\n📞 CC SCAN: skipped (after hours)")
     else:
-        print("\n📞 CC: No calls triggered today.")
+        new_cc_orders = plan_ccs_from_open_lots()
 
-    print_open_cc_roll_candidates(px, today=today)
-    print_csp_roll_candidates(csp_roll_candidates)
+        if new_cc_orders:
+            print("\n📞 NEW CC IDEAS (from lots) (paper execution)")
+            for o in new_cc_orders[:15]:
+                credit_est = float(o.get("credit_mid", 0.0)) * 100.0
+                print(f"  {o['ticker']:<6} {float(o['strike']):.0f}C {o['expiry']} | est credit ${credit_est:.0f} | {o.get('reason','')}")
+
+            for o in new_cc_orders:
+                strat.add_cc_position_from_candidate(today.isoformat(), o)
+
+            link_new_ccs_to_lots(today)
+        else:
+            print("\n📞 CC: No calls triggered today.")
+
+    if market_open:
+        print_open_cc_roll_candidates(px, today=today)
+        print_csp_roll_candidates(csp_roll_candidates)
 
     # ── 10. Backfill + monthly rebuild ───────────────────────────
     if should_backfill_events():

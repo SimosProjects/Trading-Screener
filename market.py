@@ -24,6 +24,48 @@ log = get_logger(__name__)
 
 
 # ============================================================
+# Market hours
+# ============================================================
+
+def is_market_hours() -> bool:
+    """Return True if NYSE is currently open for regular trading.
+
+    Uses Eastern Time (ET) regardless of where the script is run.
+    Regular session: 9:30 AM – 4:00 PM ET, Monday–Friday.
+    Does NOT account for market holidays — the GitHub Actions workflow
+    already skips non-trading days via exchange_calendars. For local runs
+    on holidays this will return True but the screener will gracefully
+    handle stale/missing data.
+
+    When False, the screener skips:
+      - New stock trade scanning and entry
+      - New CSP scanning and entry
+      - New CC planning and entry
+    Position maintenance (stop/target checks, trailing stop updates,
+    expiration processing) always runs regardless of market hours.
+    """
+    try:
+        import zoneinfo
+        et = zoneinfo.ZoneInfo("America/New_York")
+    except ImportError:
+        # Python < 3.9 fallback — use UTC offset (ET = UTC-4 in summer, UTC-5 in winter)
+        # This is approximate; install 'tzdata' for accuracy on older Python.
+        import time
+        utc_offset = -4 if time.daylight else -5
+        et = dt.timezone(dt.timedelta(hours=utc_offset))
+
+    now_et  = dt.datetime.now(tz=et)
+    weekday = now_et.weekday()   # 0=Mon, 6=Sun
+
+    if weekday >= 5:   # Saturday or Sunday
+        return False
+
+    open_time  = now_et.replace(hour=9,  minute=30, second=0, microsecond=0)
+    close_time = now_et.replace(hour=16, minute=0,  second=0, microsecond=0)
+    return open_time <= now_et <= close_time
+
+
+# ============================================================
 # Market data
 # ============================================================
 

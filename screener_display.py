@@ -1159,12 +1159,27 @@ def print_final_exposure_summary(
     if ret_flagged:
         print(f"  ⚠️ Breakeven-only flagged: {', '.join(ret_flagged)}")
 
-    indiv_stock_mv = float(mv_stock.get(INDIVIDUAL, 0.0))
-    print("\n📦 STOCK CAPS (non-wheel positions)")
-    print(
-        f"  INDIVIDUAL   MV ${indiv_stock_mv:>8,.0f} / ${float(INDIVIDUAL_STOCK_CAP):>8,.0f}"
-        f"  | Remaining ${max(float(INDIVIDUAL_STOCK_CAP) - indiv_stock_mv, 0.0):>8,.0f}"
-    )
+    # Swing position summary — risk-based sizing, no hard cap
+    try:
+        swing_rows = [r for r in strat.load_stock_positions()
+                      if (r.get("status") or "").upper() == "OPEN"
+                      and (r.get("account") or "").upper() == INDIVIDUAL]
+        swing_count  = len(swing_rows)
+        swing_mv     = float(mv_stock.get(INDIVIDUAL, 0.0))
+        total_risk   = sum(
+            (float(r.get("entry_price") or 0) - float(r.get("stop_price") or 0))
+            * float(r.get("shares") or 0)
+            for r in swing_rows
+        )
+        trail_count = sum(1 for r in swing_rows
+                          if (r.get("stop_type") or "").upper() == "TRAIL_EMA8")
+        fixed_count = swing_count - trail_count
+        print(f"\n📦 SWING POSITIONS  ({swing_count} open)")
+        print(f"  MV ${swing_mv:,.0f}  |  Total risk deployed ${total_risk:,.0f}"
+              f"  |  {trail_count} trailing  {fixed_count} fixed")
+    except Exception as e:
+        log.warning("Swing summary failed: %s", e)
+
     for acct in (IRA, ROTH):
         acct_stock_mv = float(mv_ret.get(acct, 0.0)) + float(mv_stock.get(acct, 0.0))
         cap           = float(RETIREMENT_STOCK_CAPS.get(acct, 0))
