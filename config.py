@@ -182,9 +182,10 @@ STOCK_BREAKEVEN_AFTER_R  = 1.0
 STOCK_USE_BREAKEVEN_TRAIL = True
 
 # Stop distances (ATR multiples)
-STOCK_STOP_ATR_PULLBACK = 1.0   # stop = EMA21 - 1.0*ATR
-STOCK_STOP_ATR_EMA8     = 0.75  # tighter stop for EMA8 entries (shorter hold)
-STOCK_STOP_ATR_BREAKOUT = 1.2   # stop = breakout_level - 1.2*ATR
+STOCK_STOP_PCT          = 0.05  # 5% fixed stop below entry for all signals
+STOCK_STOP_ATR_PULLBACK = 1.0   # kept for reference — not used for initial stop
+STOCK_STOP_ATR_EMA8     = 0.75  # still used for trailing stop calculation
+STOCK_STOP_ATR_BREAKOUT = 1.2   # kept for reference — not used for initial stop
 
 # ── ADX floor for stock eligibility ─────────────────────────────────────────
 # In momentum/bull markets ADX compresses — a static 20 floor misses valid entries.

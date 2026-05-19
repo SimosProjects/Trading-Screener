@@ -43,6 +43,7 @@ from config import (
     STOCK_TARGET_R_MULTIPLE,
     STOCK_BREAKEVEN_AFTER_R,
     STOCK_USE_BREAKEVEN_TRAIL,
+    STOCK_STOP_PCT,
     STOCK_STOP_ATR_PULLBACK,
     STOCK_STOP_ATR_EMA8,
     STOCK_STOP_ATR_BREAKOUT,
@@ -107,11 +108,17 @@ def regime_val(param: object, regime: str, fallback=None):
 # ============================================================
 
 _cache = None
+_market_open = True
 
 
 def set_data_cache(cache) -> None:
     global _cache
     _cache = cache
+
+
+def set_market_open(is_open: bool) -> None:
+    global _market_open
+    _market_open = bool(is_open)
 
 
 _chain_cache: Dict[str, object] = {}
@@ -141,19 +148,23 @@ def download_ohlcv(ticker: str, period: str = DATA_PERIOD, interval: str = DATA_
 
 
 def get_live_price(ticker: str) -> Optional[float]:
-    """Return the most current price (~15min delayed during market hours).
+    """Return the appropriate price for the current session.
 
-    Tries yfinance fast_info first (intraday), falls back to last daily close.
-    Used everywhere a current price is needed for decisions or display.
+    During market hours: uses fast_info (~15min delayed intraday quote).
+    After hours / weekends: uses last daily close only — fast_info returns
+    extended-hours prices which can trigger false stop/target hits on
+    after-market moves that don't reflect actual fills.
     """
-    try:
-        info  = yf.Ticker(ticker).fast_info
-        price = float(info.get("last_price") or info.get("lastPrice") or 0.0)
-        if price > 0:
-            return price
-    except Exception as e:
-        log.debug("get_live_price: fast_info failed for %s: %s", ticker, e)
+    if _market_open:
+        try:
+            info  = yf.Ticker(ticker).fast_info
+            price = float(info.get("last_price") or info.get("lastPrice") or 0.0)
+            if price > 0:
+                return price
+        except Exception as e:
+            log.debug("get_live_price: fast_info failed for %s: %s", ticker, e)
 
+    # After hours or fast_info failed — use last daily close
     try:
         df = download_ohlcv(ticker)
         if df is not None and not df.empty:
@@ -863,16 +874,12 @@ def plan_stock_trade(
     except Exception:
         sma50 = 0.0; high52w = 0.0
 
-    # ── Stops ────────────────────────────────────────────────────────────────
-    if signal == "EMA8_PULLBACK":
-        stop    = ema8 - (STOCK_STOP_ATR_EMA8 * atr) if atr > 0 else ema8 * 0.97
-        risk_ps = max(close - stop, 0.01)
-    elif signal == "PULLBACK":
-        stop    = ema21 - (STOCK_STOP_ATR_PULLBACK * atr) if atr > 0 else ema21 * 0.97
-        risk_ps = max(close - stop, 0.01)
-    else:  # BREAKOUT
-        stop    = high20 - (STOCK_STOP_ATR_BREAKOUT * atr) if atr > 0 else high20 * 0.96
-        risk_ps = max(close - stop, 0.01)
+    # ── Stops — 5% fixed below entry for all signals ─────────────────────────
+    # Wide enough to avoid noise-driven stopouts, consistent across signals.
+    # TRAIL_EMA8 positions will trail upward using EMA8 - 0.75×ATR once the
+    # trend rises, but the initial stop is always 5% below entry.
+    stop    = close * (1.0 - STOCK_STOP_PCT)
+    risk_ps = max(close - stop, 0.01)
 
     # ── Technically-grounded targets ─────────────────────────────────────────
     # Base target: 2R minimum — never set a target that doesn't pay for the risk.
@@ -1021,8 +1028,9 @@ def update_and_close_stock_positions(today: dt.date, mkt: Dict) -> Dict[str, Lis
 
         if stop_type == "TRAIL_EMA8":
             # Trailing stop: recalculate EMA8 - 0.75×ATR from fresh daily data.
-            # Stop only moves up — never down. This keeps you in the trend as
-            # long as price stays above the rising EMA8.
+            # Initial stop is 5% below entry. Trail only raises the stop —
+            # never lowers it. Once EMA8 rises enough that EMA8-0.75×ATR
+            # exceeds the 5% floor, the trailing stop takes over.
             try:
                 df_trail = add_indicators(download_ohlcv(tkr))
                 if not df_trail.empty:

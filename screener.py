@@ -167,6 +167,7 @@ def run_screener() -> None:
     csp_regime  = csp_mode(mkt)
     regime      = market_regime(mkt)
     market_open = is_market_hours()
+    strat.set_market_open(market_open)
 
     print_market_context(mkt, trading_on, retire_on)
     if not market_open:
