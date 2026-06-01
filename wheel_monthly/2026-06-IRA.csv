@@ -1,0 +1,5 @@
+date,account,ticker,event_type,amount,net,notes
+2026-06-01,ROTH,ABNB,CSP_CLOSE_TP,-255.00,135.00,TP buyback — net $135
+2026-06-01,IRA,NVDA,CSP_CLOSE_TP,-241.50,91.00,TP buyback — net $91
+2026-06-01,IRA,NVDA,CSP_OPEN,+241.50,,200.00P exp 2026-06-26
+,,NET_PREMIUM,,-255.00,,

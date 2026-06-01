@@ -1,0 +1,4 @@
+date,account,ticker,event_type,amount,net,notes
+2026-06-01,INDIVIDUAL,CELH,CC_OPEN,+195.90,,36.00C exp 2026-06-26 x2
+2026-06-01,INDIVIDUAL,TJX,CC_OPEN,+163.35,,157.50C exp 2026-06-18
+,,NET_PREMIUM,,+359.25,,
